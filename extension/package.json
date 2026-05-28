@@ -1,0 +1,25 @@
+{
+  "name": "pi-makepad-extension",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@automerge/automerge": "^2.2.0",
+    "@automerge/automerge-repo": "^2.5.0",
+    "@automerge/automerge-repo-network-websocket": "^2.5.0",
+    "@earendil-works/pi-coding-agent": "latest",
+    "typebox": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
