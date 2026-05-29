@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
+use futures::StreamExt;
+
 use crate::doc::{AgentRequest, AgentResponse, MiniApp};
 use crate::repo::DocHandle;
 
 pub async fn run(doc_handle: DocHandle) {
-    loop {
-        if doc_handle.changed().await.is_err() {
-            break;
-        }
+    let mut changes = doc_handle.changes();
+    while changes.next().await.is_some() {
         process_pending_requests(&doc_handle).await;
     }
 }

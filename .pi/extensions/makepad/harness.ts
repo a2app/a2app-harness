@@ -4,14 +4,14 @@ import { resolve } from "node:path";
 
 let harnessProcess: ChildProcess | null = null;
 
-function findHarnessBinary(extensionRoot: string): string {
+function findHarnessBinary(workspaceRoot: string): string {
   if (process.env.LSP_AGENT_HARNESS_BINARY) {
     return process.env.LSP_AGENT_HARNESS_BINARY;
   }
 
   const candidates = [
-    resolve(extensionRoot, "target/debug/harness"),
-    resolve(extensionRoot, "harness/target/debug/harness"),
+    resolve(workspaceRoot, "target/debug/harness"),
+    resolve(workspaceRoot, "harness/target/debug/harness"),
   ];
 
   const found = candidates.find((p) => existsSync(p));
@@ -24,8 +24,12 @@ function findHarnessBinary(extensionRoot: string): string {
   return found;
 }
 
-export function startHarness(extensionRoot: string): ChildProcess {
-  const binaryPath = findHarnessBinary(extensionRoot);
+export function startHarness(workspaceRoot: string): ChildProcess {
+  if (harnessProcess && harnessProcess.exitCode === null) {
+    return harnessProcess;
+  }
+
+  const binaryPath = findHarnessBinary(workspaceRoot);
 
   harnessProcess = spawn(binaryPath, [], {
     stdio: ["ignore", "ignore", "inherit"],

@@ -1,46 +1,50 @@
-import { getDocHandle } from "./doc-bridge.js";
-import type { AgentDoc } from "./schema.js";
+import { getDocHandle } from "./doc-bridge";
+import type { AgentDoc } from "./schema";
 
 type ExtensionAPI = any;
 
 type InferenceRequest = {
-  type: "Inference";
-  content: string;
-  app_id: string;
+  Inference: {
+    content: string;
+    app_id: string;
+  };
 };
 
 export function watchInferenceRequests(pi: ExtensionAPI): ReturnType<typeof setInterval> {
   const docHandle = getDocHandle();
 
   const poll = async (): Promise<void> => {
-    const doc = docHandle.docSync();
+    const doc = docHandle.doc();
     if (!doc) {
       return;
     }
 
     const inferenceReq = doc.requests.find(
-      (r): r is InferenceRequest => r.type === "Inference",
+      (r): r is InferenceRequest => "Inference" in r,
     );
     if (!inferenceReq) {
       return;
     }
 
+    const { content, app_id } = inferenceReq.Inference;
+
     docHandle.change((d) => {
       const idx = d.requests.findIndex(
-        (r) => r.type === "Inference" && r.app_id === inferenceReq.app_id,
+        (r) => "Inference" in r && r.Inference.app_id === app_id,
       );
       if (idx !== -1) {
         d.requests.splice(idx, 1);
       }
     });
 
-    const response = await callPiInference(pi, inferenceReq.content, doc);
+    const response = await callPiInference(pi, content, doc);
 
     docHandle.change((d) => {
       d.responses.push({
-        type: "InferenceResult",
-        app_id: inferenceReq.app_id,
-        content: response,
+        InferenceResult: {
+          app_id,
+          content: response,
+        },
       });
     });
   };

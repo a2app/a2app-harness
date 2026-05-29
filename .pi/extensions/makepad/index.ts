@@ -1,13 +1,20 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
-import { connectToHarness, getDocHandle } from "./doc-bridge.js";
-import { startHarness, stopHarness } from "./harness.js";
-import { watchInferenceRequests } from "./inference-loop.js";
-import { registerTools } from "./tools.js";
+import { connectToHarness, getDocHandle } from "./doc-bridge";
+import { startHarness, stopHarness } from "./harness";
+import { watchInferenceRequests } from "./inference-loop";
+import { registerTools } from "./tools";
 
-const EXTENSION_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const MAKEPAD_PROMPT_APPEND = `
+Makepad runtime guidance:
+- Use launch_makepad_app to create or update native Splash mini apps.
+- Generate Splash body only; do not include Root{}, Window{}, or Rust wrappers.
+- Avoid on_render in embedded mini apps.
+- Give every TextInput an explicit numeric height (for example 34).
+- Use list_makepad_apps before replacing an unknown app.
+- Use close_makepad_app when asked to remove an app.
+- Use store_value/read_value for persistent app data.
+`;
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   let inferencePoller: ReturnType<typeof setInterval> | null = null;
@@ -17,7 +24,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.on("session_start", async (_event: any, ctx: any) => {
     ctx.ui.setStatus("makepad", "Makepad: starting...");
     try {
-      startHarness(EXTENSION_ROOT);
+      startHarness(ctx.cwd);
       await connectToHarness();
       inferencePoller = watchInferenceRequests(pi);
       ctx.ui.setStatus("makepad", "Makepad: ready");
@@ -47,21 +54,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   pi.on("before_agent_start", async (event: any) => {
     try {
-      const doc = getDocHandle().docSync();
+      const doc = getDocHandle().doc();
       if (!doc) {
         return;
       }
 
       const appIds = Object.keys(doc.mini_apps);
-      if (appIds.length === 0) {
-        return;
-      }
+      const runningAppsLine =
+        appIds.length > 0
+          ? `\n\nCurrently running Makepad apps: ${appIds.join(", ")}.`
+          : "\n\nCurrently running Makepad apps: none.";
 
-      return {
-        systemPrompt:
-          event.systemPrompt +
-          `\n\nCurrently running Makepad apps: ${appIds.join(", ")}.`,
-      };
+      return { systemPrompt: event.systemPrompt + MAKEPAD_PROMPT_APPEND + runningAppsLine };
     } catch {
       return;
     }
@@ -70,10 +74,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.on("tool_call", async (event: any) => {
     try {
       const docHandle = getDocHandle();
+
+      const input = event.input ?? event.args ?? {};
+
       if (event.toolName === "write" || event.toolName === "edit") {
-        const path = String(event.args?.filePath ?? event.args?.path ?? "");
+        const path = String(input.filePath ?? input.path ?? "");
         const content = String(
-          event.args?.content ?? event.args?.newContent ?? "",
+          input.content ?? input.newContent ?? "",
         );
         if (path.length > 0) {
           docHandle.change((doc) => {
@@ -84,7 +91,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
 
       if (event.toolName === "read") {
-        const path = String(event.args?.filePath ?? event.args?.path ?? "");
+        const path = String(input.filePath ?? input.path ?? "");
         if (path.length > 0) {
           docHandle.change((doc) => {
             doc.active_document = path;

@@ -15,7 +15,9 @@ target
 
 # Node workspace artifacts
 node_modules/
-extension/dist/
+.pi/extensions/*/node_modules/
+.pi/extensions/*/package-lock.json
+.pi/extensions/*/dist/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

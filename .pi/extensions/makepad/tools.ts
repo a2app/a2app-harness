@@ -1,8 +1,9 @@
 import { Type } from "typebox";
+import { RawString } from "@automerge/automerge-repo";
 
-import { getDocHandle, waitForResponse } from "./doc-bridge.js";
-import { STANDARD_APPS } from "./standard-apps.js";
-import { validateSplashBody } from "./validate-splash.js";
+import { getDocHandle, waitForResponse } from "./doc-bridge";
+import { STANDARD_APPS } from "./standard-apps";
+import { validateSplashBody } from "./validate-splash";
 
 type ExtensionAPI = any;
 
@@ -53,7 +54,12 @@ export function registerTools(pi: ExtensionAPI): void {
 
       const docHandle = getDocHandle();
       docHandle.change((doc) => {
-        doc.requests.push({ type: "LaunchApp", id: app_id, splash_body });
+        doc.requests.push({
+          LaunchApp: {
+            id: new RawString(app_id) as unknown as string,
+            splash_body: new RawString(splash_body) as unknown as string,
+          },
+        });
       });
 
       onUpdate?.({
@@ -62,8 +68,9 @@ export function registerTools(pi: ExtensionAPI): void {
 
       const result = await waitForResponse(
         docHandle,
-        (r): r is { type: "AppLaunched"; id: string } =>
-          r.type === "AppLaunched" && r.id === app_id,
+        (r): r is { AppLaunched: { id: string } } =>
+          "AppLaunched" in r &&
+          String((r as { AppLaunched: { id: unknown } }).AppLaunched?.id ?? "") === app_id,
         signal,
       );
 
@@ -91,13 +98,16 @@ export function registerTools(pi: ExtensionAPI): void {
     async execute(_id: string, params: any, signal: AbortSignal) {
       const docHandle = getDocHandle();
       docHandle.change((doc) => {
-        doc.requests.push({ type: "CloseApp", id: params.app_id });
+        doc.requests.push({
+          CloseApp: { id: new RawString(params.app_id) as unknown as string },
+        });
       });
 
       const result = await waitForResponse(
         docHandle,
-        (r): r is { type: "AppClosed"; id: string } =>
-          r.type === "AppClosed" && r.id === params.app_id,
+        (r): r is { AppClosed: { id: string } } =>
+          "AppClosed" in r &&
+          String((r as { AppClosed: { id: unknown } }).AppClosed?.id ?? "") === params.app_id,
         signal,
       );
 
@@ -119,7 +129,7 @@ export function registerTools(pi: ExtensionAPI): void {
     description: "List currently running Makepad mini-apps and their Splash bodies.",
     parameters: Type.Object({}),
     async execute() {
-      const doc = getDocHandle().docSync();
+      const doc = getDocHandle().doc();
       if (!doc) {
         return {
           content: [{ type: "text", text: "Doc not ready." }],
@@ -168,7 +178,7 @@ export function registerTools(pi: ExtensionAPI): void {
     description: "Read a stored key-value pair.",
     parameters: Type.Object({ key: Type.String() }),
     async execute(_id: string, params: any) {
-      const doc = getDocHandle().docSync();
+      const doc = getDocHandle().doc();
       const entry = doc?.stored_values[params.key];
       return {
         content: [

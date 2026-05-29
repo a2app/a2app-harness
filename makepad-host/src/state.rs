@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use makepad_widgets::SignalToUI;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -46,13 +47,6 @@ impl HostState {
     pub fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
-}
-
-#[derive(Clone, Default, Debug)]
-pub struct SignalToUI;
-
-impl SignalToUI {
-    pub fn set(&self) {}
 }
 
 pub static HOST_STATE: OnceLock<Arc<RwLock<HostState>>> = OnceLock::new();

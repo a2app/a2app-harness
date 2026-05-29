@@ -1,65 +1,102 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::str::FromStr;
 
+use autosurgeon::{hydrate, reconcile};
+use futures::StreamExt;
 use reqwest::Client;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use samod::{ConnDirection, Connection, DocHandle as SamodDocHandle, Repo};
+use samod_core::DocumentId;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
 
 use shared::{AgentDoc, AgentRequest, AgentResponse, DOC_ID_PORT, WS_PORT};
 
 use crate::state::{get_host_state, get_signal, AppState, HostCommand, PendingLaunch};
 
+pub struct DocSession {
+    #[allow(dead_code)]
+    pub repo: Repo,
+    #[allow(dead_code)]
+    pub connection: Connection,
+    pub doc_handle: DocHandle,
+}
+
 #[derive(Clone)]
 pub struct DocHandle {
-    #[allow(dead_code)]
-    pub id: String,
-    inner: Arc<RwLock<AgentDoc>>,
-    changed_tx: broadcast::Sender<()>,
+    inner: SamodDocHandle,
 }
 
 impl DocHandle {
     pub fn with_doc<T>(&self, f: impl FnOnce(&AgentDoc) -> T) -> T {
-        let guard = self.inner.blocking_read();
-        f(&guard)
+        self.inner.with_document(|doc| {
+            let agent: AgentDoc = hydrate(doc).unwrap_or_default();
+            f(&agent)
+        })
     }
 
     pub fn with_doc_mut<T>(&self, f: impl FnOnce(&mut AgentDoc) -> T) -> T {
-        let mut guard = self.inner.blocking_write();
-        let out = f(&mut guard);
-        let _ = self.changed_tx.send(());
-        out
+        self.inner.with_document(|doc| {
+            let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+            let out = f(&mut agent);
+            let mut tx = doc.transaction();
+            reconcile(&mut tx, &agent).expect("reconcile agent doc");
+            tx.commit();
+            out
+        })
     }
 
-    pub async fn changed(&self) -> Result<(), broadcast::error::RecvError> {
-        let mut rx = self.changed_tx.subscribe();
-        rx.recv().await
-    }
-}
-
-pub async fn setup_doc() -> DocHandle {
-    let doc_id = wait_for_doc_id(&format!("http://127.0.0.1:{DOC_ID_PORT}/doc_id")).await;
-    eprintln!("[makepad-host] connect ws://127.0.0.1:{WS_PORT} for doc {doc_id}");
-
-    let (changed_tx, _) = broadcast::channel(256);
-    DocHandle {
-        id: doc_id,
-        inner: Arc::new(RwLock::new(AgentDoc::default())),
-        changed_tx,
+    pub fn changes(&self) -> impl futures::Stream<Item = samod_core::DocumentChanged> {
+        self.inner.changes()
     }
 }
 
-pub async fn run(doc_handle: DocHandle, mut cmd_rx: mpsc::UnboundedReceiver<HostCommand>) {
+pub async fn setup_doc() -> DocSession {
+    let repo = Repo::build_tokio().load().await;
+
+    let ws_url = format!("ws://127.0.0.1:{WS_PORT}/sync");
+    let (socket, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("connect websocket to harness");
+    let connection = repo
+        .connect_tungstenite(socket, ConnDirection::Outgoing)
+        .expect("attach websocket to samod repo");
+    connection
+        .handshake_complete()
+        .await
+        .expect("samod websocket handshake");
+
+    let doc_id_str = wait_for_doc_id(&format!("http://127.0.0.1:{DOC_ID_PORT}/doc_id")).await;
+    let doc_id = DocumentId::from_str(doc_id_str.trim()).expect("parse harness doc_id");
+
+    let doc_handle = loop {
+        match repo.find(doc_id.clone()).await {
+            Ok(Some(handle)) => break handle,
+            Ok(None) => sleep(Duration::from_millis(100)).await,
+            Err(err) => panic!("failed to find shared document: {err:?}"),
+        }
+    };
+
+    DocSession {
+        repo,
+        connection,
+        doc_handle: DocHandle { inner: doc_handle },
+    }
+}
+
+pub async fn run(session: DocSession, mut cmd_rx: mpsc::UnboundedReceiver<HostCommand>) {
+    let doc_handle = session.doc_handle.clone();
+    handle_doc_change(&doc_handle).await;
+    let mut changes = doc_handle.changes();
+
     loop {
         tokio::select! {
-            changed = doc_handle.changed() => {
-                if changed.is_err() {
-                    break;
-                }
+            Some(_changed) = changes.next() => {
                 handle_doc_change(&doc_handle).await;
             }
             Some(cmd) = cmd_rx.recv() => {
                 handle_host_command(&doc_handle, cmd).await;
             }
+            else => break,
         }
     }
 }

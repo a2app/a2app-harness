@@ -1,13 +1,15 @@
+// Wire format matches Rust autosurgeon enum serialization:
+// each variant is an object with a single key equal to the variant name.
 export type AgentRequest =
-  | { type: "LaunchApp"; id: string; splash_body: string }
-  | { type: "CloseApp"; id: string }
-  | { type: "Inference"; content: string; app_id: string };
+  | { LaunchApp: { id: string; splash_body: string } }
+  | { CloseApp: { id: string } }
+  | { Inference: { content: string; app_id: string } };
 
 export type AgentResponse =
-  | { type: "AppLaunched"; id: string }
-  | { type: "AppClosed"; id: string }
-  | { type: "InferenceResult"; app_id: string; content: string }
-  | { type: "Chat"; value: string };
+  | { AppLaunched: { id: string } }
+  | { AppClosed: { id: string } }
+  | { InferenceResult: { app_id: string; content: string } }
+  | { Chat: string };
 
 export interface MiniApp {
   splash_body: string;

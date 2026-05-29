@@ -1,3 +1,5 @@
+mod agent_splash;
+mod app;
 mod app_host;
 mod doc_agent;
 mod state;
@@ -14,8 +16,8 @@ fn main() {
     std::thread::spawn(|| {
         let rt = Runtime::new().expect("create tokio runtime");
         rt.block_on(async {
-            let doc_handle = doc_agent::setup_doc().await;
-            doc_agent::run(doc_handle, cmd_rx).await;
+            let session = doc_agent::setup_doc().await;
+            doc_agent::run(session, cmd_rx).await;
         });
     });
 
