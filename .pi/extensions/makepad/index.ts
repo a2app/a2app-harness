@@ -1,46 +1,51 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { connectToHarness, getDocHandle } from "./doc-bridge";
-import { startHarness, stopHarness } from "./harness";
-import { watchInferenceRequests } from "./inference-loop";
-import { registerTools } from "./tools";
+import { getDocHandle } from "./doc-bridge";
+import { stopHarness } from "./harness";
+import { registerTools, stopInferencePoller } from "./tools";
 
-const MAKEPAD_PROMPT_APPEND = `
-Makepad runtime guidance:
+let extensionDir = "";
+
+// Load prompt guidance from the markdown file (single source of truth).
+function loadMakepadPrompt(extensionDir: string): string {
+  try {
+    const promptPath = resolve(extensionDir, "prompts", "makepad-environment.md");
+    return readFileSync(promptPath, "utf-8");
+  } catch {
+    // Fallback if file is missing at runtime.
+    return `You are operating in a Makepad mini-app environment.
+
+Constraints:
+- Generate Splash body only. Do not emit Root{}, Window{}, or Rust wrappers.
+- Avoid on_render in embedded apps.
+- Every TextInput must use a fixed numeric height like 34.
+- Keep layouts simple and deterministic.
+
+Tools:
 - Use launch_makepad_app to create or update native Splash mini apps.
-- Generate Splash body only; do not include Root{}, Window{}, or Rust wrappers.
-- Avoid on_render in embedded mini apps.
-- Give every TextInput an explicit numeric height (for example 34).
-- Use list_makepad_apps before replacing an unknown app.
-- Use close_makepad_app when asked to remove an app.
-- Use store_value/read_value for persistent app data.
-`;
+- Use close_makepad_app to remove or close an app.
+- Use list_makepad_apps to list running apps.
+- Use store_value / read_value for persistent data.`;
+  }
+}
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-  let inferencePoller: ReturnType<typeof setInterval> | null = null;
-
   registerTools(pi);
 
   pi.on("session_start", async (_event: any, ctx: any) => {
-    ctx.ui.setStatus("makepad", "Makepad: starting...");
-    try {
-      startHarness(ctx.cwd);
-      await connectToHarness();
-      inferencePoller = watchInferenceRequests(pi);
-      ctx.ui.setStatus("makepad", "Makepad: ready");
-      ctx.ui.notify("Makepad host connected", "info");
-    } catch (err) {
-      ctx.ui.setStatus("makepad", "Makepad: offline");
-      ctx.ui.notify(`Makepad host failed to start: ${String(err)}`, "error");
-    }
+    extensionDir = ctx.extensionPath ?? __dirname ?? "";
+    // Do NOT start the harness on session start.
+    // It will be started lazily on the first tool call via tools.ts.
+    ctx.ui.setStatus("makepad", "Makepad: idle (start on first use)");
   });
 
   pi.on("session_shutdown", async () => {
-    if (inferencePoller) {
-      clearInterval(inferencePoller);
-      inferencePoller = null;
-    }
+    // Stop the inference polling loop.
+    stopInferencePoller();
 
+    // Signal graceful shutdown to makepad-host via the shared doc.
     try {
       getDocHandle().change((doc) => {
         doc.should_exit = true;
@@ -56,8 +61,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     try {
       const doc = getDocHandle().doc();
       if (!doc) {
+        // Harness not yet started — no Makepad context to add.
         return;
       }
+
+      const promptBase = loadMakepadPrompt(extensionDir);
 
       const appIds = Object.keys(doc.mini_apps);
       const runningAppsLine =
@@ -65,12 +73,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           ? `\n\nCurrently running Makepad apps: ${appIds.join(", ")}.`
           : "\n\nCurrently running Makepad apps: none.";
 
-      return { systemPrompt: event.systemPrompt + MAKEPAD_PROMPT_APPEND + runningAppsLine };
+      return { systemPrompt: `${event.systemPrompt}\n\n${promptBase}${runningAppsLine}` };
     } catch {
       return;
     }
   });
 
+  // Track file reads/writes in the shared doc (no harness lazy-init here).
   pi.on("tool_call", async (event: any) => {
     try {
       const docHandle = getDocHandle();

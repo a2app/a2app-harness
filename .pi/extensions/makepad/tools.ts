@@ -1,13 +1,56 @@
 import { Type } from "typebox";
 import { RawString } from "@automerge/automerge-repo";
 
-import { getDocHandle, waitForResponse } from "./doc-bridge";
+import { connectToHarness, getDocHandle, waitForResponse } from "./doc-bridge";
+import { startHarness } from "./harness";
+import { watchInferenceRequests } from "./inference-loop";
 import { STANDARD_APPS } from "./standard-apps";
 import { validateSplashBody } from "./validate-splash";
 
 type ExtensionAPI = any;
 
+// Lazy initialization state: starts harness + connects on first tool call.
+let harnessStarted = false;
+let harnessReady: Promise<void> | null = null;
+let inferencePoller: ReturnType<typeof setInterval> | null = null;
+let _pi: ExtensionAPI | null = null;
+
+/**
+ * Ensures the harness + makepad-host are running, and we have a doc connection.
+ * Called at the start of every tool execution.
+ */
+async function ensureConnected(): Promise<void> {
+  if (harnessStarted) return;
+
+  // Only attempt startup once; subsequent calls await the same promise.
+  if (!harnessReady) {
+    harnessReady = (async () => {
+      startHarness(process.cwd());
+      await connectToHarness();
+      harnessStarted = true;
+
+      // Start the inference polling loop (checks for Inference requests from mini-apps).
+      if (_pi) {
+        inferencePoller = watchInferenceRequests(_pi);
+      }
+    })();
+  }
+
+  await harnessReady;
+}
+
+/**
+ * Clean up the inference poller. Called on session shutdown.
+ */
+export function stopInferencePoller(): void {
+  if (inferencePoller) {
+    clearInterval(inferencePoller);
+    inferencePoller = null;
+  }
+}
+
 export function registerTools(pi: ExtensionAPI): void {
+  _pi = pi;
   pi.registerTool({
     name: "launch_makepad_app",
     label: "Launch Makepad App",
@@ -31,7 +74,18 @@ export function registerTools(pi: ExtensionAPI): void {
         Type.String({ description: "Optional standard app key, such as 'todo'" }),
       ),
     }),
-    async execute(_id: string, params: any, signal: AbortSignal, onUpdate: any) {
+    async execute(_id: string, params: any, _signal: AbortSignal, onUpdate: any) {
+      // Lazy-init: start harness + connect on first use.
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
       const { app_id, standard_app } = params;
       const splash_body =
         typeof standard_app === "string" && STANDARD_APPS[standard_app]
@@ -66,19 +120,22 @@ export function registerTools(pi: ExtensionAPI): void {
         content: [{ type: "text", text: `Launching app '${app_id}'...` }],
       });
 
+      // Use own timeout — the signal from the agent may already be aborted.
       const result = await waitForResponse(
         docHandle,
         (r): r is { AppLaunched: { id: string } } =>
           "AppLaunched" in r &&
           String((r as { AppLaunched: { id: unknown } }).AppLaunched?.id ?? "") === app_id,
-        signal,
+        undefined,  // don't pass the agent signal — use our own timeout
       );
+
+      const success = result !== null;
 
       return {
         content: [
           {
             type: "text",
-            text: result
+            text: success
               ? `App '${app_id}' launched.`
               : `Launch timed out for '${app_id}'.`,
           },
@@ -95,7 +152,17 @@ export function registerTools(pi: ExtensionAPI): void {
     parameters: Type.Object({
       app_id: Type.String(),
     }),
-    async execute(_id: string, params: any, signal: AbortSignal) {
+    async execute(_id: string, params: any, _signal: AbortSignal) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
       const docHandle = getDocHandle();
       docHandle.change((doc) => {
         doc.requests.push({
@@ -108,7 +175,7 @@ export function registerTools(pi: ExtensionAPI): void {
         (r): r is { AppClosed: { id: string } } =>
           "AppClosed" in r &&
           String((r as { AppClosed: { id: unknown } }).AppClosed?.id ?? "") === params.app_id,
-        signal,
+        undefined,
       );
 
       return {
@@ -129,6 +196,16 @@ export function registerTools(pi: ExtensionAPI): void {
     description: "List currently running Makepad mini-apps and their Splash bodies.",
     parameters: Type.Object({}),
     async execute() {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
       const doc = getDocHandle().doc();
       if (!doc) {
         return {
@@ -139,7 +216,7 @@ export function registerTools(pi: ExtensionAPI): void {
 
       const apps = Object.entries(doc.mini_apps).map(([id, app]) => ({
         id,
-        splash_preview: app.splash_body.slice(0, 200),
+        splash_preview: String(app.splash_body).slice(0, 200),
       }));
 
       return {
@@ -159,6 +236,16 @@ export function registerTools(pi: ExtensionAPI): void {
       description: Type.String(),
     }),
     async execute(_id: string, params: any) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
       getDocHandle().change((doc) => {
         doc.stored_values[params.key] = {
           value: params.value,
@@ -178,6 +265,16 @@ export function registerTools(pi: ExtensionAPI): void {
     description: "Read a stored key-value pair.",
     parameters: Type.Object({ key: Type.String() }),
     async execute(_id: string, params: any) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
       const doc = getDocHandle().doc();
       const entry = doc?.stored_values[params.key];
       return {

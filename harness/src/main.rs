@@ -19,12 +19,43 @@ use shared::{DOC_ID_PORT, WS_PORT};
 async fn main() {
     let (repo_handle, doc_handle) = repo::start_repo().await;
 
+    // Clear any stale mini_apps from a previous session so old apps don't show up.
+    doc_handle.with_doc_mut(|agent| {
+        agent.mini_apps.clear();
+        agent.should_exit = false;
+    });
+
     let doc_id = doc_handle.document_id().to_string();
     tokio::spawn(serve_harness_api(repo_handle.repo.clone(), doc_id));
 
-    let _child = spawn_makepad_host();
+    let mut makepad_child = spawn_makepad_host();
 
     router::run(doc_handle).await;
+
+    // After router::run returns (should_exit was set), wait for makepad-host to exit.
+    if let Some(ref mut child) = makepad_child {
+        let _ = child.wait();
+    }
+}
+
+/// Helper to kill any process on a given port using lsof.
+fn kill_process_on_port(port: u16) {
+    use std::process::Command as StdCommand;
+    let output = StdCommand::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output();
+    if let Ok(output) = output {
+        if !output.stdout.is_empty() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid in pids.lines() {
+                let pid = pid.trim();
+                if !pid.is_empty() {
+                    eprintln!("[Harness] Killing stale process {pid} on port {port}");
+                    let _ = StdCommand::new("kill").args(["-9", pid]).status();
+                }
+            }
+        }
+    }
 }
 
 async fn serve_harness_api(repo: Repo, doc_id: String) {
@@ -43,23 +74,35 @@ async fn serve_harness_api(repo: Repo, doc_id: String) {
         .route("/sync", get(ws_upgrade_handler))
         .with_state(repo);
 
+    // Kill any stale processes before binding.
+    kill_process_on_port(DOC_ID_PORT);
+    kill_process_on_port(WS_PORT);
+
     tokio::spawn(async move {
         let addr = SocketAddr::from(([127, 0, 0, 1], DOC_ID_PORT));
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("bind doc_id listener");
-        if let Err(err) = axum::serve(listener, doc_id_app).await {
-            eprintln!("[Harness] doc_id server failed: {err}");
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if let Err(err) = axum::serve(listener, doc_id_app).await {
+                    eprintln!("[Harness] doc_id server failed: {err}");
+                }
+            }
+            Err(err) => {
+                eprintln!("[Harness] bind doc_id listener: {err} — port {DOC_ID_PORT} still in use");
+            }
         }
     });
 
     let ws_addr = SocketAddr::from(([127, 0, 0, 1], WS_PORT));
-    let ws_listener = tokio::net::TcpListener::bind(ws_addr)
-        .await
-        .expect("bind websocket sync listener");
-    eprintln!("[Harness] samod websocket server listening on 127.0.0.1:{WS_PORT}");
-    if let Err(err) = axum::serve(ws_listener, ws_app).await {
-        eprintln!("[Harness] websocket server failed: {err}");
+    match tokio::net::TcpListener::bind(ws_addr).await {
+        Ok(ws_listener) => {
+            eprintln!("[Harness] samod websocket server listening on 127.0.0.1:{WS_PORT}");
+            if let Err(err) = axum::serve(ws_listener, ws_app).await {
+                eprintln!("[Harness] websocket server failed: {err}");
+            }
+        }
+        Err(err) => {
+            eprintln!("[Harness] bind websocket sync listener: {err} — port {WS_PORT} still in use");
+        }
     }
 }
 

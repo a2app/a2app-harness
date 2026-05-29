@@ -6,9 +6,15 @@ use makepad_widgets::SignalToUI;
 
 use crate::state::{get_host_state, init_host_state};
 
-pub fn run_app() {
+/// Initialize the SignalToUI early so doc_agent can post Signal events
+/// before the window is fully up.
+pub fn init_host_signal() {
     init_host_state(SignalToUI::new());
+}
 
+pub fn run_app() {
+    // Signal is already initialized by init_host_signal() called from main().
+    // The OnceLock ensures we don't double-initialize.
     if env::var("MAKEPAD_HOST_WINDOWED").ok().as_deref() == Some("1") {
         crate::app::app_main();
     } else {

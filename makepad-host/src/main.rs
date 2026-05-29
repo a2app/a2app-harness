@@ -13,6 +13,10 @@ fn main() {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<HostCommand>();
     let _ = COMMAND_TX.set(cmd_tx);
 
+    // Initialize host state and signal BEFORE the tokio thread starts,
+    // so doc_agent::run can post window Signal events immediately.
+    app_host::init_host_signal();
+
     std::thread::spawn(|| {
         let rt = Runtime::new().expect("create tokio runtime");
         rt.block_on(async {

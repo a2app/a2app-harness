@@ -152,9 +152,11 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
                 .and_modify(|app| app.content = splash_body.clone())
                 .or_insert_with(|| AppState::new(splash_body.clone()));
             state.pending_launches.push(PendingLaunch {
-                id,
+                id: id.clone(),
                 content: splash_body,
             });
+            // Newly launched app becomes the active one.
+            state.active_app_id = Some(id);
             state.bump_revision();
             signal.set();
         }
@@ -164,6 +166,7 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
             let mut state = state.write().expect("host state poisoned");
             state.apps.remove(&id);
             state.app_order.retain(|x| x != &id);
+            state.ensure_active_app();
             state.bump_revision();
             signal.set();
         }

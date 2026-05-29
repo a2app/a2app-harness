@@ -23,6 +23,19 @@ pub struct AppState {
     pub pending_inference: VecDeque<oneshot::Sender<String>>,
 }
 
+impl Clone for AppState {
+    fn clone(&self) -> Self {
+        Self {
+            content: self.content.clone(),
+            last_request: self.last_request.clone(),
+            last_response: self.last_response.clone(),
+            request_in_flight: self.request_in_flight,
+            // Senders cannot be cloned; new clones start with empty queue.
+            pending_inference: VecDeque::new(),
+        }
+    }
+}
+
 impl AppState {
     pub fn new(content: String) -> Self {
         Self {
@@ -40,12 +53,32 @@ pub struct HostState {
     pub pending_launches: Vec<PendingLaunch>,
     pub app_order: Vec<String>,
     pub apps: HashMap<String, AppState>,
+    pub active_app_id: Option<String>,
     pub signal: Option<SignalToUI>,
 }
 
 impl HostState {
     pub fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn ensure_active_app(&mut self) {
+        if let Some(ref id) = self.active_app_id {
+            if self.apps.contains_key(id) {
+                return;
+            }
+        }
+        self.active_app_id = self.app_order.first().cloned();
+    }
+
+    pub fn set_active_app(&mut self, id: &str) {
+        if self.apps.contains_key(id) {
+            self.active_app_id = Some(id.to_string());
+            self.bump_revision();
+            if let Some(ref sig) = self.signal {
+                sig.set();
+            }
+        }
     }
 }
 
@@ -60,6 +93,7 @@ pub fn init_host_state(signal: SignalToUI) {
                 pending_launches: Vec::new(),
                 app_order: Vec::new(),
                 apps: HashMap::new(),
+                active_app_id: None,
                 signal: None,
             }))
         })
@@ -77,6 +111,7 @@ pub fn get_host_state() -> Arc<RwLock<HostState>> {
                 pending_launches: Vec::new(),
                 app_order: Vec::new(),
                 apps: HashMap::new(),
+                active_app_id: None,
                 signal: None,
             }))
         })

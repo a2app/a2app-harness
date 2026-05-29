@@ -58,6 +58,15 @@ export function getDocHandle(): DocHandle<AgentDoc> {
   return handle;
 }
 
+/**
+ * Force a fresh connection to the harness. Call this if getDocHandle()
+ * returns a stale handle (e.g. after the harness was restarted).
+ */
+export async function reconnectToHarness(): Promise<DocHandle<AgentDoc>> {
+  handle = await connectToHarness();
+  return handle;
+}
+
 export async function waitForResponse<T extends AgentDoc["responses"][number]>(
   docHandle: DocHandle<AgentDoc>,
   predicate: (r: AgentDoc["responses"][number]) => r is T,

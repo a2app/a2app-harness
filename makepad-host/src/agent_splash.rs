@@ -21,7 +21,7 @@ pub struct AgentSplash {
     body: ArcStringMut,
 }
 
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit, ";
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*\n";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
