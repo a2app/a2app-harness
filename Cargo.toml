@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "shared",
+  "harness",
+  "makepad-host",
+]
+resolver = "2"
