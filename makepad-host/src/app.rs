@@ -92,6 +92,7 @@ script_mod! {
                         text: "Other apps (0)"
                         draw_text: { color: #xccddff text_style: { font_size: 12 } }
                         margin: 6 0 0 4
+                        cursor: Hand
                     }
                     card_label := Label {
                         text: ""
@@ -302,6 +303,27 @@ impl MakepadRootApp {
                 let mut s = host_state.write().expect("host state poisoned");
                 s.set_active_app(&app_id);
                 return;
+            }
+        }
+
+        // Check other_label (multi-line list of other apps)
+        let other_text = self.ui.label(cx, ids!(other_label)).text();
+        if !other_text.is_empty() {
+            let r = self.ui.label(cx, ids!(other_label)).area().rect(cx);
+            if r.contains(abs) {
+                // Extract the first app_id from the multi-line text
+                let first = other_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("• "))
+                    .and_then(|s| s.split(" (").next())
+                    .unwrap_or("")
+                    .to_string();
+                if !first.is_empty() {
+                    let mut s = host_state.write().expect("host state poisoned");
+                    s.set_active_app(&first);
+                    return;
+                }
             }
         }
 
