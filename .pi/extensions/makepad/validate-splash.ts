@@ -1,4 +1,9 @@
 export function validateSplashBody(body: string): string | null {
+  // Special marker for built-in chat panel — skip DSL validation
+  if (body.trim() === "__chat__") {
+    return null;
+  }
+
   if (body.includes("if (")) {
     return "it used parenthesized `if` conditions; use `if cond { ... }` syntax instead";
   }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use autosurgeon::{hydrate, reconcile};
@@ -9,7 +9,7 @@ use samod_core::DocumentId;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
 
-use shared::{AgentDoc, AgentRequest, AgentResponse, DOC_ID_PORT, WS_PORT};
+use shared::{AgentDoc, AgentRequest, AgentResponse, StoredValue, DOC_ID_PORT, WS_PORT};
 
 use crate::state::{get_host_state, get_signal, AppState, HostCommand, PendingLaunch};
 
@@ -53,20 +53,33 @@ impl DocHandle {
 pub async fn setup_doc() -> DocSession {
     let repo = Repo::build_tokio().load().await;
 
+    // Wait for the harness HTTP API to be up first
+    let doc_id_str = wait_for_doc_id(&format!("http://127.0.0.1:{DOC_ID_PORT}/doc_id")).await;
+    let doc_id = DocumentId::from_str(doc_id_str.trim()).expect("parse harness doc_id");
+
+    // Retry websocket connection until the harness is ready
     let ws_url = format!("ws://127.0.0.1:{WS_PORT}/sync");
-    let (socket, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .expect("connect websocket to harness");
-    let connection = repo
-        .connect_tungstenite(socket, ConnDirection::Outgoing)
-        .expect("attach websocket to samod repo");
+    let connection = loop {
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((socket, _)) => {
+                match repo.connect_tungstenite(socket, ConnDirection::Outgoing) {
+                    Ok(conn) => break conn,
+                    Err(err) => {
+                        eprintln!("[doc_agent] attach websocket failed: {err:?}, retrying...");
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("[doc_agent] connect websocket failed: {err:?}, retrying...");
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
     connection
         .handshake_complete()
         .await
         .expect("samod websocket handshake");
-
-    let doc_id_str = wait_for_doc_id(&format!("http://127.0.0.1:{DOC_ID_PORT}/doc_id")).await;
-    let doc_id = DocumentId::from_str(doc_id_str.trim()).expect("parse harness doc_id");
 
     let doc_handle = loop {
         match repo.find(doc_id.clone()).await {
@@ -102,7 +115,7 @@ pub async fn run(session: DocSession, mut cmd_rx: mpsc::UnboundedReceiver<HostCo
 }
 
 async fn handle_doc_change(doc_handle: &DocHandle) {
-    let (should_exit, new_apps, closed_apps, inference_results) = doc_handle.with_doc(|agent| {
+    let (should_exit, new_apps, closed_apps, inference_results, stored_results) = doc_handle.with_doc(|agent| {
         let state = get_host_state();
         let state_guard = state.read().expect("host state poisoned");
 
@@ -113,13 +126,11 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
             .map(|(id, app)| (id.clone(), app.splash_body.clone()))
             .collect();
 
-        let active_ids: HashSet<String> = agent.mini_apps.keys().cloned().collect();
-        let closed: Vec<String> = state_guard
-            .apps
-            .keys()
-            .filter(|id| !active_ids.contains(*id))
-            .cloned()
-            .collect();
+        // NEVER auto-close apps based on doc state absence.
+        // The doc may temporarily appear empty during sync, which would
+        // incorrectly close all running apps. Apps are only closed via
+        // explicit CloseApp requests processed in router.rs.
+        let closed: Vec<String> = Vec::new();
 
         let results: Vec<(String, String)> = agent
             .responses
@@ -132,7 +143,16 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
             })
             .collect();
 
-        (agent.should_exit, new, closed, results)
+        // HTTP fallback: read inference responses from stored_values
+        // (written by the harness's /inference_response endpoint)
+        let mut stored: HashMap<String, String> = HashMap::new();
+        for (key, sv) in &agent.stored_values {
+            if let Some(app_id) = key.strip_prefix("response:") {
+                stored.insert(app_id.to_string(), sv.value.clone());
+            }
+        }
+
+        (agent.should_exit, new, closed, results, stored)
     });
 
     if should_exit {
@@ -171,7 +191,10 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
             signal.set();
         }
 
-        for (app_id, content) in inference_results {
+        // Process both direct responses and HTTP fallback stored_values
+        for (app_id, content) in inference_results.into_iter().chain(
+            stored_results.into_iter().map(|(k, v)| (k, v))
+        ) {
             let state = get_host_state();
             let mut state = state.write().expect("host state poisoned");
             state
@@ -193,12 +216,15 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
             signal.set();
 
             doc_handle.with_doc_mut(|agent| {
+                // Clean up direct response
                 let pos = agent.responses.iter().position(|r| {
                     matches!(r, AgentResponse::InferenceResult { app_id: id, .. } if id == &app_id)
                 });
                 if let Some(i) = pos {
                     agent.responses.remove(i);
                 }
+                // Clean up HTTP fallback stored_value
+                agent.stored_values.remove(&format!("response:{}", app_id));
             });
         }
     }
@@ -206,7 +232,7 @@ async fn handle_doc_change(doc_handle: &DocHandle) {
 
 async fn handle_host_command(doc_handle: &DocHandle, cmd: HostCommand) {
     match cmd {
-        HostCommand::Inference { app_id, content } => {
+        HostCommand::Inference { app_id, content, .. } => {
             {
                 let state = get_host_state();
                 let mut state = state.write().expect("host state poisoned");

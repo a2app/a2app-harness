@@ -1,4 +1,10 @@
 use std::collections::{HashMap, VecDeque};
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String,  // "user" or "assistant"
+    pub content: String,
+}
 use std::sync::{Arc, OnceLock, RwLock};
 
 use makepad_widgets::SignalToUI;
@@ -6,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub enum HostCommand {
-    Inference { app_id: String, content: String },
+    Inference { app_id: String, content: String, mode: String },
     CloseApp(String),
 }
 
@@ -21,6 +27,7 @@ pub struct AppState {
     pub last_response: Option<String>,
     pub request_in_flight: bool,
     pub pending_inference: VecDeque<oneshot::Sender<String>>,
+    pub inference_mode: String,
 }
 
 impl Clone for AppState {
@@ -32,6 +39,7 @@ impl Clone for AppState {
             request_in_flight: self.request_in_flight,
             // Senders cannot be cloned; new clones start with empty queue.
             pending_inference: VecDeque::new(),
+            inference_mode: self.inference_mode.clone(),
         }
     }
 }
@@ -44,6 +52,7 @@ impl AppState {
             last_response: None,
             request_in_flight: false,
             pending_inference: VecDeque::new(),
+            inference_mode: "sub".to_string(),
         }
     }
 }
@@ -55,6 +64,7 @@ pub struct HostState {
     pub apps: HashMap<String, AppState>,
     pub active_app_id: Option<String>,
     pub signal: Option<SignalToUI>,
+    pub chat_messages: HashMap<String, Vec<ChatMessage>>,
 }
 
 impl HostState {
@@ -95,6 +105,7 @@ pub fn init_host_state(signal: SignalToUI) {
                 apps: HashMap::new(),
                 active_app_id: None,
                 signal: None,
+                chat_messages: HashMap::new(),
             }))
         })
         .clone();
@@ -113,6 +124,7 @@ pub fn get_host_state() -> Arc<RwLock<HostState>> {
                 apps: HashMap::new(),
                 active_app_id: None,
                 signal: None,
+                chat_messages: HashMap::new(),
             }))
         })
         .clone()
