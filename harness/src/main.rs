@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::State;
+use axum::extract::{Json, State};
 use axum::response::IntoResponse;
+use axum::routing::post;
+use serde::Deserialize;
 use axum::routing::get;
 use axum::Router;
 use samod::Repo;
-use shared::{DOC_ID_PORT, WS_PORT};
+use shared::{StoredValue, DOC_ID_PORT, WS_PORT};
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +28,7 @@ async fn main() {
     });
 
     let doc_id = doc_handle.document_id().to_string();
-    tokio::spawn(serve_harness_api(repo_handle.repo.clone(), doc_id));
+    tokio::spawn(serve_harness_api(repo_handle.repo.clone(), doc_handle.clone(), doc_id));
 
     let mut makepad_child = spawn_makepad_host();
 
@@ -58,9 +60,28 @@ fn kill_process_on_port(port: u16) {
     }
 }
 
-async fn serve_harness_api(repo: Repo, doc_id: String) {
-    let doc_id_app = Router::new().route(
-        "/doc_id",
+use crate::repo::DocHandle;
+
+#[derive(Clone)]
+struct ApiState {
+    repo: Repo,
+    doc_handle: DocHandle,
+}
+
+#[derive(Deserialize)]
+struct InferenceResponsePayload {
+    app_id: String,
+    content: String,
+}
+
+async fn serve_harness_api(repo: Repo, doc_handle: DocHandle, doc_id: String) {
+    let api_state = ApiState {
+        repo: repo.clone(),
+        doc_handle: doc_handle.clone(),
+    };
+
+    let doc_id_app = Router::new()
+        .route("/doc_id",
         get({
             let doc_id = doc_id.clone();
             move || {
@@ -78,11 +99,19 @@ async fn serve_harness_api(repo: Repo, doc_id: String) {
     kill_process_on_port(DOC_ID_PORT);
     kill_process_on_port(WS_PORT);
 
+    let inf_router = Router::new()
+        .route("/inference_response", post(handle_inference_response))
+        .with_state(api_state);
+
+    let http_app = Router::new()
+        .merge(doc_id_app)
+        .merge(inf_router);
+
     tokio::spawn(async move {
         let addr = SocketAddr::from(([127, 0, 0, 1], DOC_ID_PORT));
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                if let Err(err) = axum::serve(listener, doc_id_app).await {
+                if let Err(err) = axum::serve(listener, http_app).await {
                     eprintln!("[Harness] doc_id server failed: {err}");
                 }
             }
@@ -104,6 +133,32 @@ async fn serve_harness_api(repo: Repo, doc_id: String) {
             eprintln!("[Harness] bind websocket sync listener: {err} — port {WS_PORT} still in use");
         }
     }
+}
+
+async fn handle_inference_response(
+    State(state): State<ApiState>,
+    Json(payload): Json<InferenceResponsePayload>,
+) -> impl IntoResponse {
+    eprintln!(
+        "[Harness] received inference response for '{}' ({} chars)",
+        payload.app_id,
+        payload.content.len(),
+    );
+
+    let response_key = format!("response:{}", payload.app_id);
+    let doc_handle = state.doc_handle.clone();
+    doc_handle.with_doc_mut(|agent| {
+        agent
+            .stored_values
+            .entry(response_key)
+            .and_modify(|sv| sv.value = payload.content.clone())
+            .or_insert_with(|| StoredValue {
+                value: payload.content.clone(),
+                description: format!("Inference response for {}", payload.app_id),
+            });
+    });
+
+    "ok"
 }
 
 async fn ws_upgrade_handler(

@@ -91,7 +91,10 @@ impl Widget for AgentSplash {
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         if self.body.as_ref() != v {
             self.body.set(v);
-            self.eval_body(cx);
+            // Skip eval for the chat marker — the host renders it natively
+            if v != "__chat__" {
+                self.eval_body(cx);
+            }
             self.redraw(cx);
         }
     }

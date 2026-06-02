@@ -1,3 +1,4 @@
+import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { getDocHandle } from "./doc-bridge";
 import type { AgentDoc } from "./schema";
 
@@ -26,19 +27,22 @@ export function watchInferenceRequests(pi: ExtensionAPI): ReturnType<typeof setI
       return;
     }
 
-    const { content, app_id } = inferenceReq.Inference;
+    // Coerce RawString → plain string
+    const content = String(inferenceReq.Inference.content);
+    const app_id = String(inferenceReq.Inference.app_id);
 
     docHandle.change((d) => {
       const idx = d.requests.findIndex(
-        (r) => "Inference" in r && r.Inference.app_id === app_id,
+        (r) => "Inference" in r && String(r.Inference.app_id) === app_id,
       );
       if (idx !== -1) {
         d.requests.splice(idx, 1);
       }
     });
 
-    const response = await callPiInference(pi, content, doc);
+    const response = await callSubInference(pi, content, doc);
 
+    // Write response via doc (direct sync)
     docHandle.change((d) => {
       d.responses.push({
         InferenceResult: {
@@ -47,6 +51,17 @@ export function watchInferenceRequests(pi: ExtensionAPI): ReturnType<typeof setI
         },
       });
     });
+
+    // HTTP fallback: POST to harness endpoint which writes to stored_values
+    try {
+      await fetch(`http://127.0.0.1:2348/inference_response`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ app_id, content: response }),
+      });
+    } catch (err) {
+      console.error(`[inference-loop] HTTP fallback error: ${err}`);
+    }
   };
 
   return setInterval(() => {
@@ -54,39 +69,36 @@ export function watchInferenceRequests(pi: ExtensionAPI): ReturnType<typeof setI
   }, 200);
 }
 
-async function callPiInference(
+async function callSubInference(
   pi: ExtensionAPI,
   prompt: string,
   doc: AgentDoc,
 ): Promise<string> {
-  if (typeof pi.sendUserMessage !== "function") {
-    return "Inference API unavailable in this Pi runtime.";
-  }
-
-  const runningApps = Object.keys(doc.mini_apps);
-  const prefix =
-    runningApps.length > 0
-      ? `Running apps: ${runningApps.join(", ")}. Return only the requested result.\n\n`
-      : "";
-
-  const text = `${prefix}${prompt}`;
-
   try {
-    const direct = await pi.sendUserMessage(text, { deliverAs: "followUp" });
-    if (typeof direct === "string" && direct.trim().length > 0) {
-      return direct;
-    }
-    if (direct && typeof direct.text === "string" && direct.text.trim().length > 0) {
-      return direct.text;
-    }
-  } catch (err) {
-    if (typeof pi.sendMessage === "function") {
-      await pi.sendMessage({
-        role: "system",
-        content: `Inference follow-up failed: ${String(err)}`,
-      });
-    }
-  }
+    const { session } = await createAgentSession({
+      sessionManager: SessionManager.inMemory(),
+      noTools: "all",
+      model: pi.model,
+    });
 
-  return "Inference call did not return a response.";
+    let fullResponse = "";
+
+    session.subscribe((event: any) => {
+      if (
+        event.type === "message_update" &&
+        event.assistantMessageEvent?.type === "text_delta"
+      ) {
+        fullResponse += event.assistantMessageEvent.delta;
+      }
+    });
+
+    await session.prompt(prompt);
+    session.dispose();
+
+    return fullResponse.trim().length > 0
+      ? fullResponse
+      : "(no response from sub-inference)";
+  } catch (err) {
+    return `Sub-inference error: ${String(err)}`;
+  }
 }

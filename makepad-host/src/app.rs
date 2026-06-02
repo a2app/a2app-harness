@@ -3,7 +3,7 @@ use std::fs;
 
 use makepad_widgets::*;
 
-use crate::state::get_host_state;
+use crate::state::{get_host_state, send_command, AppState, ChatMessage, HostCommand};
 
 app_main!(MakepadRootApp);
 
@@ -50,11 +50,37 @@ script_mod! {
                         tab_7: Label { text: "" draw_text: { color: #xbbccdd text_style: { font_size: 11 } } cursor: Hand }
                     }
 
-                    splash_holder := RoundedView {
-                        width: Fill height: Fit padding: 12
-                        draw_bg.color: #1f232e
-                        draw_bg.border_radius: 8.0
-                        splash := mod.widgets.AgentSplash{width: Fill height: Fit}
+                    content_area := View {
+                        width: Fill height: Fit
+                        flow: Down spacing: 6
+
+                        splash_holder := RoundedView {
+                            width: Fill height: Fit padding: 12
+                            draw_bg.color: #1f232e
+                            draw_bg.border_radius: 8.0
+                            splash := mod.widgets.AgentSplash{width: Fill height: Fit}
+                        }
+
+                        chat_input_row := RoundedView {
+                            width: Fill height: Fit
+                            flow: Right spacing: 8
+                            padding: Inset{top: 6 bottom: 6 left: 12 right: 12}
+                            visible: false
+                            draw_bg.color: #x262a36
+                            draw_bg.border_radius: 8.0
+                            chat_mode := Label {
+                                text: "[mode: sub]"
+                                draw_text: { color: #xaadd99 text_style: { font_size: 11 } }
+                                cursor: Hand
+                            }
+                            chat_input := TextInput {
+                                width: Fill height: 34
+                                empty_text: "Type a message..."
+                            }
+                            chat_send := Button {
+                                text: "Send" width: 80 height: 34
+                            }
+                        }
                     }
 
                     source := TextInput {
@@ -66,6 +92,7 @@ script_mod! {
                         text: "Other apps (0)"
                         draw_text: { color: #xccddff text_style: { font_size: 12 } }
                         margin: 6 0 0 4
+                        cursor: Hand
                     }
                     card_label := Label {
                         text: ""
@@ -92,6 +119,76 @@ static CARD_IDS: [LiveId; MAX_VISIBLE] = [
 fn tab_id(i: usize) -> &'static [LiveId] { &TAB_IDS[i..i+1] }
 fn card_id(i: usize) -> &'static [LiveId] { &CARD_IDS[i..i+1] }
 
+/// Generate a Splash DSL body that renders chat messages as styled label widgets.
+/// This is used for `__chat__` apps — the host generates the body dynamically.
+fn generate_chat_splash_body(messages: &[ChatMessage], app_state: Option<&AppState>) -> String {
+    let has_pending = app_state
+        .and_then(|a| a.last_response.as_ref())
+        .filter(|resp| !messages.iter().any(|m| m.role == "assistant" && m.content == **resp))
+        .is_some();
+
+    let mut body = r#"RoundedView{
+    width: Fill height: Fit
+    flow: Down spacing: 6
+    padding: 12
+    new_batch: true
+    draw_bg.color: #x1a1a2e
+    draw_bg.border_radius: 6.0
+"#.to_string();
+
+    if messages.is_empty() && !has_pending {
+        body.push_str(r#"    Label{
+        text: "Start a conversation! Type a message below."
+        draw_text: { color: #x8899aa text_style: { font_size: 11 } }
+    }"#);
+    } else {
+        let mut all_msgs: Vec<(String, String)> = messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+
+        // If there's a pending response not yet in chat_messages, show it
+        if let Some(pending) = app_state
+            .and_then(|a| a.last_response.as_ref())
+            .filter(|resp| !messages.iter().any(|m| m.role == "assistant" && m.content == **resp))
+        {
+            all_msgs.push(("assistant".to_string(), pending.clone()));
+        }
+
+        for (role, content) in &all_msgs {
+            let prefix = if role == "user" { "You" } else { "AI" };
+            let color = if role == "user" { "#x88ddff" } else { "#xddd" };
+            // Escape double quotes and backslashes in content for Splash DSL
+            let escaped = content
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            body.push_str(&format!(
+                r#"    RoundedView{{
+        width: Fill height: Fit
+        flow: Down spacing: 2
+        padding: Inset{{top: 6 bottom: 6 left: 10 right: 10}}
+        new_batch: true
+        draw_bg.color: #x2a2a3e
+        draw_bg.border_radius: 6.0
+        Label{{
+            text: "{}:"
+            draw_text: {{ color: {} text_style: {{ font_size: 10 }} }}
+        }}
+        Label{{
+            text: "{}"
+            draw_text: {{ color: #xeee text_style: {{ font_size: 11 }} }}
+        }}
+    }}"#,
+                prefix, color, escaped
+            ));
+        }
+    }
+
+    body.push_str("}");
+    body
+}
+
 #[derive(Script, ScriptHook)]
 pub struct MakepadRootApp {
     #[live]
@@ -111,6 +208,10 @@ impl MakepadRootApp {
         let order = state_lock.app_order.clone();
         let active = state_lock.active_app_id.clone();
         let apps = state_lock.apps.clone();
+        let chat_msgs = active.as_ref()
+            .and_then(|id| state_lock.chat_messages.get(id))
+            .cloned()
+            .unwrap_or_default();
         self.last_revision = state_lock.revision;
         drop(state_lock);
 
@@ -142,8 +243,28 @@ impl MakepadRootApp {
             .and_then(|id| apps.get(id))
             .map(|a| a.content.as_str())
             .unwrap_or("");
-        self.ui.widget(cx, ids!(splash)).set_text(cx, active_body);
-        self.ui.widget(cx, ids!(source)).set_text(cx, active_body);
+        let is_chat = active_body == "__chat__";
+
+        // Show/hide splash holder and chat input row
+        self.ui.view(cx, ids!(splash_holder)).set_visible(cx, true);
+        self.ui.view(cx, ids!(chat_input_row)).set_visible(cx, is_chat);
+
+        if is_chat {
+            // Show current inference mode
+            if let Some(app_id) = active.as_ref() {
+                if let Some(app_state) = apps.get(app_id) {
+                    let mode = &app_state.inference_mode;
+                    self.ui.label(cx, ids!(chat_mode)).set_text(cx, &format!("[mode: {}]", mode));
+                }
+            }
+            // Build a dynamic Splash body that renders all chat messages
+            let splash_body = generate_chat_splash_body(&chat_msgs, active.as_ref().and_then(|id| apps.get(id)));
+            self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
+            self.ui.widget(cx, ids!(source)).set_text(cx, &splash_body);
+        } else {
+            self.ui.widget(cx, ids!(splash)).set_text(cx, active_body);
+            self.ui.widget(cx, ids!(source)).set_text(cx, active_body);
+        }
 
         // Other apps as plain Labels
         let others: Vec<&String> = order.iter()
@@ -185,12 +306,32 @@ impl MakepadRootApp {
             }
         }
 
+        // Check other_label (multi-line list of other apps)
+        let other_text = self.ui.label(cx, ids!(other_label)).text();
+        if !other_text.is_empty() {
+            let r = self.ui.label(cx, ids!(other_label)).area().rect(cx);
+            if r.contains(abs) {
+                // Extract the first app_id from the multi-line text
+                let first = other_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("• "))
+                    .and_then(|s| s.split(" (").next())
+                    .unwrap_or("")
+                    .to_string();
+                if !first.is_empty() {
+                    let mut s = host_state.write().expect("host state poisoned");
+                    s.set_active_app(&first);
+                    return;
+                }
+            }
+        }
+
         // Check card label
         let card_text = self.ui.label(cx, ids!(card_label)).text();
         if !card_text.is_empty() {
             let r = self.ui.label(cx, ids!(card_label)).area().rect(cx);
             if r.contains(abs) {
-                // Extract app_id: "• counter-1  (click to switch)" -> "counter-1"
                 let app_id = card_text
                     .strip_prefix("• ")
                     .and_then(|s| s.split("  (").next())
@@ -203,6 +344,80 @@ impl MakepadRootApp {
                 }
             }
         }
+
+        // Check chat mode toggle (only when chat input row is visible)
+        let is_chat_visible = self.ui.view(cx, ids!(chat_input_row)).visible();
+        if is_chat_visible {
+            let mode_rect = self.ui.label(cx, ids!(chat_mode)).area().rect(cx);
+            if mode_rect.contains(abs) {
+                let host_state = get_host_state();
+                let mut state = host_state.write().expect("host state poisoned");
+                if let Some(ref aid) = state.active_app_id.clone() {
+                    if let Some(app) = state.apps.get_mut(aid) {
+                        app.inference_mode = if app.inference_mode == "sub" {
+                            "full".to_string()
+                        } else {
+                            "sub".to_string()
+                        };
+                        state.bump_revision();
+                    }
+                }
+                return;
+            }
+
+            // Check chat send button
+            let send_rect = self.ui.button(cx, ids!(chat_send)).area().rect(cx);
+            if send_rect.contains(abs) {
+                let input_text = self.ui.text_input(cx, ids!(chat_input)).text();
+                let trimmed = input_text.trim().to_string();
+                if !trimmed.is_empty() {
+                    let (app_id, mode) = {
+                        let state = get_host_state();
+                        let state_lock = state.read().expect("host state poisoned");
+                        let aid = state_lock.active_app_id.clone();
+                        let m = aid.as_ref()
+                            .and_then(|id| state_lock.apps.get(id))
+                            .map(|a| a.inference_mode.clone())
+                            .unwrap_or_else(|| "sub".to_string());
+                        (aid, m)
+                    };
+                    if let Some(ref aid) = app_id {
+                        // Add user message to chat history and signal the UI
+                        {
+                            let host_state_arc = get_host_state();
+                            let mut state = host_state_arc.write().expect("host state poisoned");
+                            state
+                                .chat_messages
+                                .entry(aid.clone())
+                                .or_default()
+                                .push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: trimmed.clone(),
+                                });
+                            state.bump_revision();
+                            if let Some(ref sig) = state.signal {
+                                sig.set();
+                            }
+                        }
+                        // Send inference request with mode
+                        eprintln!("[app] sending Inference command for '{}' mode={}", aid, mode);
+                        let result = send_command(HostCommand::Inference {
+                            app_id: aid.clone(),
+                            content: trimmed,
+                            mode: mode.clone(),
+                        });
+                        if let Err(e) = result {
+                            eprintln!("[app] send_command FAILED: {}", e);
+                        } else {
+                            eprintln!("[app] send_command succeeded");
+                        }
+                        // Clear input
+                        self.ui.text_input(cx, ids!(chat_input)).set_text(cx, "");
+                    }
+                }
+                return;
+            }
+        }
     }
 
     fn write_window_marker_once(&mut self) {
@@ -212,6 +427,37 @@ impl MakepadRootApp {
         }
         self.marker_written = true;
     }
+}
+
+/// Helper: if the active app is a chat app with a pending last_response, absorb it into chat_messages.
+/// Returns true if something was absorbed.
+fn app_is_chat_and_has_response(state_lock: &mut crate::state::HostState) -> bool {
+    let active_id = match state_lock.active_app_id.clone() {
+        Some(id) => id,
+        None => return false,
+    };
+    let app = match state_lock.apps.get_mut(&active_id) {
+        Some(app) => app,
+        None => return false,
+    };
+    if app.content != "__chat__" {
+        return false;
+    }
+    let resp = match app.last_response.take() {
+        Some(r) => r,
+        None => return false,
+    };
+    eprintln!("[app] absorbing response for '{}': {} chars", active_id, resp.len());
+    let msgs = state_lock.chat_messages.entry(active_id).or_default();
+    if msgs.iter().any(|m| m.role == "assistant" && m.content == resp) {
+        eprintln!("[app] duplicate response, skipping");
+        return false;
+    }
+    msgs.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: resp,
+    });
+    true
 }
 
 impl AppMain for MakepadRootApp {
@@ -235,9 +481,31 @@ impl AppMain for MakepadRootApp {
                 self.sync_from_host_state(cx);
             }
             Event::Signal => {
-                let state = get_host_state();
-                let revision = state.read().expect("host state poisoned").revision;
-                if revision != self.last_revision {
+                let mut should_sync = false;
+                {
+                    let state = get_host_state();
+                    let mut state_lock = state.write().expect("host state poisoned");
+                    let revision = state_lock.revision;
+                    eprintln!("[app] Signal: revision={}, last_revision={}, active={:?}",
+                        revision, self.last_revision, state_lock.active_app_id);
+                    if revision != self.last_revision {
+                        // If there's a pending inference response for a chat app, absorb it
+                        if app_is_chat_and_has_response(&mut state_lock) {
+                            state_lock.bump_revision();
+                            eprintln!("[app] response absorbed, chat_msgs now {}",
+                                state_lock.chat_messages.get(
+                                    state_lock.active_app_id.as_deref().unwrap_or("")
+                                ).map_or(0, |v| v.len()));
+                        }
+                        let final_revision = state_lock.revision;
+                        if final_revision != self.last_revision {
+                            self.last_revision = final_revision;
+                            should_sync = true;
+                        }
+                    }
+                }
+                if should_sync {
+                    eprintln!("[app] calling sync_from_host_state");
                     self.sync_from_host_state(cx);
                 }
             }

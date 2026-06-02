@@ -219,6 +219,84 @@ RoundedView{
     }
 }`,
   },
+  chat: {
+    description:
+      "Standard AI chat app with conversation history. Renders in the splash area with messages as styled cards. Uses sub-inference (no tool calls) by default for pure text responses. Type messages in the native input bar below the splash. AI responses appear in the splash area.",
+    splashBody: "__chat__",
+  },
+  counter: {
+    description:
+      "Simple counter app with increment, decrement, and reset buttons.",
+    splashBody: `let count = 0
+RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true draw_bg.color:#x1e1e2e draw_bg.border_radius:10.0
+  Label{text:"Counter" draw_text.color:#fff draw_text.text_style.font_size:16}
+  display := Label{text:"0" draw_text.color:#x44cc88 draw_text.text_style.font_size:32}
+  View{flow:Right spacing:12 align:Align{x:0.5 y:0.5}
+    ButtonFlat{text:"-" on_click:||{count -= 1; ui.display.set_text(count + "")}}
+    ButtonFlat{text:"Reset" on_click:||{count = 0; ui.display.set_text("0")}}
+    ButtonFlat{text:"+" on_click:||{count += 1; ui.display.set_text(count + "")}}
+  }
+}`,
+  },
+  timer: {
+    description:
+      "Countdown timer with start, stop, and reset controls.",
+    splashBody: `let seconds = 60
+let running = false
+let timer_id = 0
+
+fn format_time(s){
+    let m = s / 60
+    let sec = s % 60
+    let sec_str = "" + sec
+    if sec < 10 { sec_str = "0" + sec_str }
+    m + ":" + sec_str
+}
+
+fn tick(){
+    if !running { return }
+    if seconds > 0 {
+        seconds -= 1
+        ui.timer_display.set_text(format_time(seconds))
+    }
+    if seconds == 0 {
+        running = false
+        ui.timer_status.set_text("Time's up!")
+    }
+}
+
+fn start_timer(){
+    if seconds <= 0 { seconds = 60 }
+    running = true
+    ui.timer_status.set_text("Running...")
+    timer_id = set_interval(|| tick(), 1000)
+}
+
+fn stop_timer(){
+    running = false
+    clear_interval(timer_id)
+    ui.timer_status.set_text("Paused")
+}
+
+fn reset_timer(){
+    running = false
+    clear_interval(timer_id)
+    seconds = 60
+    ui.timer_display.set_text("1:00")
+    ui.timer_status.set_text("Ready")
+}
+
+RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true draw_bg.color:#x1e1e2e draw_bg.border_radius:10.0
+  Label{text:"Timer" draw_text.color:#fff draw_text.text_style.font_size:16}
+  timer_display := Label{text:"1:00" draw_text.color:#xdd8844 draw_text.text_style.font_size:36}
+  timer_status := Label{text:"Ready" draw_text.color:#xaaa draw_text.text_style.font_size:11}
+  View{flow:Right spacing:12 align:Align{x:0.5 y:0.5}
+    ButtonFlat{text:"Start" on_click:|| start_timer()}
+    ButtonFlat{text:"Stop" on_click:|| stop_timer()}
+    ButtonFlat{text:"Reset" on_click:|| reset_timer()}
+  }
+}`,
+  },
   notes: {
     description:
       "Well-written quick notes app with add, delete, and clear-all flows.",

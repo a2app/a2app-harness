@@ -32,15 +32,22 @@ function findHarnessBinary(workspaceRoot: string): string {
  * This prevents "Address already in use" crashes on restart.
  */
 function killProcessesOnPorts(ports: number[]): void {
+  const ownPid = process.pid;
   for (const port of ports) {
     try {
-      const stdout = execSync(`lsof -ti :${port} 2>/dev/null`, {
+      // Only target LISTENING sockets — established connections (e.g.
+      // the pi agent's websocket to an old harness) should NOT be killed.
+      const stdout = execSync(`lsof -ti :${port} -sTCP:LISTEN 2>/dev/null`, {
         encoding: "utf-8",
         timeout: 3000,
       }).trim();
       if (stdout) {
         const pids = stdout.split("\n").filter(Boolean);
         for (const pid of pids) {
+          const pidNum = parseInt(pid, 10);
+          if (pidNum === ownPid) {
+            continue; // Never kill ourselves
+          }
           try {
             execSync(`kill -9 ${pid} 2>/dev/null`, { timeout: 2000 });
           } catch {
