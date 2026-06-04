@@ -3,7 +3,6 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const WS_PORT = 2341;
-const DOC_ID_PORT = 2348;
 
 let harnessProcess: ChildProcess | null = null;
 
@@ -27,37 +26,27 @@ function findHarnessBinary(workspaceRoot: string): string {
   return found;
 }
 
-/**
- * Kill any process holding the harness ports (2341, 2348).
- * This prevents "Address already in use" crashes on restart.
- */
-function killProcessesOnPorts(ports: number[]): void {
+function killProcessesOnPort(port: number): void {
   const ownPid = process.pid;
-  for (const port of ports) {
-    try {
-      // Only target LISTENING sockets — established connections (e.g.
-      // the pi agent's websocket to an old harness) should NOT be killed.
-      const stdout = execSync(`lsof -ti :${port} -sTCP:LISTEN 2>/dev/null`, {
-        encoding: "utf-8",
-        timeout: 3000,
-      }).trim();
-      if (stdout) {
-        const pids = stdout.split("\n").filter(Boolean);
-        for (const pid of pids) {
-          const pidNum = parseInt(pid, 10);
-          if (pidNum === ownPid) {
-            continue; // Never kill ourselves
-          }
-          try {
-            execSync(`kill -9 ${pid} 2>/dev/null`, { timeout: 2000 });
-          } catch {
-            // Process may already be gone
-          }
+  try {
+    const stdout = execSync(`lsof -ti :${port} -sTCP:LISTEN 2>/dev/null`, {
+      encoding: "utf-8",
+      timeout: 3000,
+    }).trim();
+    if (stdout) {
+      const pids = stdout.split("\n").filter(Boolean);
+      for (const pid of pids) {
+        const pidNum = parseInt(pid, 10);
+        if (pidNum === ownPid) continue;
+        try {
+          execSync(`kill -9 ${pid} 2>/dev/null`, { timeout: 2000 });
+        } catch {
+          // already gone
         }
       }
-    } catch {
-      // lsof may fail if no process is on the port — that's fine
     }
+  } catch {
+    // no process on port
   }
 }
 
@@ -66,14 +55,17 @@ export function startHarness(workspaceRoot: string): ChildProcess {
     return harnessProcess;
   }
 
-  // Kill any stale processes holding our ports before spawning.
-  killProcessesOnPorts([WS_PORT, DOC_ID_PORT]);
+  // Kill any stale process on our port
+  killProcessesOnPort(WS_PORT);
 
   const binaryPath = findHarnessBinary(workspaceRoot);
 
   harnessProcess = spawn(binaryPath, [], {
     stdio: ["ignore", "ignore", "inherit"],
-    env: { ...process.env, RUST_BACKTRACE: "1", MAKEPAD_HOST_WINDOWED: "1" },
+    env: {
+      ...process.env,
+      RUST_BACKTRACE: "1",
+    },
   });
 
   harnessProcess.on("exit", (code) => {
@@ -90,16 +82,14 @@ export function stopHarness(): void {
     return;
   }
 
-  // Try SIGTERM first for graceful shutdown, then SIGKILL after timeout.
   try {
     harnessProcess.kill("SIGTERM");
-    
-    // Give it 3 seconds to shut down gracefully, then force kill.
+
     const killTimeout = setTimeout(() => {
       try {
         harnessProcess?.kill("SIGKILL");
       } catch {
-        // Already dead
+        // already dead
       }
     }, 3000);
 
@@ -107,7 +97,7 @@ export function stopHarness(): void {
       clearTimeout(killTimeout);
     });
   } catch {
-    // Process already gone
+    // already gone
   }
 
   harnessProcess = null;

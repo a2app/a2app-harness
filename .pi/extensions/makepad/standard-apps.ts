@@ -219,11 +219,7 @@ RoundedView{
     }
 }`,
   },
-  chat: {
-    description:
-      "Standard AI chat app with conversation history. Renders in the splash area with messages as styled cards. Uses sub-inference (no tool calls) by default for pure text responses. Type messages in the native input bar below the splash. AI responses appear in the splash area.",
-    splashBody: "__chat__",
-  },
+
   counter: {
     description:
       "Simple counter app with increment, decrement, and reset buttons.",

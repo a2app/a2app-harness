@@ -1,5 +1,5 @@
-import { connectToHarness, getDocHandle } from "../doc-bridge";
-import { registerTools } from "../tools";
+import { connectToHarness, getDocHandle } from "../doc-bridge.js";
+import { registerTools } from "../tools.js";
 
 interface ToolDef {
   name: string;
@@ -68,15 +68,24 @@ async function main(): Promise<void> {
     throw new Error(`Launch tool returned error: ${JSON.stringify(launch)}`);
   }
 
-  await waitFor(() => {
-    const doc = getDocHandle().doc();
-    return Boolean(doc?.mini_apps?.[appId]);
-  }, timeoutMs, `mini app '${appId}' to appear`);
+  await waitFor(
+    () => {
+      const doc = getDocHandle().doc();
+      return (
+        doc?.pending_app?.id === appId &&
+        doc?.pending_app?.status === "Launched"
+      );
+    },
+    timeoutMs,
+    `app '${appId}' to be launched`,
+  );
 
   const doc = getDocHandle().doc();
-  const splash = String(doc?.mini_apps?.[appId]?.splash_body ?? "");
+  const splash = String(doc?.pending_app?.splash_body ?? "");
   if (!splash.includes("add_todo") || !splash.includes("toggle_todo")) {
-    throw new Error("Todo splash body does not match extension standard app template");
+    throw new Error(
+      "Todo splash body does not match extension standard app template",
+    );
   }
 
   const close = await closeTool.execute(
@@ -89,10 +98,14 @@ async function main(): Promise<void> {
     throw new Error(`Close tool returned error: ${JSON.stringify(close)}`);
   }
 
-  await waitFor(() => {
-    const current = getDocHandle().doc();
-    return !current?.mini_apps?.[appId];
-  }, timeoutMs, `mini app '${appId}' to close`);
+  await waitFor(
+    () => {
+      const current = getDocHandle().doc();
+      return current?.pending_app === null;
+    },
+    timeoutMs,
+    `app '${appId}' to close`,
+  );
 
   console.log(`Extension TypeScript integration succeeded for ${appId}`);
   process.exit(0);
