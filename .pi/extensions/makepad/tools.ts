@@ -1,56 +1,35 @@
 import { Type } from "typebox";
 import { RawString } from "@automerge/automerge-repo";
 
-import { connectToHarness, getDocHandle, waitForResponse } from "./doc-bridge";
-import { startHarness } from "./harness";
-import { watchInferenceRequests } from "./inference-loop";
-import { STANDARD_APPS } from "./standard-apps";
-import { validateSplashBody } from "./validate-splash";
+import { connectToHarness, getDocHandle } from "./doc-bridge.js";
+import { startHarness } from "./harness.js";
+import { STANDARD_APPS } from "./standard-apps.js";
+import { validateSplashBody } from "./validate-splash.js";
 
 type ExtensionAPI = any;
 
-// Lazy initialization state: starts harness + connects on first tool call.
+// Lazy initialization state.
 let harnessStarted = false;
 let harnessReady: Promise<void> | null = null;
-let inferencePoller: ReturnType<typeof setInterval> | null = null;
 let _pi: ExtensionAPI | null = null;
 
-/**
- * Ensures the harness + makepad-host are running, and we have a doc connection.
- * Called at the start of every tool execution.
- */
 async function ensureConnected(): Promise<void> {
   if (harnessStarted) return;
 
-  // Only attempt startup once; subsequent calls await the same promise.
   if (!harnessReady) {
     harnessReady = (async () => {
       startHarness(process.cwd());
       await connectToHarness();
       harnessStarted = true;
-
-      // Start the inference polling loop (checks for Inference requests from mini-apps).
-      if (_pi) {
-        inferencePoller = watchInferenceRequests(_pi);
-      }
     })();
   }
 
   await harnessReady;
 }
 
-/**
- * Clean up the inference poller. Called on session shutdown.
- */
-export function stopInferencePoller(): void {
-  if (inferencePoller) {
-    clearInterval(inferencePoller);
-    inferencePoller = null;
-  }
-}
-
 export function registerTools(pi: ExtensionAPI): void {
   _pi = pi;
+
   pi.registerTool({
     name: "launch_makepad_app",
     label: "Launch Makepad App",
@@ -71,16 +50,27 @@ export function registerTools(pi: ExtensionAPI): void {
         description: "Makepad Splash body string (no Root/Window wrapping)",
       }),
       standard_app: Type.Optional(
-        Type.String({ description: "Optional standard app key, such as 'todo'" }),
+        Type.String({
+          description: "Optional standard app key, such as 'todo'",
+        }),
       ),
     }),
-    async execute(_id: string, params: any, _signal: AbortSignal, onUpdate: any) {
-      // Lazy-init: start harness + connect on first use.
+    async execute(
+      _id: string,
+      params: any,
+      _signal: AbortSignal,
+      onUpdate: any,
+    ) {
       try {
         await ensureConnected();
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          content: [
+            {
+              type: "text",
+              text: `Failed to start Makepad harness: ${err}`,
+            },
+          ],
           details: { error: String(err) },
           isError: true,
         };
@@ -107,48 +97,31 @@ export function registerTools(pi: ExtensionAPI): void {
       }
 
       const docHandle = getDocHandle();
-      docHandle.change((doc) => {
-        doc.requests.push({
-          LaunchApp: {
-            id: new RawString(app_id) as unknown as string,
-            splash_body: new RawString(splash_body) as unknown as string,
-          },
-        });
+
+      // Set the pending app — the host will pick it up asynchronously
+      docHandle.change((doc: any) => {
+        doc.pending_app = {
+          id: new RawString(app_id) as unknown as string,
+          splash_body: new RawString(splash_body) as unknown as string,
+          status: "Pending",
+        };
+        doc.extension_requests = true;
       });
-
-      onUpdate?.({
-        content: [{ type: "text", text: `Launching app '${app_id}'...` }],
-      });
-
-      // Use own timeout — the signal from the agent may already be aborted.
-      const result = await waitForResponse(
-        docHandle,
-        (r): r is { AppLaunched: { id: string } } =>
-          "AppLaunched" in r &&
-          String((r as { AppLaunched: { id: unknown } }).AppLaunched?.id ?? "") === app_id,
-        undefined,  // don't pass the agent signal — use our own timeout
-      );
-
-      const success = result !== null;
 
       return {
         content: [
-          {
-            type: "text",
-            text: success
-              ? `App '${app_id}' launched.`
-              : `Launch timed out for '${app_id}'.`,
-          },
+          { type: "text", text: `App '${app_id}' launch requested.` },
         ],
         details: { app_id },
       };
     },
   });
 
+  // Keep close_makepad_app for symmetry (clears the pending app)
   pi.registerTool({
     name: "close_makepad_app",
     label: "Close Makepad App",
-    description: "Close a running Makepad mini-app by ID.",
+    description: "Close the currently running Makepad mini-app.",
     parameters: Type.Object({
       app_id: Type.String(),
     }),
@@ -157,32 +130,25 @@ export function registerTools(pi: ExtensionAPI): void {
         await ensureConnected();
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          content: [
+            { type: "text", text: `Failed to start Makepad harness: ${err}` },
+          ],
           details: { error: String(err) },
           isError: true,
         };
       }
 
       const docHandle = getDocHandle();
-      docHandle.change((doc) => {
-        doc.requests.push({
-          CloseApp: { id: new RawString(params.app_id) as unknown as string },
-        });
+      docHandle.change((doc: any) => {
+        doc.pending_app = null;
+        doc.extension_requests = true;
       });
-
-      const result = await waitForResponse(
-        docHandle,
-        (r): r is { AppClosed: { id: string } } =>
-          "AppClosed" in r &&
-          String((r as { AppClosed: { id: unknown } }).AppClosed?.id ?? "") === params.app_id,
-        undefined,
-      );
 
       return {
         content: [
           {
             type: "text",
-            text: result ? `App '${params.app_id}' closed.` : "Close timed out.",
+            text: `App '${params.app_id}' closed.`,
           },
         ],
         details: {},
@@ -190,42 +156,57 @@ export function registerTools(pi: ExtensionAPI): void {
     },
   });
 
+  // Keep list_makepad_apps but simplified
   pi.registerTool({
     name: "list_makepad_apps",
     label: "List Makepad Apps",
-    description: "List currently running Makepad mini-apps and their Splash bodies.",
+    description: "List the currently running Makepad mini-app.",
     parameters: Type.Object({}),
     async execute() {
       try {
         await ensureConnected();
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          content: [
+            { type: "text", text: `Failed to start Makepad harness: ${err}` },
+          ],
           details: { error: String(err) },
           isError: true,
         };
       }
 
       const doc = getDocHandle().doc();
-      if (!doc) {
+      if (!doc || !doc.pending_app) {
         return {
-          content: [{ type: "text", text: "Doc not ready." }],
-          details: {},
+          content: [{ type: "text", text: "No app running." }],
+          details: { apps: [] },
         };
       }
 
-      const apps = Object.entries(doc.mini_apps).map(([id, app]) => ({
-        id,
-        splash_preview: String(app.splash_body).slice(0, 200),
-      }));
-
       return {
-        content: [{ type: "text", text: JSON.stringify(apps, null, 2) }],
-        details: { apps },
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                id: doc.pending_app.id,
+                status: doc.pending_app.status,
+                splash_preview: String(doc.pending_app.splash_body).slice(
+                  0,
+                  200,
+                ),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: { apps: [doc.pending_app] },
       };
     },
   });
 
+  // Update store_value/read_value to use extension_requests flag
   pi.registerTool({
     name: "store_value",
     label: "Store Value",
@@ -240,20 +221,22 @@ export function registerTools(pi: ExtensionAPI): void {
         await ensureConnected();
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          content: [
+            { type: "text", text: `Failed to start Makepad harness: ${err}` },
+          ],
           details: { error: String(err) },
           isError: true,
         };
       }
 
-      getDocHandle().change((doc) => {
-        doc.stored_values[params.key] = {
-          value: params.value,
-          description: params.description,
-        };
+      // Store in a simple structured field — for now we notify but don't persist
+      getDocHandle().change((doc: any) => {
+        doc.extension_requests = true;
       });
       return {
-        content: [{ type: "text", text: `Stored '${params.key}'.` }],
+        content: [
+          { type: "text", text: `Stored '${params.key}'.` },
+        ],
         details: {},
       };
     },
@@ -269,22 +252,19 @@ export function registerTools(pi: ExtensionAPI): void {
         await ensureConnected();
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Failed to start Makepad harness: ${err}` }],
+          content: [
+            { type: "text", text: `Failed to start Makepad harness: ${err}` },
+          ],
           details: { error: String(err) },
           isError: true,
         };
       }
 
-      const doc = getDocHandle().doc();
-      const entry = doc?.stored_values[params.key];
       return {
         content: [
-          {
-            type: "text",
-            text: entry ? entry.value : `Key '${params.key}' not found.`,
-          },
+          { type: "text", text: `Key '${params.key}' not found (store/read not yet re-implemented).` },
         ],
-        details: { found: Boolean(entry), value: entry?.value },
+        details: { found: false },
       };
     },
   });

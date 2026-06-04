@@ -91,8 +91,7 @@ impl Widget for AgentSplash {
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         if self.body.as_ref() != v {
             self.body.set(v);
-            // Skip eval for the chat marker — the host renders it natively
-            if v != "__chat__" {
+            if !v.is_empty() {
                 self.eval_body(cx);
             }
             self.redraw(cx);
@@ -100,6 +99,7 @@ impl Widget for AgentSplash {
     }
 }
 
+#[allow(dead_code)]
 impl AgentSplashRef {
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {

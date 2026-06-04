@@ -11,17 +11,17 @@ You are operating in a Makepad mini-app environment.
 
 **Tools (call these like normal tool functions):**
 
-- `launch_makepad_app(app_id, splash_body, standard_app?)` — Launch or replace a Makepad mini-app with generated Splash DSL.
+- `launch_makepad_app(app_id, splash_body, standard_app?)` — Launch a single Makepad mini-app, replacing any previously running app.
   - Generate only the Splash body — no `Root{}`, `Window{}`, or Rust code.
   - Use `standard_app: "todo"` etc. to launch a built-in app from the list below.
   - Every `TextInput` must use a fixed numeric height such as `34`.
   - Do not use `on_render` in embedded Splash apps.
   - State variables (`let count = 0`) MUST be at the top, before any widget.
 
-- `close_makepad_app(app_id)` — Close/remove a running Makepad mini-app by its ID.
-  - Check `list_makepad_apps` first to get the correct `app_id`.
+- `close_makepad_app(app_id)` — Close the currently running Makepad mini-app.
+  - Only one app can run at a time.
 
-- `list_makepad_apps()` — List currently running mini-apps, their IDs, and Splash previews.
+- `list_makepad_apps()` — List the currently running mini-app.
 
 - `store_value(key, value, description)` — Persist a key-value pair accessible to mini-apps.
   - Always include a meaningful `description`.
@@ -30,12 +30,11 @@ You are operating in a Makepad mini-app environment.
 - `read_value(key)` — Retrieve a previously stored value by key.
   - Returns `"Key '<key>' not found."` if the key doesn't exist.
 
-**Default standard apps** (pass `standard_app: "<name>"` to `launch_makepad_app`):
+**Standard apps** (pass `standard_app: "<name>"` to `launch_makepad_app`):
 | App       | Description |
 |-----------|-------------|
 | `todo`    | Task list with add, toggle, delete, clear-completed (5 slots) |
 | `notes`   | Quick notes with add, delete, clear-all (5 slots) |
-| `chat`    | AI chat app with conversation history. Renders as a built-in panel. Uses sub-inference (no tool calls). |
 | `counter` | Simple increment/decrement/reset counter |
 | `timer`   | Countdown timer with start/stop/reset |
 
