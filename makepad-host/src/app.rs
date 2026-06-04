@@ -1,15 +1,10 @@
-use std::env;
-use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::Ordering;
 
 use makepad_widgets::*;
 
-/// Global flag set by the file-watcher thread when splash body changes.
-static SPLASH_UPDATED: AtomicBool = AtomicBool::new(false);
+use crate::{SHARED_DOC, DOC_CHANGED};
 
-app_main!(MakepadWindowApp);
+app_main!(MakepadHostApp);
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -21,7 +16,7 @@ script_mod! {
         width: Fill height: Fit
     }
 
-    startup() do #(MakepadWindowApp::script_component(vm)){
+    startup() do #(MakepadHostApp::script_component(vm)){
         ui: Root{
             main_window := Window{
                 window.inner_size: vec2(980, 760)
@@ -35,7 +30,8 @@ script_mod! {
 
                     status_line := Label {
                         text: "Waiting for app launch…"
-                        draw_text: { color: #xccddff text_style: { font_size: 11 } }
+                        draw_text.color: #xccddff
+                        draw_text.text_style.font_size: 11
                     }
 
                     splash_holder := RoundedView {
@@ -56,49 +52,43 @@ script_mod! {
 }
 
 #[derive(Script, ScriptHook)]
-pub struct MakepadWindowApp {
+pub struct MakepadHostApp {
     #[live]
     ui: WidgetRef,
     #[rust]
-    splash_file: String,
-    #[rust]
-    status_file: String,
-    #[rust]
-    last_content: String,
-    #[rust]
-    marker_written: bool,
-    #[rust]
     last_app_id: String,
+    #[rust]
+    last_splash_body: String,
 }
 
-impl MakepadWindowApp {
-    fn write_status(&self, status: &str) {
-        if !self.status_file.is_empty() {
-            let _ = fs::write(&self.status_file, status);
-        }
-    }
+impl MakepadHostApp {
+    /// Read the current app state from the shared doc and update the UI.
+    fn sync_from_doc(&mut self, cx: &mut Cx) {
+        let doc_handle = match SHARED_DOC.get() {
+            Some(h) => h,
+            None => return,
+        };
 
-    /// Read the splash body and app ID from the shared file.
-    /// The file format is: first line = app_id, rest = splash body.
-    fn read_splash_data(&self) -> (String, String) {
-        match fs::read_to_string(&self.splash_file) {
-            Ok(content) => {
-                let content = content.trim().to_string();
-                if content.is_empty() {
-                    return (String::new(), String::new());
-                }
-                // First line is the app_id, rest is the splash body
-                let mut lines = content.lines();
-                let app_id = lines.next().unwrap_or("").to_string();
-                let body = lines.collect::<Vec<&str>>().join("\n");
-                (app_id, body)
-            }
-            Err(_) => (String::new(), String::new()),
-        }
-    }
+        let (app_id, splash_body, should_exit) = doc_handle.with_document(|doc| {
+            use autosurgeon::hydrate;
+            let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+            let id = agent
+                .pending_app
+                .as_ref()
+                .map(|a| a.id.clone())
+                .unwrap_or_default();
+            let body = agent
+                .pending_app
+                .as_ref()
+                .map(|a| a.splash_body.clone())
+                .unwrap_or_default();
+            (id, body, agent.should_exit)
+        });
 
-    fn sync_splash(&mut self, cx: &mut Cx) {
-        let (app_id, splash_body) = self.read_splash_data();
+        if should_exit {
+            eprintln!("[makepad-host] should_exit received — exiting");
+            std::process::exit(0);
+        }
 
         if splash_body.is_empty() && app_id.is_empty() {
             // No app — clear everything
@@ -107,11 +97,11 @@ impl MakepadWindowApp {
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, "Waiting for app launch…");
             self.last_app_id.clear();
-            self.last_content.clear();
+            self.last_splash_body.clear();
             return;
         }
 
-        if splash_body != self.last_content || app_id != self.last_app_id {
+        if splash_body != self.last_splash_body || app_id != self.last_app_id {
             eprintln!(
                 "[makepad-host] rendering splash for app '{}' ({} chars)",
                 app_id,
@@ -123,36 +113,21 @@ impl MakepadWindowApp {
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, &format!("App: {}", app_id));
 
-            self.last_app_id = app_id.clone();
-            self.last_content = splash_body.clone();
+            self.last_app_id = app_id;
+            self.last_splash_body = splash_body;
         }
-    }
-
-    fn write_window_marker_once(&mut self) {
-        if self.marker_written {
-            return;
-        }
-        if let Ok(marker_path) = env::var("MAKEPAD_HOST_WINDOW_MARKER") {
-            let _ = fs::write(marker_path, "window-ready\n");
-        }
-        self.marker_written = true;
     }
 }
 
-impl AppMain for MakepadWindowApp {
+impl AppMain for MakepadHostApp {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         makepad_widgets::script_mod(vm);
         self::script_mod(vm)
     }
 
     fn after_new_from_script(_vm: &mut ScriptVm, app: &mut Self) {
-        app.splash_file = env::var("MAKEPAD_HOST_SPLASH_FILE")
-            .unwrap_or_else(|_| "/tmp/makepad-host-splash.txt".to_string());
-        app.status_file = env::var("MAKEPAD_HOST_STATUS_FILE")
-            .unwrap_or_else(|_| "/tmp/makepad-host-status.txt".to_string());
-        app.last_content = String::new();
-        app.marker_written = false;
         app.last_app_id = String::new();
+        app.last_splash_body = String::new();
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
@@ -161,40 +136,14 @@ impl AppMain for MakepadWindowApp {
         match event {
             Event::Startup => {
                 eprintln!("[makepad-host] Startup event");
-                self.write_window_marker_once();
-
-                // Start the file-watcher thread that polls for splash changes
-                let splash_file = self.splash_file.clone();
-                thread::spawn(move || {
-                    let poll_interval = Duration::from_millis(200);
-                    let mut last_mtime: Option<SystemTime> = None;
-
-                    loop {
-                        thread::sleep(poll_interval);
-
-                        let current = fs::metadata(&splash_file)
-                            .and_then(|m| m.modified())
-                            .ok();
-
-                        if current != last_mtime {
-                            last_mtime = current;
-                            SPLASH_UPDATED.store(true, Ordering::SeqCst);
-                        }
-                    }
-                });
-
-                // Initial sync
-                self.sync_splash(cx);
-                self.write_status("ready");
-            }
-            Event::Signal => {
-                eprintln!("[makepad-host] Signal received — re-syncing from file");
-                self.sync_splash(cx);
+                self.sync_from_doc(cx);
             }
             Event::Draw(_) => {
-                // Before drawing, check if the watcher thread flagged an update
-                if SPLASH_UPDATED.swap(false, Ordering::SeqCst) {
-                    self.sync_splash(cx);
+                // Poll for changes on each draw event.
+                // The background thread sets DOC_CHANGED when a change arrives.
+                if DOC_CHANGED.swap(false, Ordering::Relaxed) {
+                    eprintln!("[makepad-host] Doc change detected — re-syncing");
+                    self.sync_from_doc(cx);
                 }
             }
             _ => {}

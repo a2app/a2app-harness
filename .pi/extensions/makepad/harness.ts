@@ -2,7 +2,7 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-const WS_PORT = 2341;
+const JSON_WS_PORT = 2341;
 
 let harnessProcess: ChildProcess | null = null;
 
@@ -56,7 +56,8 @@ export function startHarness(workspaceRoot: string): ChildProcess {
   }
 
   // Kill any stale process on our port
-  killProcessesOnPort(WS_PORT);
+  killProcessesOnPort(JSON_WS_PORT);
+  killProcessesOnPort(2342); // also clean up samod WS port
 
   const binaryPath = findHarnessBinary(workspaceRoot);
 

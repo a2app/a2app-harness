@@ -4,6 +4,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { stopHarness } from "./harness.js";
 import { registerTools } from "./tools.js";
+import { connectToHarness, onMessage } from "./doc-bridge.js";
+import type { HarnessMessage } from "./types.js";
 
 let extensionDir = "";
 
@@ -40,12 +42,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async () => {
-    // Signal graceful shutdown via the shared doc.
     try {
-      const { getDocHandle } = await import("./doc-bridge.js");
-      getDocHandle().change((doc: any) => {
-        doc.should_exit = true;
-      });
+      const { sendToHarness } = await import("./doc-bridge.js");
+      sendToHarness({ type: "exit" });
     } catch {
       // Not connected.
     }
@@ -54,20 +53,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("before_agent_start", async (event: any) => {
-    try {
-      const { getDocHandle } = await import("./doc-bridge.js");
-      const doc = getDocHandle().doc();
-      const promptBase = loadMakepadPrompt(extensionDir);
+    // Try to connect and get app info for the system prompt.
+    // We don't block the agent on this — it's best-effort.
+    const runningAppLine = await getRunningAppInfo();
 
-      const runningAppLine = doc?.pending_app
-        ? `\n\nCurrently running Makepad app: ${doc.pending_app.id} (${doc.pending_app.status}).`
-        : "\n\nCurrently running Makepad apps: none.";
-
-      return {
-        systemPrompt: `${event.systemPrompt}\n\n${promptBase}${runningAppLine}`,
-      };
-    } catch {
-      return;
-    }
+    const promptBase = loadMakepadPrompt(extensionDir);
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${promptBase}${runningAppLine}`,
+    };
   });
+}
+
+async function getRunningAppInfo(): Promise<string> {
+  try {
+    const { quickConnectCheck } = await import("./doc-bridge.js");
+    const alive = await quickConnectCheck();
+    if (alive) {
+      return "\n\nCurrently running Makepad apps: see list_makepad_apps tool.";
+    }
+  } catch {
+    // ignore
+  }
+  return "\n\nMakepad harness not running. Apps will launch on first use.";
 }

@@ -1,5 +1,7 @@
 use makepad_widgets::*;
 
+use crate::SHARED_DOC;
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -104,6 +106,23 @@ impl AgentSplashRef {
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
+        }
+    }
+
+    /// Bridge for splash apps to send a response back to the pi extension.
+    /// Writes the response into the shared CRDT document's `user_response` field,
+    /// which the harness sees via CRDT sync and forwards to pi over JSON WS.
+    pub fn send_response(&self, _cx: &mut Cx, data: &str) {
+        if let Some(handle) = SHARED_DOC.get() {
+            handle.with_document(|doc| {
+                use autosurgeon::{hydrate, reconcile};
+                let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.user_response = Some(data.to_string());
+                let mut tx = doc.transaction();
+                let _ = reconcile(&mut tx, &agent);
+                tx.commit();
+                eprintln!("[splash] send_response: {}", data);
+            });
         }
     }
 }

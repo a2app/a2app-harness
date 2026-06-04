@@ -1,6 +1,10 @@
 use autosurgeon::{Hydrate, Reconcile};
 
-pub const WS_PORT: u16 = 2341;
+/// JSON WebSocket port — pi extension ↔ harness (plain JSON, no CRDT)
+pub const JSON_WS_PORT: u16 = 2341;
+
+/// samod WebSocket port — harness ↔ makepad-host (CRDT sync between Rust processes)
+pub const SAMOD_WS_PORT: u16 = 2342;
 
 #[derive(Debug, Clone, Default, Reconcile, Hydrate, PartialEq)]
 pub struct AgentDoc {
@@ -8,10 +12,15 @@ pub struct AgentDoc {
     /// None = no app running.
     pub pending_app: Option<PendingApp>,
     /// Flag set by the pi extension whenever it makes a change.
-    /// The Rust loop resets this and signals the UI.
+    /// The bridge resets this and signals the Makepad host.
     pub extension_requests: bool,
-    /// Set to true by the extension to request graceful shutdown.
+    /// Set to true by pi to request graceful shutdown.
     pub should_exit: bool,
+    /// Optional payload sent by the rendered splash app back to the
+    /// pi extension. Written by the Makepad host's AgentSplash widget
+    /// (`send_response`), synced to the harness via CRDT, then forwarded
+    /// to pi over JSON WS.
+    pub user_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]

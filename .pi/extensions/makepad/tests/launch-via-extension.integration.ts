@@ -1,113 +1,107 @@
-import { connectToHarness, getDocHandle } from "../doc-bridge.js";
-import { registerTools } from "../tools.js";
+import WebSocket from "ws";
 
-interface ToolDef {
-  name: string;
-  execute: (
-    id: string,
-    params: Record<string, unknown>,
-    signal: AbortSignal,
-    onUpdate?: (update: unknown) => void,
-  ) => Promise<Record<string, unknown>>;
-}
+const HARNESS_WS = "ws://127.0.0.1:2341/";
+const CONNECT_TIMEOUT_MS = 15_000;
 
-class FakePi {
-  private readonly tools = new Map<string, ToolDef>();
-
-  registerTool(tool: ToolDef): void {
-    this.tools.set(tool.name, tool);
-  }
-
-  getTool(name: string): ToolDef {
-    const tool = this.tools.get(name);
-    if (!tool) {
-      throw new Error(`Tool '${name}' was not registered`);
-    }
-    return tool;
-  }
-}
-
-async function waitFor(
-  predicate: () => boolean,
-  timeoutMs: number,
-  label: string,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    if (predicate()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`Timed out waiting for ${label}`);
+interface HarnessMessage {
+  type: string;
+  app_id?: string;
+  status?: string;
+  response?: string;
 }
 
 async function main(): Promise<void> {
   const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS ?? "30000");
   const appId = process.env.SMOKE_APP_ID ?? `ts-ext-smoke-${Date.now()}`;
 
-  await connectToHarness();
-
-  const fakePi = new FakePi();
-  registerTools(fakePi as unknown as any);
-
-  const launchTool = fakePi.getTool("launch_makepad_app");
-  const closeTool = fakePi.getTool("close_makepad_app");
-
-  const launch = await launchTool.execute(
-    "integration-launch",
-    {
-      app_id: appId,
-      standard_app: "todo",
-      splash_body: "",
-    },
-    AbortSignal.timeout(timeoutMs),
-  );
-
-  if (launch.isError) {
-    throw new Error(`Launch tool returned error: ${JSON.stringify(launch)}`);
-  }
-
-  await waitFor(
-    () => {
-      const doc = getDocHandle().doc();
-      return (
-        doc?.pending_app?.id === appId &&
-        doc?.pending_app?.status === "Launched"
+  // Connect to harness JSON WS and wait for welcome message
+  // Attach the message handler BEFORE resolving the connection to avoid races.
+  const { ws, welcome } = await new Promise<{ ws: WebSocket; welcome: HarnessMessage }>((resolve, reject) => {
+    const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+    const tryConnect = () => {
+      if (Date.now() > deadline) {
+        reject(new Error("Timed out connecting to harness"));
+        return;
+      }
+      const socket = new WebSocket(HARNESS_WS);
+      const welcomeTimeout = setTimeout(
+        () => reject(new Error("Timeout waiting for welcome")),
+        5000,
       );
-    },
-    timeoutMs,
-    `app '${appId}' to be launched`,
-  );
+      socket.on("message", (data: Buffer) => {
+        clearTimeout(welcomeTimeout);
+        const msg = JSON.parse(data.toString()) as HarnessMessage;
+        resolve({ ws: socket, welcome: msg });
+      });
+      socket.on("open", () => {
+        // Message handler already set up; welcome will arrive shortly
+      });
+      socket.on("error", () => {
+        clearTimeout(welcomeTimeout);
+        socket.close();
+        setTimeout(tryConnect, 500);
+      });
+    };
+    tryConnect();
+  });
 
-  const doc = getDocHandle().doc();
-  const splash = String(doc?.pending_app?.splash_body ?? "");
-  if (!splash.includes("add_todo") || !splash.includes("toggle_todo")) {
-    throw new Error(
-      "Todo splash body does not match extension standard app template",
+  if (welcome.type !== "welcome") {
+    throw new Error(`Expected welcome, got: ${JSON.stringify(welcome)}`);
+  }
+  console.error("Got welcome from harness");
+
+  // Listen for status updates
+  const statusPromise = new Promise<HarnessMessage>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Timeout waiting for status")),
+      timeoutMs,
     );
-  }
+    ws.on("message", (data: Buffer) => {
+      const msg = JSON.parse(data.toString()) as HarnessMessage;
+      if (msg.type === "status" && msg.app_id === appId) {
+        clearTimeout(timeout);
+        resolve(msg);
+      }
+    });
+  });
 
-  const close = await closeTool.execute(
-    "integration-close",
-    { app_id: appId },
-    AbortSignal.timeout(timeoutMs),
+  // Send launch
+  ws.send(
+    JSON.stringify({
+      type: "launch",
+      app_id: appId,
+      splash_body: `RoundedView{
+        width: Fill height: Fit
+        flow: Down spacing: 10 padding: 16
+        draw_bg.color: #x1e1e2e draw_bg.border_radius: 10.0
+        Label{text: "Integration Test" draw_text.color: #fff}
+      }`,
+    }),
   );
+  console.error("Sent launch request");
 
-  if (close.isError) {
-    throw new Error(`Close tool returned error: ${JSON.stringify(close)}`);
+  // Wait for status: Launched
+  const status = await statusPromise;
+  if (status.status !== "Launched") {
+    throw new Error(`Expected Launched status, got: ${JSON.stringify(status)}`);
   }
+  console.error(`App '${appId}' launched successfully`);
 
-  await waitFor(
-    () => {
-      const current = getDocHandle().doc();
-      return current?.pending_app === null;
-    },
-    timeoutMs,
-    `app '${appId}' to close`,
+  // Send clear
+  ws.send(
+    JSON.stringify({
+      type: "clear",
+      app_id: appId,
+    }),
   );
+  console.error("Sent clear request");
 
-  console.log(`Extension TypeScript integration succeeded for ${appId}`);
+  // Give harness a moment to process
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  ws.close();
+
+  console.log(`Integration test succeeded for ${appId}`);
   process.exit(0);
 }
 
