@@ -1,237 +1,450 @@
-mod repo;
-
 use std::env;
-use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::routing::get;
 use axum::Router;
-use futures::StreamExt;
-use samod::{DocHandle, Repo};
+use futures::{SinkExt, StreamExt};
+use samod::DocHandle;
+use serde::{Deserialize, Serialize};
+use shared::AgentDoc;
 use tokio::runtime::Runtime;
 
-use shared::{AppStatus, WS_PORT};
+// ── Ports ────────────────────────────────────────────────────────────────
 
-/// Global flag set by the watcher thread when should_exit is detected.
-/// The main thread polls this flag and performs cleanup.
-static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
+/// JSON WebSocket — pi extension ↔ harness (simple JSON messages, no CRDT)
+const JSON_WS_PORT: u16 = 2341;
+
+/// samod WebSocket — harness ↔ makepad-host (CRDT sync between two Rust processes)
+const SAMOD_WS_PORT: u16 = 2342;
+
+// ── Shared doc handle ────────────────────────────────────────────────────
+
+static SHARED_DOC: OnceLock<DocHandle> = OnceLock::new();
+
+// ── JSON WS message types (pi ↔ harness) ─────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum PiToHarnessMsg {
+    #[serde(rename = "launch")]
+    Launch { app_id: String, splash_body: String },
+    #[serde(rename = "clear")]
+    Clear { app_id: String },
+    #[serde(rename = "exit")]
+    Exit,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum HarnessToPiMsg {
+    #[serde(rename = "welcome")]
+    Welcome,
+    #[serde(rename = "status")]
+    Status { app_id: String, status: String },
+    #[serde(rename = "user_response")]
+    UserResponse { app_id: String, response: String },
+}
+
+// ── Startup ──────────────────────────────────────────────────────────────
 
 fn main() {
-    // ── 1. Create the tokio runtime and set up the shared doc ───────────
-    let rt = Runtime::new().expect("create tokio runtime");
+    // Only enable tracing if RUST_LOG is set
+    let _ = tracing_subscriber::fmt::try_init();
 
-    let (repo, doc_handle) = rt.block_on(async { repo::start_repo().await });
+    // If headless mode, skip spawning makepad-host (for testing)
+    let headless = env::var("HARNESS_HEADLESS").ok().as_deref() == Some("1");
 
-    // Clear any stale pending app from a previous session.
+    // Start the background async runtime on a separate thread
+    std::thread::spawn(move || {
+        let rt = Runtime::new().expect("create tokio runtime");
+        rt.block_on(background_main(headless));
+        eprintln!("[harness] background tasks finished");
+    });
+
+    // Main thread: just wait until background signals exit, or block forever
+    // In the future, this could do other things like run a CLI
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+// ── Background: bridge logic ─────────────────────────────────────────────
+
+async fn background_main(headless: bool) {
+    // ── 1. Create samod repo and shared doc ──────────────────────────
+    let repo = samod::Repo::build_tokio().load().await;
+
+    let mut initial = automerge::Automerge::new();
+    {
+        let mut tx = initial.transaction();
+        autosurgeon::reconcile(&mut tx, &AgentDoc::default())
+            .expect("reconcile default agent doc");
+        tx.commit();
+    }
+
+    let doc_handle = repo
+        .create(initial)
+        .await
+        .expect("create shared document");
+
+    // Clear any stale state
     doc_handle.with_document(|doc| {
         use autosurgeon::{hydrate, reconcile};
-        let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+        let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
         agent.pending_app = None;
         agent.extension_requests = false;
         agent.should_exit = false;
+        agent.user_response = None;
         let mut tx = doc.transaction();
         reconcile(&mut tx, &agent).expect("reconcile");
         tx.commit();
     });
 
-    let doc_handle_for_ws = doc_handle.clone();
-    let doc_handle_for_watcher = doc_handle.clone();
+    // Publish doc handle
+    if SHARED_DOC.set(doc_handle.clone()).is_err() {
+        eprintln!("[harness] SHARED_DOC already set");
+    }
 
-    // ── 2. Start websocket server for pi extension on a tokio task ──────
-    rt.spawn(async move {
-        serve_ws(repo, doc_handle_for_ws).await;
+    let doc_id = doc_handle.document_id().to_string();
+    eprintln!("[harness] shared doc ID: {doc_id}");
+
+    // ── 2. Set up samod WS server for makepad-host ─────────────────
+    // In samod 0.6.1, accept_axum is called directly on the Repo.
+    let repo_clone = repo.clone();
+    tokio::spawn(async move {
+        let ws_app = Router::new()
+            .route("/sync", get(move |ws: WebSocketUpgrade| {
+                let repo = repo_clone.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        if let Err(e) = repo.accept_axum(socket) {
+                            eprintln!("[harness] accept makepad-host WS: {e:?}");
+                        }
+                    })
+                }
+            }));
+        let addr = SocketAddr::from(([127, 0, 0, 1], SAMOD_WS_PORT));
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                eprintln!("[harness] samod WS listening on 127.0.0.1:{SAMOD_WS_PORT}");
+                let _ = axum::serve(listener, ws_app).await;
+            }
+            Err(e) => eprintln!("[harness] samod WS bind: {e}"),
+        }
     });
 
-    // ── 3. Prepare temp files for IPC with makepad-host ─────────────────
-    let runtime_dir = get_runtime_dir();
+    // ── 3. Spawn makepad-host (unless headless) ──────────────────────
+    let mut makepad_child: Option<Child> = None;
+    if !headless {
+        let ready_marker = format!("/tmp/makepad-host-ready-{}.marker", std::process::id());
+        let _ = std::fs::remove_file(&ready_marker);
 
-    // Ensure the runtime directory exists
-    let _ = fs::create_dir_all(&runtime_dir);
+        let harness_bin = env::current_exe().ok();
+        let makepad_bin = if let Some(ref bin) = harness_bin {
+            // Same directory as the harness binary
+            let mut p = bin.parent().unwrap().to_path_buf();
+            p.push("makepad-host");
+            if p.exists() { p } else {
+                // Fallback: try sibling directory
+                let mut p = bin.parent().unwrap().parent().unwrap().to_path_buf();
+                p.push("makepad-host");
+                p.push("target");
+                p.push("debug");
+                p.push("makepad-host");
+                p
+            }
+        } else {
+            // Guess: sibling in workspace
+            let mut p = env::current_dir().unwrap_or_default();
+            p.push("target");
+            p.push("debug");
+            p.push("makepad-host");
+            p
+        };
 
-    let splash_file = runtime_dir.join("splash_body.txt");
-    let status_file = runtime_dir.join("host_status.txt");
-    let window_marker = runtime_dir.join("window_ready.txt");
+        eprintln!("[harness] spawning makepad-host: {}", makepad_bin.display());
 
-    // ── 4. Spawn the doc-change watcher on a separate thread ────────────
-    let splash_file_for_watcher = splash_file.clone();
-    let status_file_for_watcher = status_file.clone();
-
-    // We need a second runtime because the watcher loop blocks on changes().
-    std::thread::spawn(move || {
-        let rt2 = Runtime::new().expect("create watcher runtime");
-        rt2.block_on(async move {
-            watch_doc_changes(
-                doc_handle_for_watcher,
-                splash_file_for_watcher,
-                status_file_for_watcher,
-            )
-            .await;
-        });
-    });
-
-    // ── 5. Spawn makepad-host as a separate process ────────────────────
-    // Can be disabled via env var MAKEPAD_HOST_DISABLE=1 (useful for tests or headless)
-    let host_disabled = env::var("MAKEPAD_HOST_DISABLE").ok().as_deref() == Some("1");
-
-    let makepad_host_binary = if host_disabled {
-        None
-    } else {
-        find_makepad_host_binary()
-    };
-    let mut host_process: Option<Child> = None;
-
-    if let Some(binary) = makepad_host_binary {
-        eprintln!("[harness] spawning makepad-host: {}", binary.display());
-
-        match Command::new(&binary)
-            .env("MAKEPAD_HOST_SPLASH_FILE", splash_file.to_str().unwrap())
-            .env("MAKEPAD_HOST_STATUS_FILE", status_file.to_str().unwrap())
-            .env("MAKEPAD_HOST_WINDOW_MARKER", window_marker.to_str().unwrap())
+        match Command::new(&makepad_bin)
+            .env("MAKEPAD_HOST_DOC_ID", &doc_id)
+            .env("MAKEPAD_HOST_WS_URL", format!("ws://127.0.0.1:{SAMOD_WS_PORT}/sync"))
+            .env("MAKEPAD_HOST_READY_MARKER", &ready_marker)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
         {
             Ok(child) => {
-                let pid = child.id();
-                eprintln!("[harness] makepad-host spawned (PID: {})", pid);
-                host_process = Some(child);
+                makepad_child = Some(child);
+                eprintln!("[harness] makepad-host spawned, waiting for ready marker...");
+
+                // Wait for makepad-host to signal readiness (with timeout)
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let mut ready = false;
+                while std::time::Instant::now() < deadline {
+                    if std::fs::read_to_string(&ready_marker)
+                        .ok()
+                        .map(|s| s.trim() == "ready")
+                        .unwrap_or(false)
+                    {
+                        ready = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                if ready {
+                    eprintln!("[harness] makepad-host is ready");
+                } else {
+                    eprintln!("[harness] WARNING: makepad-host did not become ready within timeout");
+                }
+                let _ = std::fs::remove_file(&ready_marker);
             }
-            Err(err) => {
-                eprintln!("[harness] failed to spawn makepad-host: {err}");
+            Err(e) => {
+                eprintln!("[harness] failed to spawn makepad-host: {e}");
+                eprintln!("[harness] continuing without makepad-host (headless-like mode)");
             }
         }
-    } else {
-        eprintln!("[harness] makepad-host binary not found — running headless");
     }
 
-    // ── 6. Wait for shutdown signal ────────────────────────────────────
-    // Block the main thread until SHOULD_EXIT flag is set (by the watcher
-    // thread when it detects should_exit in the doc).
-    while !SHOULD_EXIT.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
+    // ── 4. Set up JSON WS server for pi extension ────────────────────
+    // Wrap doc_handle in a shared state for the WS handler
+    let bridge_state = BridgeState {
+        doc: doc_handle.clone(),
+        pi_tx: tokio::sync::broadcast::channel(16).0,
+    };
+    let bridge = std::sync::Arc::new(tokio::sync::Mutex::new(bridge_state));
+
+    let bridge_for_ws = bridge.clone();
+    let doc_id_for_http = doc_id.clone();
+    tokio::spawn(async move {
+        // Serve both the JSON WS endpoint and a /doc_id HTTP endpoint
+        let ws_routes = Router::new()
+            .route("/", get(move |ws: WebSocketUpgrade| {
+                let bridge = bridge_for_ws.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        handle_pi_ws(socket, bridge).await;
+                    })
+                }
+            }));
+        let info_routes = Router::new().route(
+            "/doc_id",
+            get({
+                let doc_id = doc_id_for_http.clone();
+                move || {
+                    let body = doc_id.clone();
+                    async move { body }
+                }
+            }),
+        );
+        let json_app = Router::new().merge(ws_routes).merge(info_routes);
+        let addr = SocketAddr::from(([127, 0, 0, 1], JSON_WS_PORT));
+        // Kill stale processes on port
+        kill_process_on_port(JSON_WS_PORT);
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                eprintln!("[harness] JSON WS listening on 127.0.0.1:{JSON_WS_PORT}");
+                let _ = axum::serve(listener, json_app).await;
+            }
+            Err(e) => eprintln!("[harness] JSON WS bind: {e}"),
+        }
+    });
+
+    // ── 5. Bridge loop: doc changes → push to pi ────────────────────
+    // We also need to handle writes FROM pi in the WS handler above.
+    // Here we watch for doc changes (from makepad-host) and push to pi.
+    let mut doc_changes = doc_handle.changes();
+
+    while let Some(_change) = doc_changes.next().await {
+        let (has_response, app_id, status, exit) = doc_handle.with_document(|doc| {
+            use autosurgeon::hydrate;
+            let agent: AgentDoc = hydrate(doc).unwrap_or_default();
+            let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
+            let status = agent.pending_app.as_ref().map(|a| match &a.status {
+                shared::AppStatus::Pending => "Pending".to_string(),
+                shared::AppStatus::Launched => "Launched".to_string(),
+            });
+            (agent.user_response.clone(), app_id, status, agent.should_exit)
+        });
+
+        // Push user_response to pi if present
+        if let Some(ref response) = has_response {
+            if let Some(ref id) = app_id {
+                let msg = HarnessToPiMsg::UserResponse {
+                    app_id: id.clone(),
+                    response: response.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+        }
+
+        // Push status update to pi if we have an app
+        if let Some(ref id) = app_id {
+            if let Some(ref st) = status {
+                let msg = HarnessToPiMsg::Status {
+                    app_id: id.clone(),
+                    status: st.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+        }
+
+        if exit {
+            eprintln!("[harness] should_exit — stopping");
+            break;
+        }
     }
 
-    eprintln!("[harness] shutting down");
-
-    // ── 7. Cleanup ─────────────────────────────────────────────────────
-    if let Some(mut child) = host_process {
-        eprintln!("[harness] killing makepad-host (PID: {})", child.id());
+    // ── Cleanup ─────────────────────────────────────────────────────
+    if let Some(mut child) = makepad_child {
         let _ = child.kill();
         let _ = child.wait();
     }
 
-    // Clean up temp files
-    let _ = fs::remove_file(&splash_file);
-    let _ = fs::remove_file(&status_file);
-    let _ = fs::remove_file(&window_marker);
-    let _ = fs::remove_dir(&runtime_dir);
-
-    eprintln!("[harness] goodbye");
+    eprintln!("[harness] bridge loop ended");
 }
 
-// ── Temp directory helpers ───────────────────────────────────────────────
+// ── Bridge state ─────────────────────────────────────────────────────────
 
-fn get_runtime_dir() -> PathBuf {
-    let base = env::temp_dir();
-    let pid = std::process::id();
-    base.join(format!("a2app-harness-{}", pid))
+struct BridgeState {
+    doc: DocHandle,
+    /// Broadcast channel for pushing messages from the bridge loop
+    /// to the connected pi WebSocket.
+    pi_tx: tokio::sync::broadcast::Sender<String>,
 }
 
-fn find_makepad_host_binary() -> Option<PathBuf> {
-    if let Ok(path) = env::var("MAKEPAD_HOST_BINARY") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
+// ── Handle pi WebSocket connection ───────────────────────────────────────
 
-    // Search relative to the harness binary
-    if let Ok(exe_path) = env::current_exe() {
-        // Look in the same directory
-        let dir = exe_path.parent()?;
+async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<BridgeState>>) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
 
-        // The makepad-host binary is typically in the same target dir
-        // Try finding it in the workspace target directory
-        let mut candidate_paths: Vec<PathBuf> = vec![
-            dir.join("makepad-host"),
-            dir.join("makepad-host.exe"),
-        ];
-        // Relative to project root
-        if let Some(p) = dir.parent().and_then(|p| p.parent()).map(|p| p.join("makepad-host").join("target").join("debug").join("makepad-host")) {
-            candidate_paths.push(p);
-        }
-        // In the workspace target directory
-        if let Some(p) = dir.parent().and_then(|p| p.parent()).map(|p| p.join("target").join("debug").join("makepad-host")) {
-            candidate_paths.push(p);
-        }
+    use tokio::sync::mpsc;
+    let (fwd_tx, mut fwd_rx) = mpsc::unbounded_channel::<String>();
 
-        for candidate in &candidate_paths {
-            if candidate.exists() {
-                return Some(candidate.clone());
+    // Spawn a task to forward messages → pi WS
+    let fwd_handle = tokio::spawn(async move {
+        while let Some(msg) = fwd_rx.recv().await {
+            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Helper to send a message to pi
+    let send_to_pi = |msg: HarnessToPiMsg| {
+        let json = serde_json::to_string(&msg).unwrap_or_default();
+        let _ = fwd_tx.send(json);
+    };
+
+    // Send welcome
+    send_to_pi(HarnessToPiMsg::Welcome);
+    eprintln!("[harness] pi connected");
+
+    // Subscribe to the broadcast channel for doc changes
+    let mut pi_rx = bridge.lock().await.pi_tx.subscribe();
+
+    // Spawn a task to forward broadcast messages → fwd_tx
+    let fwd_tx2 = fwd_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(msg) = pi_rx.recv().await {
+            let _ = fwd_tx2.send(msg);
+        }
+    });
+
+    // Read messages from pi
+    let doc_handle = bridge.lock().await.doc.clone();
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Binary(_) => continue,
+            Message::Close(_) | Message::Ping(_) | Message::Pong(_) => continue,
+        };
+
+        let parsed: PiToHarnessMsg = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[harness] bad JSON from pi: {e}");
+                continue;
+            }
+        };
+
+        match parsed {
+            PiToHarnessMsg::Launch { app_id, splash_body } => {
+                eprintln!("[harness] pi: launch app '{app_id}' ({} chars)", splash_body.len());
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.pending_app = Some(shared::PendingApp {
+                        id: app_id.clone(),
+                        splash_body: splash_body.clone(),
+                        status: shared::AppStatus::Pending,
+                    });
+                    agent.extension_requests = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+
+                // Immediately set status to Launched and write it back
+                // so makepad-host can render it
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    if let Some(ref mut app) = agent.pending_app {
+                        app.status = shared::AppStatus::Launched;
+                    }
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+
+                // Push status to pi
+                send_to_pi(HarnessToPiMsg::Status {
+                    app_id: app_id.clone(),
+                    status: "Launched".to_string(),
+                });
+            }
+            PiToHarnessMsg::Clear { app_id } => {
+                eprintln!("[harness] pi: clear app '{app_id}'");
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.pending_app = None;
+                    agent.extension_requests = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+            }
+            PiToHarnessMsg::Exit => {
+                eprintln!("[harness] pi: exit");
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.should_exit = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+
+                break;
             }
         }
     }
 
-    // Last resort: look in common locations
-    let cwd_candidate = PathBuf::from("./target/debug/makepad-host");
-    if cwd_candidate.exists() {
-        return Some(cwd_candidate);
-    }
-
-    None
+    eprintln!("[harness] pi disconnected");
+    fwd_handle.abort();
 }
 
-// ── Websocket server ─────────────────────────────────────────────────────
-
-async fn serve_ws(repo: Repo, doc_handle: DocHandle) {
-    kill_process_on_port(WS_PORT);
-
-    let ws_app = Router::new()
-        .route("/sync", get(ws_upgrade_handler))
-        .with_state(repo);
-
-    // Also serve a simple endpoint so the extension can discover the doc ID.
-    let doc_id = doc_handle.document_id().to_string();
-    let info_app = Router::new().route(
-        "/doc_id",
-        get(move || {
-            let body = doc_id.clone();
-            async move { body }
-        }),
-    );
-
-    let combined = Router::new().merge(ws_app).merge(info_app);
-    let addr = SocketAddr::from(([127, 0, 0, 1], WS_PORT));
-
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            eprintln!("[harness] listening on 127.0.0.1:{WS_PORT}");
-            if let Err(err) = axum::serve(listener, combined).await {
-                eprintln!("[harness] server failed: {err}");
-            }
-        }
-        Err(err) => {
-            eprintln!("[harness] bind listener: {err} — port {WS_PORT} still in use");
-        }
-    }
-}
-
-async fn ws_upgrade_handler(
-    State(repo): State<Repo>,
-    ws: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        if let Err(err) = repo.accept_axum(socket) {
-            eprintln!("[harness] failed to accept websocket peer: {err:?}");
-        }
-    })
-}
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 fn kill_process_on_port(port: u16) {
     use std::process::Command;
@@ -248,93 +461,6 @@ fn kill_process_on_port(port: u16) {
                     let _ = Command::new("kill").args(["-9", pid]).status();
                 }
             }
-        }
-    }
-}
-
-// ── Doc change watcher ───────────────────────────────────────────────────
-
-async fn watch_doc_changes(
-    doc_handle: samod::DocHandle,
-    splash_file: PathBuf,
-    status_file: PathBuf,
-) {
-    let mut changes = doc_handle.changes();
-
-    eprintln!("[watcher] starting change listener");
-
-    while changes.next().await.is_some() {
-        eprintln!("[watcher] change detected!");
-
-        // Read the current doc state
-        let (needs_signal, should_exit, pending_app) = doc_handle.with_document(|doc| {
-            use autosurgeon::hydrate;
-            let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
-            eprintln!(
-                "[watcher] pending_app: {:?}, extension_requests: {}, should_exit: {}",
-                agent.pending_app, agent.extension_requests, agent.should_exit
-            );
-            (
-                agent.extension_requests,
-                agent.should_exit,
-                agent.pending_app.clone(),
-            )
-        });
-
-        if should_exit {
-            eprintln!("[watcher] should_exit received — signalling main thread");
-            SHOULD_EXIT.store(true, Ordering::SeqCst);
-            return;
-        }
-
-        if needs_signal {
-            eprintln!("[watcher] extension_requests is true, processing");
-
-            // Write the pending app data to the splash file for the makepad-host process
-            if let Some(ref app) = pending_app {
-                // The splash file format: first line = app_id, then blank line, then splash body
-                let content = format!("{}\n{}", app.id, app.splash_body);
-                let _ = fs::write(&splash_file, &content);
-                eprintln!(
-                    "[watcher] wrote splash file for app '{}' ({} bytes)",
-                    app.id,
-                    content.len()
-                );
-
-                // Update status: Pending → Launched
-                if app.status == AppStatus::Pending {
-                    doc_handle.with_document(|doc| {
-                        use autosurgeon::{hydrate, reconcile};
-                        let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
-                        if let Some(ref mut pa) = agent.pending_app {
-                            pa.status = AppStatus::Launched;
-                        }
-                        let mut tx = doc.transaction();
-                        reconcile(&mut tx, &agent).expect("reconcile");
-                        tx.commit();
-                    });
-                    eprintln!("[watcher] app status updated to Launched");
-                }
-            } else {
-                // No pending app — clear the splash file
-                let _ = fs::write(&splash_file, "");
-                eprintln!("[watcher] cleared splash file (no pending app)");
-            }
-
-            // Write ready status
-            let _ = fs::write(&status_file, "ready");
-
-            // Reset the flag
-            doc_handle.with_document(|doc| {
-                use autosurgeon::{hydrate, reconcile};
-                let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
-                agent.extension_requests = false;
-                let mut tx = doc.transaction();
-                reconcile(&mut tx, &agent).expect("reconcile");
-                tx.commit();
-            });
-
-            eprintln!("[watcher] extension_requests reset to false");
         }
     }
 }

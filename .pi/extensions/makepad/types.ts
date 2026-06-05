@@ -1,0 +1,29 @@
+// ── Local extension state ────────────────────────────────────────────────
+
+export type AppStatus = "Pending" | "Launched" | "Closed";
+
+export interface AppState {
+  app_id: string;
+  status: AppStatus;
+  splash_body: string;
+}
+
+// ── JSON WS protocol types (pi ↔ harness) ───────────────────────────────
+
+export interface WelcomeMessage {
+  type: "welcome";
+}
+
+export interface StatusMessage {
+  type: "status";
+  app_id: string;
+  status: "Pending" | "Launched";
+}
+
+export interface UserResponseMessage {
+  type: "user_response";
+  app_id: string;
+  response: string;
+}
+
+export type HarnessMessage = WelcomeMessage | StatusMessage | UserResponseMessage;

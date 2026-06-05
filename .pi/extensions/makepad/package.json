@@ -1,17 +1,15 @@
 {
   "name": "pi-makepad-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "private": true,
   "scripts": {
     "test:integration": "tsx ./tests/launch-via-extension.integration.ts"
   },
   "dependencies": {
-    "@automerge/automerge": "^2.2.0",
-    "@automerge/automerge-repo": "^2.5.0",
-    "@automerge/automerge-repo-network-websocket": "^2.5.0",
     "@earendil-works/pi-coding-agent": "latest",
-    "typebox": "latest"
+    "typebox": "latest",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "tsx": "^4.20.6",

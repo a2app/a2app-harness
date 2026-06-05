@@ -8,3 +8,11 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "12dcfc1e7
 shared = { path = "../shared" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+samod = { version = "=0.6.1", features = ["tokio", "tungstenite"] }
+automerge = "0.7.4"
+autosurgeon = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+url = "2"
+futures = "0.3"
+libc = "0.2"

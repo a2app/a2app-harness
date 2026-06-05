@@ -1,93 +1,120 @@
-import { Repo, type DocHandle } from "@automerge/automerge-repo";
-import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
+import WebSocket from "ws";
+import type { HarnessMessage } from "./types.js";
 
-import type { AgentDoc } from "./schema.js";
-
-const HARNESS_WS = "ws://127.0.0.1:2341/sync";
+const HARNESS_WS = "ws://127.0.0.1:2341/";
 const CONNECT_TIMEOUT_MS = 15_000;
-const POLL_INTERVAL_MS = 500;
-const FIND_RETRY_MS = 200;
+const CONNECT_RETRY_MS = 500;
+const QUICK_TIMEOUT_MS = 1_500;
 
-let handle: DocHandle<AgentDoc> | null = null;
+// ── Connection state ─────────────────────────────────────────────────────
 
-export async function connectToHarness(): Promise<DocHandle<AgentDoc>> {
-  const adapter = new WebSocketClientAdapter(HARNESS_WS);
-  const repo = new Repo({ network: [adapter] });
+let ws: WebSocket | null = null;
+let messageHandlers: Array<(msg: HarnessMessage) => void> = [];
+let connectedResolve: (() => void) | null = null;
+let connectedPromise: Promise<void> | null = null;
 
-  const docIdStr = await pollDocId(
-    `http://127.0.0.1:2341/doc_id`,
-    CONNECT_TIMEOUT_MS,
-    POLL_INTERVAL_MS,
-  );
-  handle = await findHarnessDoc(repo, docIdStr, CONNECT_TIMEOUT_MS);
-  await handle.whenReady();
-  return handle;
+export function onMessage(handler: (msg: HarnessMessage) => void): () => void {
+  messageHandlers.push(handler);
+  return () => {
+    messageHandlers = messageHandlers.filter((h) => h !== handler);
+  };
 }
 
-async function findHarnessDoc(
-  repo: Repo,
-  rawDocId: string,
-  timeoutMs: number,
-): Promise<DocHandle<AgentDoc>> {
-  const deadline = Date.now() + timeoutMs;
-  const candidates = [rawDocId, `automerge:${rawDocId}`];
-  let lastError: unknown = null;
+export async function connectToHarness(): Promise<void> {
+  if (connectedPromise) return connectedPromise;
 
-  while (Date.now() <= deadline) {
-    for (const candidate of candidates) {
-      try {
-        return await repo.find<AgentDoc>(candidate as any);
-      } catch (err) {
-        lastError = err;
+  connectedPromise = new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+
+    const tryConnect = () => {
+      if (Date.now() > deadline) {
+        connectedPromise = null;
+        reject(new Error("Timed out connecting to harness"));
+        return;
       }
-    }
 
-    await new Promise((resolve) => setTimeout(resolve, FIND_RETRY_MS));
-  }
+      const socket = new WebSocket(HARNESS_WS);
+      let settled = false;
 
-  throw new Error(
-    `Timed out finding harness document '${rawDocId}': ${String(lastError)}`,
-  );
-}
+      const cleanRetry = () => {
+        if (settled) return;
+        settled = true;
+        socket.close();
+        setTimeout(tryConnect, CONNECT_RETRY_MS);
+      };
 
-export function getDocHandle(): DocHandle<AgentDoc> {
-  if (!handle) {
-    throw new Error("Not connected to harness");
-  }
-  return handle;
-}
+      socket.on("open", () => {
+        ws = socket;
+        connectedResolve = resolve;
+      });
 
-/**
- * Force a fresh connection to the harness. Call this if getDocHandle()
- * returns a stale handle (e.g. after the harness was restarted).
- */
-export async function reconnectToHarness(): Promise<DocHandle<AgentDoc>> {
-  handle = await connectToHarness();
-  return handle;
-}
-
-async function pollDocId(
-  url: string,
-  timeoutMs: number,
-  pollMs: number,
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() <= deadline) {
-    try {
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const text = (await resp.text()).trim();
-        if (text.length > 0) {
-          return text;
+      socket.on("message", (data: Buffer) => {
+        try {
+          const msg = JSON.parse(data.toString()) as HarnessMessage;
+          if (msg.type === "welcome") {
+            if (connectedResolve) {
+              connectedResolve();
+              connectedResolve = null;
+            }
+          }
+          for (const handler of messageHandlers) {
+            handler(msg);
+          }
+        } catch (err) {
+          // ignore parse errors
         }
-      }
-    } catch {
-      // Harness may not be up yet.
-    }
+      });
 
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+      socket.on("close", () => {
+        ws = null;
+        cleanRetry();
+      });
+
+      socket.on("error", () => {
+        socket.close();
+        cleanRetry();
+      });
+
+      const connectTimeout = setTimeout(() => {
+        if (ws?.readyState !== WebSocket.OPEN) {
+          cleanRetry();
+        }
+      }, CONNECT_RETRY_MS);
+
+      socket.on("open", () => {
+        clearTimeout(connectTimeout);
+      });
+    };
+
+    tryConnect();
+  });
+
+  return connectedPromise;
+}
+
+export async function quickConnectCheck(): Promise<boolean> {
+  // Quick TCP-level check: does anything answer on the harness port?
+  // We try a WebSocket connect with a short deadline.
+  return new Promise<boolean>((resolve) => {
+    const socket = new WebSocket(HARNESS_WS);
+    const timer = setTimeout(() => {
+      socket.close();
+      resolve(false);
+    }, QUICK_TIMEOUT_MS);
+    socket.on("open", () => {
+      clearTimeout(timer);
+      socket.close();
+      resolve(true);
+    });
+    socket.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+export function sendToHarness(msg: object): void {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
   }
-
-  throw new Error(`Timed out waiting for harness doc id at ${url}`);
 }
