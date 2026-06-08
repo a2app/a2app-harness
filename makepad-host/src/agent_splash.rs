@@ -23,11 +23,17 @@ pub struct AgentSplash {
     body: ArcStringMut,
     #[rust]
     render_ok: bool,
+    /// Tracks the last known text of the __pi_response label
+    #[rust]
+    last_response: String,
 }
 
-// NOTE: No trailing quote/brace — the parser auto-closes the View{}
-// This matches the pattern in Makepad's built-in Splash widget (widgets/src/splash.rs)
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit, ";
+// The splash body is wrapped in: <PREFIX><body><SUFFIX>
+// The parser auto-closes the outer View.
+// __pi_response is a hidden label that splash apps can set text on
+// to send a response back to the pi extension.
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
+const SPLASH_SUFFIX: &str = "  __pi_response := Label{text:\"\"}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -47,7 +53,10 @@ impl AgentSplash {
     fn render_body(&mut self, cx: &mut Cx, body: &str) -> bool {
         let self_id = self.self_id();
         let widget_uid = self.widget_uid();
-        let code = format!("{}{}", SPLASH_PREFIX, body);
+        // Wrap body with prefix + suffix
+        // __pi_response is a hidden label the splash body can set via ui.__pi_response.set_text("...")
+        // to send responses back to the pi extension.
+        let code = format!("{}{}{}", SPLASH_PREFIX, body, SPLASH_SUFFIX);
         let script_mod = ScriptMod {
             cargo_manifest_path: String::new(),
             module_path: String::new(),
@@ -88,6 +97,19 @@ impl AgentSplash {
 impl Widget for AgentSplash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        
+        // After each event, check if the splash body updated __pi_response.
+        // Splash apps call ui.__pi_response.set_text("data") to send
+        // data back to the pi extension.
+        let response_widget = self.widget(cx, &[id!(__pi_response)]);
+        if !response_widget.is_empty() {
+            let current = response_widget.text();
+            if current != self.last_response && !current.is_empty() {
+                let new_response = current.clone();
+                self.last_response = current;
+                write_doc_field("user_response", new_response.clone());
+            }
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -101,6 +123,7 @@ impl Widget for AgentSplash {
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         if self.body.as_ref() != v {
             self.body.set(v);
+            self.last_response = String::new(); // reset response tracker
             if !v.is_empty() {
                 self.render_ok = self.eval_body(cx);
                 if !self.render_ok {

@@ -49,6 +49,19 @@ ButtonFlat{text:"+" on_click:||{count += 1; ui.display.set_text(count + "")}}
 - `ui.<name>.set_text("...")` updates any widget's text content
 - **Every container** — including inner `View{flow:Right}` — MUST have explicit `height: Fit`
 
+## Sending Data Back to Pi
+
+Splash apps can send data back to the pi extension by setting text on the built-in `__pi_response` label:
+
+```splash
+ButtonFlat{text:"Send" on_click:||{ui.__pi_response.set_text("hello from splash")}}
+ButtonFlat{text:"Send Count" on_click:||{count += 1; ui.__pi_response.set_text("count: " + count)}}
+```
+
+The `__pi_response` label is automatically available in every splash app (injected by the AgentSplash wrapper). Setting its text writes to the shared CRDT document's `user_response` field, which the harness forwards to pi as a `{"type":"user_response",...}` JSON message.
+
+Each new non-empty text triggers a new response. Empty strings are ignored.
+
 ## What Does NOT Work (Verified)
 
 | Feature | Status | Notes |

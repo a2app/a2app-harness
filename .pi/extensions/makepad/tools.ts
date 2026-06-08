@@ -153,12 +153,15 @@ export function registerTools(pi: ExtensionAPI): void {
             return;
           }
 
-          if (msg.type === "status" && msg.app_id === app_id && !statusReceived) {
+          // Only start debounce on "Launched" status, not "Pending".
+          // The harness now writes Launched immediately after Pending.
+          // This ensures errors from makepad-host arrive within the debounce window.
+          if (msg.type === "status" && msg.status === "Launched" && msg.app_id === app_id && !statusReceived) {
             statusReceived = true;
             if (currentApp) {
               currentApp.status = msg.status as AppState["status"];
             }
-            // Debounce: wait 1.5s after status before resolving,
+            // Debounce: wait 1.5s after Launched status before resolving,
             // to catch any rendering error that follows
             statusTimer = setTimeout(() => {
               clearTimeout(timeout);
@@ -359,7 +362,7 @@ export function registerTools(pi: ExtensionAPI): void {
                 return;
               }
 
-              if (msg.type === "status" && msg.app_id === appId && !statusReceived) {
+              if (msg.type === "status" && msg.status === "Launched" && msg.app_id === appId && !statusReceived) {
                 statusReceived = true;
                 if (currentApp) {
                   currentApp.status = msg.status as AppState["status"];

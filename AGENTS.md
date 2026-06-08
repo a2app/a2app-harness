@@ -347,13 +347,41 @@ The inner View MUST have `height: Fit`:
 ❌ View{flow:Right spacing:12 ...}  ← buttons invisible!
 ```
 
+### send_response Mechanism
+
+Splash apps can send arbitrary string data back to the pi extension by setting text on the built-in `__pi_response` label:
+
+```splash
+ButtonFlat{text:"Send" on_click:||{ui.__pi_response.set_text("my response data")}}
+```
+
+**Implementation** (in `makepad-host/src/agent_splash.rs`):
+1. The `SPLASH_SUFFIX` injects a hidden `__pi_response := Label{text:""}` into every evaluated body
+2. `AgentSplash::handle_event` checks this label's text on every event cycle
+3. If text has changed (and is non-empty), it writes `user_response` to the shared CRDT doc
+4. The harness bridge loop detects the change and forwards `{"type":"user_response","app_id":"...","response":"..."}` to pi
+
+### Status Race Condition Fix
+
+**Problem:** The harness used to write `status: Pending` to the doc, then the bridge loop immediately forwarded it to pi. The pi extension started its debounce timer on the first status ("Pending"), but rendering errors from makepad-host arrived after the debounce expired. Result: tools reported "Launched" even when rendering failed.
+
+**Fix (harness):** The launch handler now writes `Pending` and then immediately writes `Launched` in a second transaction:
+```rust
+// First write: Pending
+doc_handle.with_document(|doc| { ... status: Pending ... });
+// Second write: Launched (immediately after)
+doc_handle.with_document(|doc| { ... status: Launched ... });
+```
+
+**Fix (pi extension):** The tools.ts launch handler now only starts its 1.5s debounce on `msg.status === "Launched"`, not on any status message. Errors from makepad-host arrive within the debounce window because the harness writes Launched first (triggering the timer) and errors from the host arrive shortly after via CRDT sync.
+
 ### Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
 | Unknown widget | Caught by pre-validation before sending |
 | VM eval failure | Makepad renders error fallback (dark red), sets `error_message` in doc |
-| Status stuck "Pending" | Tool resolved on first status ("Pending") before makepad-host processed app — known race condition |
+| Status race condition | Fixed — harness writes Launched immediately; pi extension waits for Launched
 
 ## Test
 

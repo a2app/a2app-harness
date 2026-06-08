@@ -383,15 +383,33 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
             PiToHarnessMsg::Launch { app_id, splash_body } => {
                 eprintln!("[harness] pi: launch app '{app_id}' ({} chars)", splash_body.len());
 
+                // First write: set Pending status
                 doc_handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    // Clear stale state
+                    agent.user_response = None;
+                    agent.error_message = None;
                     agent.pending_app = Some(shared::PendingApp {
                         id: app_id.clone(),
                         splash_body: splash_body.clone(),
                         status: shared::AppStatus::Pending,
                     });
                     agent.extension_requests = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+
+                // Second write: immediately advance to Launched so the pi extension
+                // receives "Launched" status (not "Pending") and starts its debounce
+                // window during which errors from makepad-host can arrive.
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    if let Some(ref mut app) = agent.pending_app {
+                        app.status = shared::AppStatus::Launched;
+                    }
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
