@@ -1,7 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,10 +19,6 @@ const JSON_WS_PORT: u16 = 2341;
 
 /// samod WebSocket — harness ↔ makepad-host (CRDT sync between two Rust processes)
 const SAMOD_WS_PORT: u16 = 2342;
-
-// ── Shared doc handle ────────────────────────────────────────────────────
-
-static SHARED_DOC: OnceLock<DocHandle> = OnceLock::new();
 
 // ── JSON WS message types (pi ↔ harness) ─────────────────────────────────
 
@@ -103,11 +98,6 @@ async fn background_main(headless: bool) {
         reconcile(&mut tx, &agent).expect("reconcile");
         tx.commit();
     });
-
-    // Publish doc handle
-    if SHARED_DOC.set(doc_handle.clone()).is_err() {
-        eprintln!("[harness] SHARED_DOC already set");
-    }
 
     let doc_id = doc_handle.document_id().to_string();
     eprintln!("[harness] shared doc ID: {doc_id}");
@@ -383,31 +373,12 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     agent.pending_app = Some(shared::PendingApp {
                         id: app_id.clone(),
                         splash_body: splash_body.clone(),
-                        status: shared::AppStatus::Pending,
+                        status: shared::AppStatus::Launched,
                     });
                     agent.extension_requests = true;
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
-                });
-
-                // Immediately set status to Launched and write it back
-                // so makepad-host can render it
-                doc_handle.with_document(|doc| {
-                    use autosurgeon::{hydrate, reconcile};
-                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
-                    if let Some(ref mut app) = agent.pending_app {
-                        app.status = shared::AppStatus::Launched;
-                    }
-                    let mut tx = doc.transaction();
-                    let _ = reconcile(&mut tx, &agent);
-                    tx.commit();
-                });
-
-                // Push status to pi
-                send_to_pi(HarnessToPiMsg::Status {
-                    app_id: app_id.clone(),
-                    status: "Launched".to_string(),
                 });
             }
             PiToHarnessMsg::Clear { app_id } => {

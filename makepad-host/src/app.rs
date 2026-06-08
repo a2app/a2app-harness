@@ -1,8 +1,6 @@
-use std::sync::atomic::Ordering;
-
 use makepad_widgets::*;
 
-use crate::{SHARED_DOC, DOC_CHANGED};
+use crate::SHARED_DOC;
 
 app_main!(MakepadHostApp);
 
@@ -138,13 +136,9 @@ impl AppMain for MakepadHostApp {
                 eprintln!("[makepad-host] Startup event");
                 self.sync_from_doc(cx);
             }
-            Event::Draw(_) => {
-                // Poll for changes on each draw event.
-                // The background thread sets DOC_CHANGED when a change arrives.
-                if DOC_CHANGED.swap(false, Ordering::Relaxed) {
-                    eprintln!("[makepad-host] Doc change detected — re-syncing");
-                    self.sync_from_doc(cx);
-                }
+            Event::Signal => {
+                eprintln!("[makepad-host] Doc change signal — re-syncing");
+                self.sync_from_doc(cx);
             }
             _ => {}
         }
