@@ -111,6 +111,31 @@ impl MakepadHostApp {
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, &format!("App: {}", app_id));
 
+            // After rendering the splash successfully, update the doc status
+            // from Pending to Launched so the bridge pushes the status to pi.
+            // Only do this once per app render.
+            doc_handle.with_document(|doc| {
+                use autosurgeon::{hydrate, reconcile};
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                let needs_update = agent
+                    .pending_app
+                    .as_ref()
+                    .map(|a| a.status == shared::AppStatus::Pending)
+                    .unwrap_or(false);
+                if needs_update {
+                    let mut agent = agent.clone();
+                    if let Some(ref mut app) = agent.pending_app {
+                        app.status = shared::AppStatus::Launched;
+                    }
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                    eprintln!(
+                        "[makepad-host] set app status to Launched"
+                    );
+                }
+            });
+
             self.last_app_id = app_id;
             self.last_splash_body = splash_body;
         }

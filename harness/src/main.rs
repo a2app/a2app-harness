@@ -373,7 +373,7 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     agent.pending_app = Some(shared::PendingApp {
                         id: app_id.clone(),
                         splash_body: splash_body.clone(),
-                        status: shared::AppStatus::Launched,
+                        status: shared::AppStatus::Pending,
                     });
                     agent.extension_requests = true;
                     let mut tx = doc.transaction();
