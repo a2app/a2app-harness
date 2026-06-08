@@ -1,6 +1,6 @@
 // ── Local extension state ────────────────────────────────────────────────
 
-export type AppStatus = "Pending" | "Launched" | "Closed";
+export type AppStatus = "Pending" | "Launched" | "Error" | "Closed";
 
 export interface AppState {
   app_id: string;

@@ -15,7 +15,18 @@ let harnessReady: Promise<void> | null = null;
 let currentApp: AppState | null = null;
 
 async function ensureConnected(): Promise<void> {
-  if (harnessStarted) return;
+  // If we think we're connected but the harness is dead, reset
+  if (harnessStarted) {
+    // Check if harness is actually alive by doing a quick connect test
+    const { quickConnectCheck } = await import("./doc-bridge.js");
+    const alive = await quickConnectCheck();
+    if (!alive) {
+      harnessStarted = false;
+      harnessReady = null;
+    } else {
+      return;
+    }
+  }
 
   if (!harnessReady) {
     harnessReady = (async () => {
@@ -110,6 +121,16 @@ export function registerTools(pi: ExtensionAPI): void {
       const launchResult = await new Promise<{ ok: boolean; message: string }>((resolve) => {
         const timeout = setTimeout(() => resolve({ ok: false, message: `Timed out awaiting confirmation for '${app_id}'.` }), 10_000);
         const unsub = onMessage((msg: HarnessMessage) => {
+          // Check error FIRST — errors take priority over status
+          if (msg.type === "error" && msg.app_id === app_id) {
+            clearTimeout(timeout);
+            unsub();
+            if (currentApp) {
+              currentApp.status = "Error";
+            }
+            resolve({ ok: false, message: `App '${app_id}' error: ${msg.message}` });
+            return;
+          }
           if (msg.type === "status" && msg.app_id === app_id) {
             if (currentApp) {
               currentApp.status = msg.status as AppState["status"];
@@ -117,11 +138,6 @@ export function registerTools(pi: ExtensionAPI): void {
             clearTimeout(timeout);
             unsub();
             resolve({ ok: true, message: `App '${app_id}' launched.` });
-          }
-          if (msg.type === "error" && msg.app_id === app_id) {
-            clearTimeout(timeout);
-            unsub();
-            resolve({ ok: false, message: `App '${app_id}' error: ${msg.message}` });
           }
         });
       });

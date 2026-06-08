@@ -131,14 +131,19 @@ impl MakepadHostApp {
                 splash_body.len()
             );
 
-            let render_ok = self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
-            if !render_ok {
-                self.ui.label(cx, ids!(status_line))
-                    .set_text(cx, &format!("App: {} — ⚠ RENDER ERROR", app_id));
-            }
+            self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
             self.ui.widget(cx, ids!(source)).set_text(cx, &splash_body);
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, &format!("App: {}", app_id));
+
+            // Check if an error was reported during rendering (set_text calls eval_body
+            // which writes to doc's error_message on failure).
+            // If rendering failed, keep the error_message; otherwise clear it.
+            let had_error = doc_handle.with_document(|doc| {
+                use autosurgeon::hydrate;
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.error_message.is_some()
+            });
 
             // Update the doc status from Pending to Launched.
             // Only clear previous error if rendering was successful.
@@ -155,14 +160,14 @@ impl MakepadHostApp {
                     if let Some(ref mut app) = agent.pending_app {
                         app.status = shared::AppStatus::Launched;
                     }
-                    if render_ok {
+                    if !had_error {
                         agent.error_message = None;
                     }
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
                     eprintln!(
-                        "[makepad-host] set app status to Launched (render_ok: {render_ok})"
+                        "[makepad-host] set app status to Launched (error: {had_error})"
                     );
                 }
             });
