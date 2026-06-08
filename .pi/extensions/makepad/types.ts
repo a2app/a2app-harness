@@ -6,6 +6,8 @@ export interface AppState {
   app_id: string;
   status: AppStatus;
   splash_body: string;
+  /** Last error message from rendering failure, if any */
+  last_error?: string;
 }
 
 // ── JSON WS protocol types (pi ↔ harness) ───────────────────────────────

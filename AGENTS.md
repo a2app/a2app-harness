@@ -171,6 +171,100 @@ The Splash DSL is a declarative domain-specific language parsed by Makepad's bui
 
 The `standard_app` parameter on `launch_makepad_app` is informational/optional — `splash_body` is always required. To use a standard template, copy its `.splashBody` string from `standard-apps.ts`.
 
+## Debugging Failures — Splash Rendering Diagnostic System
+
+### How failures happen
+
+When a Splash body fails to render on the makepad-host:
+
+1. `AgentSplash::eval_body()` in `makepad-host/src/agent_splash.rs` tries to evaluate the body in Makepad's VM
+2. If parsing fails, it renders an error fallback (dark red background, "Splash app could not be rendered")
+3. It calls `report_error("Splash body could not be rendered")` which writes `error_message` to the shared CRDT doc
+4. The harness bridge loop sees `error_message` and forwards `{"type":"error","app_id":"...","message":"..."}` over JSON WS to pi
+
+### Problem (historical): Race condition
+
+The harness writes `status → Launched` to the doc **immediately** after receiving the launch request, before the makepad-host has even received the CRDT sync. So `{"type":"status"}` arrives at pi before `{"type":"error"}`. The old code resolved the `launch_makepad_app` tool on the first status message, **silently swallowing the error**.
+
+### Fix: 1.5s debounce window
+
+In `tools.ts`, the launch tool now waits **1.5 seconds** after receiving `status` before resolving, collecting any `error` messages during that window. If an error arrives, the tool reports `isError: true` with the error message.
+
+Total timeout: 12s (10s original + 2s buffer).
+
+### Tool: `check_debug_app`
+
+A dedicated tool for diagnosing and fixing splash rendering failures:
+
+**Parameters:**
+- `app_id` (optional) — defaults to the current running app
+- `retry_splash_body` (optional) — corrected Splash body to re-launch
+
+**Without `retry_splash_body`:** returns the app's status, any stored error, and a helpful hint.
+
+**With `retry_splash_body`:** re-launches the app with the corrected body (same debounce window logic).
+
+Errors persist in a `lastErrors` map keyed by `app_id`, so even if the error arrives after the tool call finishes, it's visible via `check_debug_app` or `list_makepad_apps`.
+
+### Tool: `list_makepad_apps`
+
+Now shows `error` field (null or string) alongside `id`, `status`, and `splash_preview`.
+
+### Pre-validation: `validate-splash.ts`
+
+Before sending a splash body to the harness, the extension runs it through `validateSplashBody()`. Errors are returned immediately with a descriptive message.
+
+**Checks added to catch the "blue sliver" failure modes:**
+
+| Check | What it catches |
+|-------|----------------|
+| Unknown widget names | `ScrollView`, `ListView`, misspelled widgets — anything not in `KNOWN_WIDGETS` set |
+| Multiline string literals | `let x = "line1\nline2"` — Splash DSL strings can't span lines; use separate `Label` per line |
+| Undeclared named references | Using `ui.foo` or `foo.text` where `foo` was never declared with `:=` |
+| Parenthesized `if (cond)` | Splash uses `if cond { }` without parens |
+| `TextInput` without fixed height | Must use numeric height like `34` |
+| `text/height: Fit` on TextInput | Must use numeric height |
+| `on_render:` | Destabilizes embedded apps |
+| Top-level function calls | `sync_rows()` at top level—root must be a widget tree |
+
+**`KNOWN_WIDGETS` set** (in `validate-splash.ts`):
+```
+View, RoundedView, Label, TextInput, Button, ButtonFlat, ButtonFlatter,
+Image, Stack, Window, Portal, Draw, Slider, ToggleButton, TabBar,
+DropDown, ListView, Grid, Menu, Popup, ScrollBar, ScrollBars,
+ScrollPair, ColorPicker, Divider, ProgressBar, IconButton
+```
+
+If you need a widget not in this list, add it to `KNOWN_WIDGETS` in `validate-splash.ts`.
+
+### Debugging workflow
+
+When a splash app shows a blue/blank screen or "Splash app could not be rendered":
+
+1. Run `list_makepad_apps` to check the current app's error state
+2. Run `check_debug_app` with the app_id for detailed error info
+3. Review the splash body against the validation rules above
+4. Fix the body and call `check_debug_app` with `retry_splash_body` set to the corrected Splash body
+5. If still failing, try the approach from the working example (`agents-viewer-2`): use individual `Label` widgets per line inside `RoundedView`, no multiline strings, no unknown widgets
+
+### Common failure patterns
+
+| Symptom | Likely cause |
+|---------|------------|
+| Blue sliver (error fallback) | Splash body failed to parse — unknown widget, multiline string, or syntax error |
+| "Splash app could not be rendered" toast/fallback | Same — Makepad VM rejected the body |
+| Tool says "launched" but app is blank | Race condition (should be fixed by debounce) — or the body parsed but rendered empty |
+| Nothing appears at all | Harness or makepad-host crashed — check terminal for `eprintln!` output |
+
+### Logs
+
+The harness and makepad-host both output debug info via `eprintln!` to stderr:
+- Harness runs in the background, stderr goes to the `pi` terminal
+- makepad-host is spawned with `Stdio::inherit()` for stderr, so its logs also go to the `pi` terminal
+- `[harness]`, `[makepad-host]`, `[splash]` prefixes identify the source
+
+If you can't see logs, check if the pi process is running in a visible terminal.
+
 ## Test
 
 ```bash
