@@ -56,7 +56,8 @@ impl AgentSplash {
 
         cx.with_vm(|vm| {
             let value = vm.eval_with_append_source(script_mod, &code, NIL.into());
-            if value.is_err() || value.is_nil() {
+            // Makepad's parser is lenient; check both error flags and result type
+            if value.is_err() || value.is_nil() || !value.is_object() {
                 return false;
             }
             self.view = View::script_from_value(vm, value);
@@ -65,14 +66,17 @@ impl AgentSplash {
         })
     }
 
-    fn eval_body(&mut self, cx: &mut Cx) {
+    fn eval_body(&mut self, cx: &mut Cx) -> bool {
         let body = self.body.as_ref().to_string();
         if body.is_empty() {
-            return;
+            return true;
         }
 
-        if !self.render_body(cx, &body) {
+        if self.render_body(cx, &body) {
+            true
+        } else {
             let _ = self.render_body(cx, SPLASH_ERROR_FALLBACK);
+            false
         }
     }
 }
@@ -94,11 +98,38 @@ impl Widget for AgentSplash {
         if self.body.as_ref() != v {
             self.body.set(v);
             if !v.is_empty() {
-                self.eval_body(cx);
+                let ok = self.eval_body(cx);
+                if !ok {
+                    report_error("Splash body could not be rendered");
+                }
             }
             self.redraw(cx);
         }
     }
+}
+
+/// Write a field on the shared AgentDoc.
+fn write_doc_field(field: &str, value: String) {
+    if let Some(handle) = SHARED_DOC.get() {
+        handle.with_document(|doc| {
+            use autosurgeon::{hydrate, reconcile};
+            let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+            match field {
+                "user_response" => agent.user_response = Some(value),
+                "error_message" => agent.error_message = Some(value),
+                _ => {}
+            }
+            let mut tx = doc.transaction();
+            let _ = reconcile(&mut tx, &agent);
+            tx.commit();
+        });
+    }
+}
+
+/// Report an error to the pi extension by writing to the doc's `error_message` field.
+fn report_error(message: &str) {
+    write_doc_field("error_message", message.to_string());
+    eprintln!("[splash] error: {}", message);
 }
 
 #[allow(dead_code)]
@@ -113,16 +144,7 @@ impl AgentSplashRef {
     /// Writes the response into the shared CRDT document's `user_response` field,
     /// which the harness sees via CRDT sync and forwards to pi over JSON WS.
     pub fn send_response(&self, _cx: &mut Cx, data: &str) {
-        if let Some(handle) = SHARED_DOC.get() {
-            handle.with_document(|doc| {
-                use autosurgeon::{hydrate, reconcile};
-                let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
-                agent.user_response = Some(data.to_string());
-                let mut tx = doc.transaction();
-                let _ = reconcile(&mut tx, &agent);
-                tx.commit();
-                eprintln!("[splash] send_response: {}", data);
-            });
-        }
+        write_doc_field("user_response", data.to_string());
+        eprintln!("[splash] send_response: {}", data);
     }
 }

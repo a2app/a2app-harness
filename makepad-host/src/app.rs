@@ -90,6 +90,17 @@ impl MakepadHostApp {
 
         if splash_body.is_empty() && app_id.is_empty() {
             // No app — clear everything
+            doc_handle.with_document(|doc| {
+                use autosurgeon::{hydrate, reconcile};
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                if agent.error_message.is_some() {
+                    let mut agent = agent.clone();
+                    agent.error_message = None;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                }
+            });
             self.ui.widget(cx, ids!(splash)).set_text(cx, "");
             self.ui.widget(cx, ids!(source)).set_text(cx, "");
             self.ui.label(cx, ids!(status_line))
@@ -113,7 +124,7 @@ impl MakepadHostApp {
 
             // After rendering the splash successfully, update the doc status
             // from Pending to Launched so the bridge pushes the status to pi.
-            // Only do this once per app render.
+            // Only do this once per app render. Also clear any previous error.
             doc_handle.with_document(|doc| {
                 use autosurgeon::{hydrate, reconcile};
                 let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
@@ -127,6 +138,7 @@ impl MakepadHostApp {
                     if let Some(ref mut app) = agent.pending_app {
                         app.status = shared::AppStatus::Launched;
                     }
+                    agent.error_message = None; // clear any previous error on successful render
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();

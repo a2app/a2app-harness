@@ -42,6 +42,8 @@ enum HarnessToPiMsg {
     Status { app_id: String, status: String },
     #[serde(rename = "user_response")]
     UserResponse { app_id: String, response: String },
+    #[serde(rename = "error")]
+    Error { app_id: String, message: String },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -94,6 +96,7 @@ async fn background_main(headless: bool) {
         agent.extension_requests = false;
         agent.should_exit = false;
         agent.user_response = None;
+        agent.error_message = None;
         let mut tx = doc.transaction();
         reconcile(&mut tx, &agent).expect("reconcile");
         tx.commit();
@@ -249,7 +252,7 @@ async fn background_main(headless: bool) {
     let mut doc_changes = doc_handle.changes();
 
     while let Some(_change) = doc_changes.next().await {
-        let (has_response, app_id, status, exit) = doc_handle.with_document(|doc| {
+        let (has_response, app_id, status, error_message, exit) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
@@ -257,7 +260,7 @@ async fn background_main(headless: bool) {
                 shared::AppStatus::Pending => "Pending".to_string(),
                 shared::AppStatus::Launched => "Launched".to_string(),
             });
-            (agent.user_response.clone(), app_id, status, agent.should_exit)
+            (agent.user_response.clone(), app_id, status, agent.error_message.clone(), agent.should_exit)
         });
 
         // Push user_response to pi if present
@@ -278,6 +281,19 @@ async fn background_main(headless: bool) {
                 let msg = HarnessToPiMsg::Status {
                     app_id: id.clone(),
                     status: st.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+        }
+
+        // Push error message to pi if present
+        // (may appear on multiple doc changes until the error is cleared by a new launch)
+        if let Some(ref msg_text) = error_message {
+            if let Some(ref id) = app_id {
+                let msg = HarnessToPiMsg::Error {
+                    app_id: id.clone(),
+                    message: msg_text.clone(),
                 };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
                 let _ = bridge.lock().await.pi_tx.send(json);

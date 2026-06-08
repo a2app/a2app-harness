@@ -50,3 +50,99 @@ RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true
   }
 }
 ```
+
+## CRITICAL SPLASH RULES
+
+These rules are frequently violated. Read them carefully.
+
+### ⛔ `height: Fit` ON EVERY CONTAINER ⛔
+
+**Every `View`, `SolidView`, `RoundedView` etc. MUST have `height: Fit`.** The default is `height: Fill`, but your output renders inside a `Fit` container — `Fill` inside `Fit` = circular dependency = **0px height** (invisible).
+
+```
+✅ RoundedView{width:Fill height:Fit flow:Down padding:16 ...}
+❌ RoundedView{width:Fill flow:Down padding:16 ...}
+```
+
+**Exceptions:** Inside a fixed-height parent, `height: Fill` is fine:
+```
+View{height:300} → View{height:Fill} ✓
+```
+
+Template: Copy this for every container:
+```
+View{height:Fit flow:Down spacing:8 padding:12
+  ...
+}
+```
+
+### ⛔ `width: Fill` ON THE ROOT CONTAINER ⛔
+
+**Never** use a fixed pixel width on the outermost container. Always `width: Fill`.
+
+```
+✅ RoundedView{width:Fill height:Fit flow:Down ...}
+❌ RoundedView{width:400 height:Fit flow:Down ...}
+```
+
+### ⛔ `draw_bg.border_radius` TAKES A FLOAT, NOT AN INSET ⛔
+
+```
+✅ draw_bg.border_radius: 16.0
+❌ draw_bg.border_radius: Inset{top:0 bottom:16 left:0 right:0}
+```
+
+### ⛔ `new_batch: true` WHEN BG + TEXT ⛔
+
+Add `new_batch: true` on any View that has `show_bg: true` AND contains Labels or other text. Without it, text can appear behind the background (batching order issue).
+
+```
+RoundedView{width:Fill height:Fit new_batch:true draw_bg.color:#x2a2a3a draw_bg.border_radius:8.0
+  Label{text:"Hello" draw_text.color:#fff}
+}
+```
+
+### ⛔ ANIMATOR: Only certain widgets support it ⛔
+
+**Widgets that DO support animator:** View, SolidView, RoundedView, ScrollXView/ScrollYView/ScrollXYView, Button, ButtonFlat, ButtonFlatter, CheckBox, Toggle, RadioButton, LinkLabel, TextInput
+
+**Widgets that DO NOT support animator:** Label, H1–H4, P, TextBox, Image, Icon, Markdown, Html, Slider, DropDown, Splitter, Hr, Filler
+
+To make a label hoverable, wrap it in a View with animator:
+```
+View{cursor:MouseCursor.Hand animator:hover:{...} show_bg:true
+  draw_bg +:{color:#0000 color_hover:#fff2 hover:instance(0.0) ...}
+  Label{text:"clickable" draw_text.color:#fff}
+}
+```
+
+### ⛔ USE STYLED VIEWS, NOT RAW `View{}` ⛔
+
+Do NOT use `View{show_bg:true}` — raw View has an ugly green test background. Use:
+
+| Widget | Use for |
+|--------|---------|
+| `RoundedView` | Rounded corners with optional border |
+| `SolidView` | Simple solid color background |
+
+### ⛔ NAMING CHILDREN: Use `:=` for dynamic properties ⛔
+
+In templates, children you want to override per-instance must use `:=`:
+```
+let MyCard = RoundedView{
+  title := Label{text:"default"}
+  body := Label{text:""}
+}
+MyCard{title.text:"Custom" body.text:"Content"}
+```
+
+### ✅ SPLASH STRING API
+
+- Convert numeric string: `text.to_f64()`, NOT `parse_float()`
+- Check substring: `text.search(".") >= 0`, NOT `contains(".")`
+- Strip suffix: `text.strip_suffix(".0")`, NOT `ends_with()+substring()`
+- Available: `len()`, `trim()`, `split()`, `search()`, `match_str()`, `replace()`, `strip_prefix()`, `strip_suffix()`, `to_f64()`
+
+### ✅ MOBILE-FIRST DESIGN
+
+Prefer a polished mobile-first surface: compact header, clear grouped sections, generous touch targets, restrained high-contrast palette.
