@@ -106,9 +106,9 @@ export function registerTools(pi: ExtensionAPI): void {
       // Send launch request over JSON WS
       sendToHarness({ type: "launch", app_id, splash_body });
 
-      // Wait for status confirmation
-      const statusReceived = await new Promise<boolean>((resolve) => {
-        const timeout = setTimeout(() => resolve(false), 10_000);
+      // Wait for status confirmation or error
+      const launchResult = await new Promise<{ ok: boolean; message: string }>((resolve) => {
+        const timeout = setTimeout(() => resolve({ ok: false, message: `Timed out awaiting confirmation for '${app_id}'.` }), 10_000);
         const unsub = onMessage((msg: HarnessMessage) => {
           if (msg.type === "status" && msg.app_id === app_id) {
             if (currentApp) {
@@ -116,7 +116,12 @@ export function registerTools(pi: ExtensionAPI): void {
             }
             clearTimeout(timeout);
             unsub();
-            resolve(true);
+            resolve({ ok: true, message: `App '${app_id}' launched.` });
+          }
+          if (msg.type === "error" && msg.app_id === app_id) {
+            clearTimeout(timeout);
+            unsub();
+            resolve({ ok: false, message: `App '${app_id}' error: ${msg.message}` });
           }
         });
       });
@@ -125,12 +130,11 @@ export function registerTools(pi: ExtensionAPI): void {
         content: [
           {
             type: "text",
-            text: statusReceived
-              ? `App '${app_id}' launched.`
-              : `App '${app_id}' launch requested (awaiting confirmation).`,
+            text: launchResult.message,
           },
         ],
-        details: { app_id, launched: statusReceived },
+        details: { app_id, launched: launchResult.ok },
+        isError: !launchResult.ok,
       };
     },
   });

@@ -21,6 +21,8 @@ pub struct AgentSplash {
     pub view: View,
     #[live]
     body: ArcStringMut,
+    #[rust]
+    render_ok: bool,
 }
 
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*\n";
@@ -98,10 +100,12 @@ impl Widget for AgentSplash {
         if self.body.as_ref() != v {
             self.body.set(v);
             if !v.is_empty() {
-                let ok = self.eval_body(cx);
-                if !ok {
+                self.render_ok = self.eval_body(cx);
+                if !self.render_ok {
                     report_error("Splash body could not be rendered");
                 }
+            } else {
+                self.render_ok = true;
             }
             self.redraw(cx);
         }
@@ -134,6 +138,7 @@ fn report_error(message: &str) {
 
 #[allow(dead_code)]
 impl AgentSplashRef {
+    /// Returns true if the body was rendered successfully, false otherwise.
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);

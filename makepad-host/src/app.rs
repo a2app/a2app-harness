@@ -32,6 +32,12 @@ script_mod! {
                         draw_text.text_style.font_size: 11
                     }
 
+                    error_line := Label {
+                        text: ""
+                        draw_text.color: #xff8888
+                        draw_text.text_style.font_size: 10
+                    }
+
                     splash_holder := RoundedView {
                         width: Fill height: Fit padding: 12
                         draw_bg.color: #1f232e
@@ -67,7 +73,7 @@ impl MakepadHostApp {
             None => return,
         };
 
-        let (app_id, splash_body, should_exit) = doc_handle.with_document(|doc| {
+        let (app_id, splash_body, should_exit, error_msg) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
             let id = agent
@@ -80,12 +86,19 @@ impl MakepadHostApp {
                 .as_ref()
                 .map(|a| a.splash_body.clone())
                 .unwrap_or_default();
-            (id, body, agent.should_exit)
+            (id, body, agent.should_exit, agent.error_message.clone())
         });
 
         if should_exit {
             eprintln!("[makepad-host] should_exit received — exiting");
             std::process::exit(0);
+        }
+
+        // Show error if present
+        if let Some(ref err) = error_msg {
+            self.ui.label(cx, ids!(error_line)).set_text(cx, &format!("⚠ {}", err));
+        } else {
+            self.ui.label(cx, ids!(error_line)).set_text(cx, "");
         }
 
         if splash_body.is_empty() && app_id.is_empty() {
@@ -105,6 +118,7 @@ impl MakepadHostApp {
             self.ui.widget(cx, ids!(source)).set_text(cx, "");
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, "Waiting for app launch…");
+            self.ui.label(cx, ids!(error_line)).set_text(cx, "");
             self.last_app_id.clear();
             self.last_splash_body.clear();
             return;
@@ -117,14 +131,17 @@ impl MakepadHostApp {
                 splash_body.len()
             );
 
-            self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
+            let render_ok = self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
+            if !render_ok {
+                self.ui.label(cx, ids!(status_line))
+                    .set_text(cx, &format!("App: {} — ⚠ RENDER ERROR", app_id));
+            }
             self.ui.widget(cx, ids!(source)).set_text(cx, &splash_body);
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, &format!("App: {}", app_id));
 
-            // After rendering the splash successfully, update the doc status
-            // from Pending to Launched so the bridge pushes the status to pi.
-            // Only do this once per app render. Also clear any previous error.
+            // Update the doc status from Pending to Launched.
+            // Only clear previous error if rendering was successful.
             doc_handle.with_document(|doc| {
                 use autosurgeon::{hydrate, reconcile};
                 let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
@@ -138,12 +155,14 @@ impl MakepadHostApp {
                     if let Some(ref mut app) = agent.pending_app {
                         app.status = shared::AppStatus::Launched;
                     }
-                    agent.error_message = None; // clear any previous error on successful render
+                    if render_ok {
+                        agent.error_message = None;
+                    }
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
                     eprintln!(
-                        "[makepad-host] set app status to Launched"
+                        "[makepad-host] set app status to Launched (render_ok: {render_ok})"
                     );
                 }
             });
