@@ -165,7 +165,36 @@ The Splash DSL is a declarative domain-specific language parsed by Makepad's bui
 | `:=` for binding closures | `:=` for naming widgets (e.g. `my_label := Label{...}`) |
 | Pattern matching / `match` | `if`/`else` only |
 
-**Always read `.pi/extensions/makepad/prompts/makepad-environment.md` first** — it contains the authoritative Splash DSL rules, syntax requirements, and a working example. Then check `standard-apps.ts` (`.pi/extensions/makepad/standard-apps.ts`) for additional working templates.
+**Always read `.pi/extensions/makepad/prompts/makepad-environment.md` first** — it contains the authoritative Splash DSL rules, syntax requirements, and working examples. Then check `standard-apps.ts` (`.pi/extensions/makepad/standard-apps.ts`) for additional working templates.
+
+**Key rules discovered through testing (not in the prompt):**
+- Every container **MUST** have `height: Fit` — this is the most common failure mode
+- The `ui` object is built-in; you do NOT need to declare it with `:=`
+- Only certain widgets exist in this Makepad build; others silently fail
+- Colons inside string arguments to `ui.*.set_text()` trigger a validator false positive
+
+### Mistake: Omitting `height: Fit` on containers
+
+Every `View`, `RoundedView`, etc. **MUST have explicit `height: Fit`**. Without it, the container collapses to zero height and nothing visible renders inside it. This was the single most common cause of "blue rectangle with no content" during testing.
+
+```splash
+✅ RoundedView{width:Fill height:Fit flow:Down padding:16 new_batch:true ...}
+❌ RoundedView{width:Fill flow:Down padding:16 ...}  ← invisible!
+❌ View{padding:30 ...}  ← invisible!
+```
+
+Note that `RoundedView` does NOT have a default height of `Fit`. Every container needs it explicitly.
+
+### Mistake: Using `Stack`, `Divider`, `ProgressBar`, `IconButton`, `ToggleButton`
+
+These widgets do not exist in this Makepad build. They silently fail to render (no error, just no visible output). Use the available alternatives:
+
+| Wanted | Not Available | Use Instead |
+|--------|--------------|-------------|
+| Divider line | `Divider` | `Hr{height:1 width:Fill}` |
+| Toggle switch | `ToggleButton` | `ToggleFlat{text:"..." selected:false}` |
+| Stack overlay | `Stack` | Manual positioning with `View` containers |
+| Progress bar | `ProgressBar` | `Slider{value:0.65 is_read_only:true}` |
 
 ### Mistake: Omitting required `splash_body` parameter
 
@@ -227,15 +256,38 @@ Before sending a splash body to the harness, the extension runs it through `vali
 | `on_render:` | Destabilizes embedded apps |
 | Top-level function calls | `sync_rows()` at top level—root must be a widget tree |
 
-**`KNOWN_WIDGETS` set** (in `validate-splash.ts`):
+**`KNOWN_WIDGETS` set** (in both `validate-splash.ts` and `dist/validate-splash.js`):
 ```
-View, RoundedView, Label, TextInput, Button, ButtonFlat, ButtonFlatter,
-Image, Stack, Window, Portal, Draw, Slider, ToggleButton, TabBar,
-DropDown, ListView, Grid, Menu, Popup, ScrollBar, ScrollBars,
-ScrollPair, ColorPicker, Divider, ProgressBar, IconButton
+Containers:    View, RoundedView
+Text:          Label, TextInput, LinkLabel
+Buttons:       Button, ButtonFlat, ButtonFlatter
+Inputs:        Slider, CheckBox, CheckBoxFlat, RadioButton, RadioButtonFlat, ToggleFlat
+Menus/Lists:   DropDown, TabBar, Tab, PopupMenu, ScrollBar, ScrollBars, LoadingSpinner
+Decorations:   Hr, Vr, Icon
 ```
 
-If you need a widget not in this list, add it to `KNOWN_WIDGETS` in `validate-splash.ts`.
+**NOT available** (will silently fail to render): `Stack`, `Divider`, `ProgressBar`, `IconButton`, `ToggleButton`, `Image`, `ListView`, `Grid`, `ColorPicker`, `ScrollPair`
+
+**Note:** These widgets are from `grep` of actual widget source files. If you need a widget not in the list, verify it exists in `widgets/src/*.rs` before adding.
+
+### Container `height: Fit` Requirement
+
+**Every container widget (`View`, `RoundedView`, etc.) MUST have explicit `height: Fit`.**
+
+Without it, the container collapses to 0px height and is invisible. This is the #1 cause of "blue rectangle but no content" failures.
+
+```
+✅ RoundedView{width:Fill height:Fit flow:Down padding:16 ...}
+✅ View{height:Fit padding:30 ...}
+❌ RoundedView{width:Fill padding:16 ...}  ← invisible!
+❌ View{padding:30 ...}  ← invisible!
+```
+
+### Validator Pitfalls
+
+- **The `ui` object is built-in in Splash DSL.** The validator must include `"ui"` in `declaredIds` to avoid false positives. Both `validate-splash.ts` AND `dist/validate-splash.js` must be updated.
+- **Colons inside string arguments cause false positives.** A call like `ui.display.set_text("1:00")` triggers a false error because the validator finds the first colon on the line (inside `"1:00"`) and parses the token before it. Workaround: use string concatenation: `ui.display.set_text("1" + ":" + "00")`.
+- **Both files need updating:** The TypeScript source (`validate-splash.ts`) and the compiled JS (`dist/validate-splash.js`) must be kept in sync. The pi extension loads from `dist/`.
 
 ### Debugging workflow
 
@@ -245,7 +297,10 @@ When a splash app shows a blue/blank screen or "Splash app could not be rendered
 2. Run `check_debug_app` with the app_id for detailed error info
 3. Review the splash body against the validation rules above
 4. Fix the body and call `check_debug_app` with `retry_splash_body` set to the corrected Splash body
-5. If still failing, try the approach from the working example (`agents-viewer-2`): use individual `Label` widgets per line inside `RoundedView`, no multiline strings, no unknown widgets
+5. If still failing, check that:
+   - All containers have explicit `height: Fit`
+   - No unknown widgets are used (check widget availability list)
+   - No colons in string args to `ui.*.set_text()`
 
 ### Common failure patterns
 
@@ -253,8 +308,11 @@ When a splash app shows a blue/blank screen or "Splash app could not be rendered
 |---------|------------|
 | Blue sliver (error fallback) | Splash body failed to parse — unknown widget, multiline string, or syntax error |
 | "Splash app could not be rendered" toast/fallback | Same — Makepad VM rejected the body |
-| Tool says "launched" but app is blank | Race condition (should be fixed by debounce) — or the body parsed but rendered empty |
+| Blue/empty rectangle, no content | Container missing `height: Fit` — it collapsed to 0px |
+| Tool says "launched" but nothing visible | Container has no `height: Fit`, or widget doesn't exist in this build (e.g. `Stack`, `Divider`) |
+| Parser-syntax error using standard template | Validator false positive — check for `:` inside string args like `"1:00"` |
 | Nothing appears at all | Harness or makepad-host crashed — check terminal for `eprintln!` output |
+| App launched but status stuck on "Pending" | Pi extension resolved on first status (Pending) before makepad-host updated to Launched; this is a known race condition
 
 ### Logs
 

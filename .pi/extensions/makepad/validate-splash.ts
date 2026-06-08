@@ -1,33 +1,47 @@
-// Known Splash-compatible widget tags
+// Known Splash-compatible widget tags (verified against Makepad widgets/src/)
+// Non-Base variants only - check agent_splash.rs for runtime support.
 const KNOWN_WIDGETS = new Set([
+  // Core containers — VERIFIED working
   "View",
   "RoundedView",
+  
+  // Labels & text — VERIFIED working
   "Label",
   "TextInput",
+  "LinkLabel",
+  
+  // Buttons — VERIFIED working
   "Button",
   "ButtonFlat",
   "ButtonFlatter",
-  "Image",
-  "Stack",
-  "Window",
-  "Portal",
-  "Draw",
-  "Slider",
-  "ToggleButton",
-  "TabBar",
+  
+  // Inputs
+  "Slider",           // VERIFIED working
+  "CheckBox",
+  "CheckBoxFlat",
+  "RadioButton",
+  "RadioButtonFlat",
+  "ToggleFlat",
+  
+  // Lists & menus
   "DropDown",
-  "ListView",
-  "Grid",
-  "Menu",
-  "Popup",
+  "TabBar",
+  "Tab",
+  "PopupMenu",
   "ScrollBar",
   "ScrollBars",
-  "ScrollPair",
-  "ColorPicker",
-  "Divider",
-  "ProgressBar",
-  "IconButton",
+  "LoadingSpinner",
+  
+  // Decorations
+  "Hr",
+  "Vr",
+  "Icon",
 ]);
+
+// Additional notes for agent guidance (not validation):
+// - All containers (View, RoundedView) MUST have explicit height:Fit to render
+// - Use draw_text.color: and draw_text.text_style.font_size: for Label styling
+// - Stack, Divider, ProgressBar, IconButton, ToggleButton, Image, ListView, Grid, ColorPicker are NOT available in this build
 
 // Known Splash DSL property roots (not named widget references)
 const PROPERTY_ROOTS = new Set([
@@ -289,7 +303,7 @@ export function validateSplashBody(body: string): string | null {
     }
   }
 
-  const declaredIds = new Set<string>();
+  const declaredIds = new Set<string>(["ui"]); // 'ui' is built-in in Splash DSL
   for (const line of lines) {
     const trimmed = line.trim();
     const idx = trimmed.indexOf(":=");
@@ -303,7 +317,6 @@ export function validateSplashBody(body: string): string | null {
     }
   }
 
-  // Check each line for unknown widgets
   for (const line of lines) {
     const err = looksLikeUnknownWidget(line);
     if (err) return err;
