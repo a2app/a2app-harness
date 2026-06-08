@@ -25,7 +25,9 @@ pub struct AgentSplash {
     render_ok: bool,
 }
 
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*\n";
+// NOTE: No trailing quote/brace — the parser auto-closes the View{}
+// This matches the pattern in Makepad's built-in Splash widget (widgets/src/splash.rs)
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit, ";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8

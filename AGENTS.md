@@ -138,6 +138,39 @@ cargo build -p makepad-host
 
 Pi extension is auto-discovered from `.pi/extensions/makepad/`.
 
+## Splash DSL Pitfalls
+
+### Mistake: Writing Rust `impl` syntax instead of Splash DSL
+
+On first attempt to launch a todo app, the agent wrote a Rust-style body:
+
+```splash
+impl TodoApp for MainView {
+    fn build(self, ui: &mut Ui) {
+        state!(ui, tasks: Vec<String> = ...);
+        ui.stack(|ui| { ... });
+    }
+}
+```
+
+This fails because **`launch_makepad_app` expects Splash DSL, not Rust code**.
+
+The Splash DSL is a declarative domain-specific language parsed by Makepad's built-in splash parser. Key differences:
+
+| Rust Makepad | Splash DSL |
+|---|---|
+| `impl View for MyApp { fn build(...) }` | No impl — just top-level `let`, `fn`, and widget trees |
+| `state!(ui, ...)` | `let counter = 0` (plain variables, no macro) |
+| `ui.label(...)` closures | `Label{text: "..."}` declarative widget literals |
+| `:=` for binding closures | `:=` for naming widgets (e.g. `my_label := Label{...}`) |
+| Pattern matching / `match` | `if`/`else` only |
+
+**Always read `.pi/extensions/makepad/prompts/makepad-environment.md` first** — it contains the authoritative Splash DSL rules, syntax requirements, and a working example. Then check `standard-apps.ts` (`.pi/extensions/makepad/standard-apps.ts`) for additional working templates.
+
+### Mistake: Omitting required `splash_body` parameter
+
+The `standard_app` parameter on `launch_makepad_app` is informational/optional — `splash_body` is always required. To use a standard template, copy its `.splashBody` string from `standard-apps.ts`.
+
 ## Test
 
 ```bash
@@ -147,3 +180,8 @@ cargo test -p harness --test integration_smoke
 # TypeScript integration test (requires running harness + makepad-host)
 cd .pi/extensions/makepad && npm test
 ```
+
+
+## End of task flow
+
+- At the end of a task, suggest a commit message to the user, based on the current diff.
