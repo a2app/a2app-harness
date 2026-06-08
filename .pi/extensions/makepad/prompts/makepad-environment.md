@@ -43,8 +43,20 @@ ButtonFlat{text:"+" on_click:||{count += 1; ui.display.set_text(count + "")}}
 
 - `ui.<name>` is built-in — no `:=` declaration needed for `ui` itself
 - Concatenate with `+ ""` to convert numbers: `count + ""`
-- Use `set_interval()` for timers, `clear_interval()` to stop
 - Functions (`fn my_fn(){...}`) can use `ui.<name>` too
+- Use `;` to separate multiple statements in closures: `{count += 1; ui.label.set_text(count + "")}`
+- `ui.<name>.text()` reads TextInput content
+- `ui.<name>.set_text("...")` updates any widget's text content
+- **Every container** — including inner `View{flow:Right}` — MUST have explicit `height: Fit`
+
+## What Does NOT Work (Verified)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `set_interval()` / `clear_interval()` | ❌ Not available | Cannot create timers or countdowns |
+| `send_response()` from splash body | ❌ Not callable | Only callable from parent app code |
+| `Stack` widget | ❌ Doesn't exist | Use manual positioning |
+| `Divider`, `ProgressBar`, `IconButton` | ❌ Don't exist | Use `Hr` for dividers |
 
 ## Known Limitation: Colons in String Arguments
 
@@ -97,7 +109,8 @@ Pass `standard_app: "<name>"` to `launch_makepad_app` for built-in templates:
 | `counter` | Increment/decrement/reset counter |
 | `notes` | Quick notes with add, delete, clear-all (5 slots) |
 | `todo` | Task list with add, toggle, delete, clear-completed (5 slots) |
-| `timer` | Countdown timer with start/stop/reset |
+
+**Note:** There is no timer standard app — `set_interval()` is not available in this Makepad build.
 
 ## Example: Interactive Counter
 

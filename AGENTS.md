@@ -323,6 +323,38 @@ The harness and makepad-host both output debug info via `eprintln!` to stderr:
 
 If you can't see logs, check if the pi process is running in a visible terminal.
 
+## Interactivity Test Results (verified 2026-06-09)
+
+### Within-App Interactivity
+
+| Test | Result | Notes |
+|------|--------|-------|
+| Button clicks (`on_click`) | ✅ Works | State vars update, UI reflects changes |
+| `ui.<name>.set_text()` | ✅ Works | Updates any widget's text |
+| `ui.<name>.text()` | ✅ Works | Reads TextInput content |
+| Multiple statements in closure | ✅ Works | Use `;` separator inside `{ }` |
+| Functions (`fn foo(){...}`) | ✅ Works | Can call `ui.*` and functions |
+| `set_interval()` / `clear_interval()` | ❌ NOT available | Not in Makepad script VM |
+| `send_response()` from splash body | ❌ Not callable | Only callable from parent app code |
+| App replacement | ✅ Works | New `launch` replaces old app |
+| Conditional `if` rendering | ✅ Works | Works at widget level |
+
+### Horizontal Layout (inner `View{flow:Right}`)
+
+The inner View MUST have `height: Fit`:
+```
+✅ View{height:Fit flow:Right spacing:12 ...}
+❌ View{flow:Right spacing:12 ...}  ← buttons invisible!
+```
+
+### Error Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Unknown widget | Caught by pre-validation before sending |
+| VM eval failure | Makepad renders error fallback (dark red), sets `error_message` in doc |
+| Status stuck "Pending" | Tool resolved on first status ("Pending") before makepad-host processed app — known race condition |
+
 ## Test
 
 ```bash
