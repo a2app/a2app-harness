@@ -21,6 +21,10 @@ pub struct AgentDoc {
     /// (`send_response`), synced to the harness via CRDT, then forwarded
     /// to pi over JSON WS.
     pub user_response: Option<String>,
+    /// Error message set by the Makepad host when the splash body
+    /// fails to evaluate. The harness bridge loop forwards this to pi
+    /// as a `{"type":"error",...}` message.
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]

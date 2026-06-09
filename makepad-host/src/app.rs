@@ -1,8 +1,6 @@
-use std::sync::atomic::Ordering;
-
 use makepad_widgets::*;
 
-use crate::{SHARED_DOC, DOC_CHANGED};
+use crate::SHARED_DOC;
 
 app_main!(MakepadHostApp);
 
@@ -32,6 +30,12 @@ script_mod! {
                         text: "Waiting for app launch…"
                         draw_text.color: #xccddff
                         draw_text.text_style.font_size: 11
+                    }
+
+                    error_line := Label {
+                        text: ""
+                        draw_text.color: #xff8888
+                        draw_text.text_style.font_size: 10
                     }
 
                     splash_holder := RoundedView {
@@ -69,7 +73,7 @@ impl MakepadHostApp {
             None => return,
         };
 
-        let (app_id, splash_body, should_exit) = doc_handle.with_document(|doc| {
+        let (app_id, splash_body, should_exit, error_msg) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
             let id = agent
@@ -82,7 +86,7 @@ impl MakepadHostApp {
                 .as_ref()
                 .map(|a| a.splash_body.clone())
                 .unwrap_or_default();
-            (id, body, agent.should_exit)
+            (id, body, agent.should_exit, agent.error_message.clone())
         });
 
         if should_exit {
@@ -90,12 +94,31 @@ impl MakepadHostApp {
             std::process::exit(0);
         }
 
+        // Show error if present
+        if let Some(ref err) = error_msg {
+            self.ui.label(cx, ids!(error_line)).set_text(cx, &format!("⚠ {}", err));
+        } else {
+            self.ui.label(cx, ids!(error_line)).set_text(cx, "");
+        }
+
         if splash_body.is_empty() && app_id.is_empty() {
             // No app — clear everything
+            doc_handle.with_document(|doc| {
+                use autosurgeon::{hydrate, reconcile};
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                if agent.error_message.is_some() {
+                    let mut agent = agent.clone();
+                    agent.error_message = None;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                }
+            });
             self.ui.widget(cx, ids!(splash)).set_text(cx, "");
             self.ui.widget(cx, ids!(source)).set_text(cx, "");
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, "Waiting for app launch…");
+            self.ui.label(cx, ids!(error_line)).set_text(cx, "");
             self.last_app_id.clear();
             self.last_splash_body.clear();
             return;
@@ -112,6 +135,42 @@ impl MakepadHostApp {
             self.ui.widget(cx, ids!(source)).set_text(cx, &splash_body);
             self.ui.label(cx, ids!(status_line))
                 .set_text(cx, &format!("App: {}", app_id));
+
+            // Check if an error was reported during rendering (set_text calls eval_body
+            // which writes to doc's error_message on failure).
+            // If rendering failed, keep the error_message; otherwise clear it.
+            let had_error = doc_handle.with_document(|doc| {
+                use autosurgeon::hydrate;
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.error_message.is_some()
+            });
+
+            // Update the doc status from Pending to Launched.
+            // Only clear previous error if rendering was successful.
+            doc_handle.with_document(|doc| {
+                use autosurgeon::{hydrate, reconcile};
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                let needs_update = agent
+                    .pending_app
+                    .as_ref()
+                    .map(|a| a.status == shared::AppStatus::Pending)
+                    .unwrap_or(false);
+                if needs_update {
+                    let mut agent = agent.clone();
+                    if let Some(ref mut app) = agent.pending_app {
+                        app.status = shared::AppStatus::Launched;
+                    }
+                    if !had_error {
+                        agent.error_message = None;
+                    }
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                    eprintln!(
+                        "[makepad-host] set app status to Launched (error: {had_error})"
+                    );
+                }
+            });
 
             self.last_app_id = app_id;
             self.last_splash_body = splash_body;
@@ -138,13 +197,9 @@ impl AppMain for MakepadHostApp {
                 eprintln!("[makepad-host] Startup event");
                 self.sync_from_doc(cx);
             }
-            Event::Draw(_) => {
-                // Poll for changes on each draw event.
-                // The background thread sets DOC_CHANGED when a change arrives.
-                if DOC_CHANGED.swap(false, Ordering::Relaxed) {
-                    eprintln!("[makepad-host] Doc change detected — re-syncing");
-                    self.sync_from_doc(cx);
-                }
+            Event::Signal => {
+                eprintln!("[makepad-host] Doc change signal — re-syncing");
+                self.sync_from_doc(cx);
             }
             _ => {}
         }

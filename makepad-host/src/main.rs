@@ -1,18 +1,14 @@
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
+use makepad_widgets::makepad_platform::thread::SignalToUI;
 use samod::{ConnDirection, DocHandle, Repo};
 use shared::AgentDoc;
 use tokio::runtime::Runtime;
 
 mod agent_splash;
 mod app;
-
-/// Atomic flag signaled by the background thread on doc changes.
-/// The Makepad main thread reads (and clears) this on each Draw event.
-pub static DOC_CHANGED: AtomicBool = AtomicBool::new(true);
 
 /// Shared doc handle — set once by the background async thread,
 /// read/written by the Makepad main thread (for send_response)
@@ -121,8 +117,8 @@ async fn background_main() {
             agent.should_exit
         });
 
-        // Signal the main thread to re-sync on next Draw
-        DOC_CHANGED.store(true, Ordering::Relaxed);
+        // Signal the Makepad main thread to re-sync
+        SignalToUI::set_ui_signal();
 
         if should_exit {
             eprintln!("[makepad-host] should_exit — exiting");

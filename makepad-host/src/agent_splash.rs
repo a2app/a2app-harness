@@ -21,9 +21,19 @@ pub struct AgentSplash {
     pub view: View,
     #[live]
     body: ArcStringMut,
+    #[rust]
+    render_ok: bool,
+    /// Tracks the last known text of the __pi_response label
+    #[rust]
+    last_response: String,
 }
 
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*\n";
+// The splash body is wrapped in: <PREFIX><body><SUFFIX>
+// The parser auto-closes the outer View.
+// __pi_response is a hidden label that splash apps can set text on
+// to send a response back to the pi extension.
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
+const SPLASH_SUFFIX: &str = "  __pi_response := Label{text:\"\"}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -43,7 +53,10 @@ impl AgentSplash {
     fn render_body(&mut self, cx: &mut Cx, body: &str) -> bool {
         let self_id = self.self_id();
         let widget_uid = self.widget_uid();
-        let code = format!("{}{}", SPLASH_PREFIX, body);
+        // Wrap body with prefix + suffix
+        // __pi_response is a hidden label the splash body can set via ui.__pi_response.set_text("...")
+        // to send responses back to the pi extension.
+        let code = format!("{}{}{}", SPLASH_PREFIX, body, SPLASH_SUFFIX);
         let script_mod = ScriptMod {
             cargo_manifest_path: String::new(),
             module_path: String::new(),
@@ -56,7 +69,8 @@ impl AgentSplash {
 
         cx.with_vm(|vm| {
             let value = vm.eval_with_append_source(script_mod, &code, NIL.into());
-            if value.is_err() || value.is_nil() {
+            // Makepad's parser is lenient; check both error flags and result type
+            if value.is_err() || value.is_nil() || !value.is_object() {
                 return false;
             }
             self.view = View::script_from_value(vm, value);
@@ -65,14 +79,17 @@ impl AgentSplash {
         })
     }
 
-    fn eval_body(&mut self, cx: &mut Cx) {
+    fn eval_body(&mut self, cx: &mut Cx) -> bool {
         let body = self.body.as_ref().to_string();
         if body.is_empty() {
-            return;
+            return true;
         }
 
-        if !self.render_body(cx, &body) {
+        if self.render_body(cx, &body) {
+            true
+        } else {
             let _ = self.render_body(cx, SPLASH_ERROR_FALLBACK);
+            false
         }
     }
 }
@@ -80,6 +97,19 @@ impl AgentSplash {
 impl Widget for AgentSplash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        
+        // After each event, check if the splash body updated __pi_response.
+        // Splash apps call ui.__pi_response.set_text("data") to send
+        // data back to the pi extension.
+        let response_widget = self.widget(cx, &[id!(__pi_response)]);
+        if !response_widget.is_empty() {
+            let current = response_widget.text();
+            if current != self.last_response && !current.is_empty() {
+                let new_response = current.clone();
+                self.last_response = current;
+                write_doc_field("user_response", new_response.clone());
+            }
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -93,16 +123,47 @@ impl Widget for AgentSplash {
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         if self.body.as_ref() != v {
             self.body.set(v);
+            self.last_response = String::new(); // reset response tracker
             if !v.is_empty() {
-                self.eval_body(cx);
+                self.render_ok = self.eval_body(cx);
+                if !self.render_ok {
+                    report_error("Splash body could not be rendered");
+                }
+            } else {
+                self.render_ok = true;
             }
             self.redraw(cx);
         }
     }
 }
 
+/// Write a field on the shared AgentDoc.
+fn write_doc_field(field: &str, value: String) {
+    if let Some(handle) = SHARED_DOC.get() {
+        handle.with_document(|doc| {
+            use autosurgeon::{hydrate, reconcile};
+            let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+            match field {
+                "user_response" => agent.user_response = Some(value),
+                "error_message" => agent.error_message = Some(value),
+                _ => {}
+            }
+            let mut tx = doc.transaction();
+            let _ = reconcile(&mut tx, &agent);
+            tx.commit();
+        });
+    }
+}
+
+/// Report an error to the pi extension by writing to the doc's `error_message` field.
+fn report_error(message: &str) {
+    write_doc_field("error_message", message.to_string());
+    eprintln!("[splash] error: {}", message);
+}
+
 #[allow(dead_code)]
 impl AgentSplashRef {
+    /// Returns true if the body was rendered successfully, false otherwise.
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
@@ -113,16 +174,7 @@ impl AgentSplashRef {
     /// Writes the response into the shared CRDT document's `user_response` field,
     /// which the harness sees via CRDT sync and forwards to pi over JSON WS.
     pub fn send_response(&self, _cx: &mut Cx, data: &str) {
-        if let Some(handle) = SHARED_DOC.get() {
-            handle.with_document(|doc| {
-                use autosurgeon::{hydrate, reconcile};
-                let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
-                agent.user_response = Some(data.to_string());
-                let mut tx = doc.transaction();
-                let _ = reconcile(&mut tx, &agent);
-                tx.commit();
-                eprintln!("[splash] send_response: {}", data);
-            });
-        }
+        write_doc_field("user_response", data.to_string());
+        eprintln!("[splash] send_response: {}", data);
     }
 }

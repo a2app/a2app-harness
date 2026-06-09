@@ -5,7 +5,7 @@ use autosurgeon::{hydrate, reconcile};
 use samod::{ConnDirection, DocumentId, Repo};
 use shared::{AppStatus, PendingApp, JSON_WS_PORT, SAMOD_WS_PORT};
 use tempfile::TempDir;
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{sleep, Duration, Instant};
 
 const SMOKE_APP_ID: &str = "smoke-todo";
 const TODO_SPLASH_BODY: &str = r#"RoundedView{

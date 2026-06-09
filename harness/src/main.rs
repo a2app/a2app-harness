@@ -1,7 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,10 +19,6 @@ const JSON_WS_PORT: u16 = 2341;
 
 /// samod WebSocket — harness ↔ makepad-host (CRDT sync between two Rust processes)
 const SAMOD_WS_PORT: u16 = 2342;
-
-// ── Shared doc handle ────────────────────────────────────────────────────
-
-static SHARED_DOC: OnceLock<DocHandle> = OnceLock::new();
 
 // ── JSON WS message types (pi ↔ harness) ─────────────────────────────────
 
@@ -47,6 +42,8 @@ enum HarnessToPiMsg {
     Status { app_id: String, status: String },
     #[serde(rename = "user_response")]
     UserResponse { app_id: String, response: String },
+    #[serde(rename = "error")]
+    Error { app_id: String, message: String },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -99,15 +96,11 @@ async fn background_main(headless: bool) {
         agent.extension_requests = false;
         agent.should_exit = false;
         agent.user_response = None;
+        agent.error_message = None;
         let mut tx = doc.transaction();
         reconcile(&mut tx, &agent).expect("reconcile");
         tx.commit();
     });
-
-    // Publish doc handle
-    if SHARED_DOC.set(doc_handle.clone()).is_err() {
-        eprintln!("[harness] SHARED_DOC already set");
-    }
 
     let doc_id = doc_handle.document_id().to_string();
     eprintln!("[harness] shared doc ID: {doc_id}");
@@ -259,7 +252,7 @@ async fn background_main(headless: bool) {
     let mut doc_changes = doc_handle.changes();
 
     while let Some(_change) = doc_changes.next().await {
-        let (has_response, app_id, status, exit) = doc_handle.with_document(|doc| {
+        let (has_response, app_id, status, error_message, exit) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
@@ -267,7 +260,7 @@ async fn background_main(headless: bool) {
                 shared::AppStatus::Pending => "Pending".to_string(),
                 shared::AppStatus::Launched => "Launched".to_string(),
             });
-            (agent.user_response.clone(), app_id, status, agent.should_exit)
+            (agent.user_response.clone(), app_id, status, agent.error_message.clone(), agent.should_exit)
         });
 
         // Push user_response to pi if present
@@ -288,6 +281,19 @@ async fn background_main(headless: bool) {
                 let msg = HarnessToPiMsg::Status {
                     app_id: id.clone(),
                     status: st.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+        }
+
+        // Push error message to pi if present
+        // (may appear on multiple doc changes until the error is cleared by a new launch)
+        if let Some(ref msg_text) = error_message {
+            if let Some(ref id) = app_id {
+                let msg = HarnessToPiMsg::Error {
+                    app_id: id.clone(),
+                    message: msg_text.clone(),
                 };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
                 let _ = bridge.lock().await.pi_tx.send(json);
@@ -377,9 +383,13 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
             PiToHarnessMsg::Launch { app_id, splash_body } => {
                 eprintln!("[harness] pi: launch app '{app_id}' ({} chars)", splash_body.len());
 
+                // First write: set Pending status
                 doc_handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    // Clear stale state
+                    agent.user_response = None;
+                    agent.error_message = None;
                     agent.pending_app = Some(shared::PendingApp {
                         id: app_id.clone(),
                         splash_body: splash_body.clone(),
@@ -391,8 +401,9 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     tx.commit();
                 });
 
-                // Immediately set status to Launched and write it back
-                // so makepad-host can render it
+                // Second write: immediately advance to Launched so the pi extension
+                // receives "Launched" status (not "Pending") and starts its debounce
+                // window during which errors from makepad-host can arrive.
                 doc_handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
@@ -402,12 +413,6 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
-                });
-
-                // Push status to pi
-                send_to_pi(HarnessToPiMsg::Status {
-                    app_id: app_id.clone(),
-                    status: "Launched".to_string(),
                 });
             }
             PiToHarnessMsg::Clear { app_id } => {

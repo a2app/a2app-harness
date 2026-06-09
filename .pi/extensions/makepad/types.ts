@@ -1,11 +1,13 @@
 // ── Local extension state ────────────────────────────────────────────────
 
-export type AppStatus = "Pending" | "Launched" | "Closed";
+export type AppStatus = "Pending" | "Launched" | "Error" | "Closed";
 
 export interface AppState {
   app_id: string;
   status: AppStatus;
   splash_body: string;
+  /** Last error message from rendering failure, if any */
+  last_error?: string;
 }
 
 // ── JSON WS protocol types (pi ↔ harness) ───────────────────────────────
@@ -26,4 +28,10 @@ export interface UserResponseMessage {
   response: string;
 }
 
-export type HarnessMessage = WelcomeMessage | StatusMessage | UserResponseMessage;
+export interface ErrorMessage {
+  type: "error";
+  app_id: string;
+  message: string;
+}
+
+export type HarnessMessage = WelcomeMessage | StatusMessage | UserResponseMessage | ErrorMessage;
