@@ -28,7 +28,7 @@ fn main() {
     std::thread::spawn(|| {
         let rt = Runtime::new().expect("create tokio runtime");
         rt.block_on(background_main());
-        eprintln!("[makepad-host] background tasks finished");
+        // background tasks finished
     });
 
     // Run the Makepad app on the main thread
@@ -41,7 +41,7 @@ async fn background_main() {
     // Read the doc ID from env (set by harness when spawning us)
     let doc_id_str = std::env::var("MAKEPAD_HOST_DOC_ID")
         .unwrap_or_else(|_| {
-            eprintln!("[makepad-host] MAKEPAD_HOST_DOC_ID not set — will discover via WS");
+            // MAKEPAD_HOST_DOC_ID not set — will discover via WS
             String::new()
         });
 
@@ -49,7 +49,7 @@ async fn background_main() {
         .unwrap_or_else(|_| format!("ws://127.0.0.1:{SAMOD_WS_PORT}/sync"));
 
     // Connect to the harness's samod WS server
-    eprintln!("[makepad-host] connecting to {}...", ws_url);
+    // connecting to harness samod WS
     let (socket, _) = tokio_tungstenite::connect_async(ws_url.as_str())
         .await
         .expect("connect to samod WS");
@@ -58,7 +58,7 @@ async fn background_main() {
         .connect_tungstenite(socket, ConnDirection::Outgoing)
         .expect("attach websocket to samod repo");
 
-    eprintln!("[makepad-host] connected to harness samod WS");
+    // connected to harness samod WS
 
     // Find the shared document
     let doc_handle = if !doc_id_str.is_empty() {
@@ -71,7 +71,7 @@ async fn background_main() {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("[makepad-host] repo.find error: {e:?}");
+                    // repo.find error
                     tokio::time::sleep(Duration::from_millis(CONNECT_RETRY_MS)).await;
                     continue;
                 }
@@ -79,22 +79,22 @@ async fn background_main() {
         }
     } else {
         // No doc ID — try to discover it. This shouldn't happen in normal operation.
-        eprintln!("[makepad-host] no doc ID provided, waiting for discovery...");
+        // no doc ID provided, waiting for discovery...
         loop {
             // Wait for the doc to appear via sync
             tokio::time::sleep(Duration::from_millis(1000)).await;
             // Try a common pattern: discover via peer sync
-            eprintln!("[makepad-host] still waiting for doc discovery...");
+            // still waiting for doc discovery...
             continue;
         }
     };
 
     // Store the doc handle for the Makepad thread
     if SHARED_DOC.set(doc_handle.clone()).is_err() {
-        eprintln!("[makepad-host] SHARED_DOC already set — ignoring duplicate");
+        // SHARED_DOC already set — ignoring duplicate
     }
 
-    eprintln!("[makepad-host] shared doc acquired");
+    // shared doc acquired
 
     // Write "ready" marker so harness knows we're up
     if let Ok(marker_path) = std::env::var("MAKEPAD_HOST_READY_MARKER") {
@@ -109,11 +109,7 @@ async fn background_main() {
         let should_exit = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
-            eprintln!(
-                "[makepad-host] change: id={:?} exit={}",
-                agent.pending_app.as_ref().map(|a| &a.id),
-                agent.should_exit,
-            );
+            // change detected
             agent.should_exit
         });
 
@@ -121,10 +117,10 @@ async fn background_main() {
         SignalToUI::set_ui_signal();
 
         if should_exit {
-            eprintln!("[makepad-host] should_exit — exiting");
+            // should_exit — exiting
             break;
         }
     }
 
-    eprintln!("[makepad-host] change stream ended");
+    // change stream ended
 }
