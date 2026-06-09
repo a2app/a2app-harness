@@ -8,6 +8,8 @@ A2App is a system for building and running agentic applications. It composes an 
 
 Four capabilities define the system, independent of any particular implementation:
 
+![A2App key features](a2app-features.svg)
+
 <img src="a2app-features.svg" alt="A2App key features" width="700"/>
 
 ---
@@ -15,6 +17,8 @@ Four capabilities define the system, independent of any particular implementatio
 ## Reference Implementation
 
 One concrete way to implement A2App maps the four features onto three components:
+
+![A2App components](a2app-components.svg)
 
 <img src="a2app-components.svg" alt="A2App components" width="720"/>
 

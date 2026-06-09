@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { stopHarness } from "./harness.js";
@@ -7,6 +8,7 @@ import { registerTools } from "./tools.js";
 import { connectToHarness, onMessage } from "./doc-bridge.js";
 import type { HarnessMessage } from "./types.js";
 
+const _dirname = typeof __dirname !== "undefined" ? __dirname : dirname(fileURLToPath(import.meta.url));
 let extensionDir = "";
 
 function loadMakepadPrompt(extensionDir: string): string {
@@ -37,7 +39,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   registerTools(pi);
 
   pi.on("session_start", async (_event: any, ctx: any) => {
-    extensionDir = ctx.extensionPath ?? __dirname ?? "";
+    extensionDir = ctx.extensionPath ?? _dirname ?? "";
     ctx.ui.setStatus("makepad", "Makepad: idle (start on first use)");
   });
 
