@@ -92,6 +92,8 @@ impl AgentSplash {
             false
         }
     }
+
+
 }
 
 impl Widget for AgentSplash {
@@ -110,6 +112,8 @@ impl Widget for AgentSplash {
                 write_doc_field("user_response", new_response.clone());
             }
         }
+
+
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {

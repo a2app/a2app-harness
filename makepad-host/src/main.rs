@@ -70,7 +70,7 @@ async fn background_main() {
                     tokio::time::sleep(Duration::from_millis(CONNECT_RETRY_MS)).await;
                     continue;
                 }
-                Err(e) => {
+                Err(_e) => {
                     // repo.find error
                     tokio::time::sleep(Duration::from_millis(CONNECT_RETRY_MS)).await;
                     continue;

@@ -84,6 +84,7 @@ A TypeScript pi extension. Uses plain WebSocket (no CRDT).
 ```json
 {"type": "launch", "app_id": "todo-1", "splash_body": "..."}
 {"type": "clear", "app_id": "todo-1"}
+{"type": "debug", "app_id": "todo-1", "command": "widget_snapshot", "params": "{}"}
 {"type": "exit"}
 ```
 
@@ -92,7 +93,59 @@ A TypeScript pi extension. Uses plain WebSocket (no CRDT).
 {"type": "welcome"}
 {"type": "status", "app_id": "todo-1", "status": "Launched"}
 {"type": "user_response", "app_id": "todo-1", "response": "..."}
+{"type": "debug_response", "app_id": "todo-1", "result": "..."}
 ```
+
+## Debug System (`debug_app` tool)
+
+The `debug_app` tool in the pi extension lets you inspect and interact with the
+running Makepad Splash app. It sends commands through the JSON WS protocol as
+debug messages, which are written to the shared CRDT doc and processed by the
+makepad-host app.
+
+### Debug Commands
+
+| Command | Description | Params |
+|---------|-------------|--------|
+| `widget_dump` | Compact text dump of widget tree | `"{}"` (empty) |
+| `widget_snapshot` | Structured JSON list of all widgets with positions, text, state | `"{}"` (empty) |
+| `widget_query` | Query widgets by id/type/text pattern | Query string like `"id:my_button"` or `"type:Button"` |
+| `click` | Simulate a mouse click at coordinates or on a widget | `{"widget_id":"my_button"}` or `{"x":100,"y":200}` |
+| `type_text` | Type text into the focused text input | Raw string like `"hello world"` |
+
+### How It Works
+
+1. **Pi extension** sends `{"type":"debug","app_id":"...","command":"widget_snapshot","params":"{}"}`
+2. **Harness** writes `debug_command` to the shared CRDT doc
+3. **Makepad-host** receives the doc change via CRDT sync (`Event::Signal`)
+4. **app.rs** `process_debug_commands()` reads the command, executes it using
+   the widget tree API (`compact_dump`, `snapshot`, `query_rects`), and writes
+   the result to `debug_response`
+5. **Harness bridge loop** detects `debug_response`, forwards it as
+   `{"type":"debug_response",...}` to pi, then clears it from the doc
+6. **Pi extension** receives the response and displays it
+
+### Click Simulation
+
+For `click`, the makepad-host stores the target coordinates and dispatches them
+on the next event cycle (`Event::Draw` or `Event::Signal`). It sends synthetic
+`MouseDownEvent` + `MouseUpEvent` directly to the splash widget (bypassing the
+Window's window_id check). The splash's internal view hierarchy handles hit-
+testing and widget interaction normally.
+
+### Text Input Simulation
+
+For `type_text`, the makepad-host sends a synthetic `TextInputEvent` with the
+text content to the splash widget. The event is dispatched to whatever widget
+currently has key focus (set by a prior click or tab navigation).
+
+### First Use Pattern
+
+1. `widget_snapshot` — discover widget IDs, types, positions, and text
+2. `widget_query "id:my_button"` — find a specific widget's position
+3. `click {"widget_id":"my_button"}` — click on that widget
+4. `widget_snapshot` — verify the state changed
+5. `type_text "new value"` — type into a focused TextInput
 
 ## Shared Document (`AgentDoc` in `shared/src/lib.rs`)
 
@@ -104,6 +157,9 @@ pub struct AgentDoc {
     pub extension_requests: bool,          // pi has a pending request
     pub should_exit: bool,                 // graceful shutdown
     pub user_response: Option<String>,     // splash sends data back
+    pub error_message: Option<String>,     // rendering error
+    pub debug_command: Option<DebugCommand>, // debug tool commands
+    pub debug_response: Option<String>,    // debug tool responses
 }
 ```
 

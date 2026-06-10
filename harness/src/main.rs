@@ -29,6 +29,8 @@ enum PiToHarnessMsg {
     Launch { app_id: String, splash_body: String },
     #[serde(rename = "clear")]
     Clear { app_id: String },
+    #[serde(rename = "debug")]
+    Debug { app_id: String, command: String, params: String },
     #[serde(rename = "exit")]
     Exit,
 }
@@ -44,6 +46,8 @@ enum HarnessToPiMsg {
     UserResponse { app_id: String, response: String },
     #[serde(rename = "error")]
     Error { app_id: String, message: String },
+    #[serde(rename = "debug_response")]
+    DebugResponse { app_id: String, result: String },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -97,6 +101,8 @@ async fn background_main(headless: bool) {
         agent.should_exit = false;
         agent.user_response = None;
         agent.error_message = None;
+        agent.debug_command = None;
+        agent.debug_response = None;
         let mut tx = doc.transaction();
         reconcile(&mut tx, &agent).expect("reconcile");
         tx.commit();
@@ -252,7 +258,7 @@ async fn background_main(headless: bool) {
     let mut doc_changes = doc_handle.changes();
 
     while let Some(_change) = doc_changes.next().await {
-        let (has_response, app_id, status, error_message, exit) = doc_handle.with_document(|doc| {
+        let (has_response, app_id, status, error_message, debug_response, exit) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
@@ -260,7 +266,7 @@ async fn background_main(headless: bool) {
                 shared::AppStatus::Pending => "Pending".to_string(),
                 shared::AppStatus::Launched => "Launched".to_string(),
             });
-            (agent.user_response.clone(), app_id, status, agent.error_message.clone(), agent.should_exit)
+            (agent.user_response.clone(), app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.should_exit)
         });
 
         // Push user_response to pi if present
@@ -272,6 +278,27 @@ async fn background_main(headless: bool) {
                 };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
                 let _ = bridge.lock().await.pi_tx.send(json);
+            }
+        }
+
+        // Push debug_response to pi if present
+        if let Some(ref result) = debug_response {
+            if let Some(ref id) = app_id {
+                let msg = HarnessToPiMsg::DebugResponse {
+                    app_id: id.clone(),
+                    result: result.clone(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+                // Clear the debug_response after forwarding
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.debug_response = None;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
             }
         }
 
@@ -410,6 +437,23 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     if let Some(ref mut app) = agent.pending_app {
                         app.status = shared::AppStatus::Launched;
                     }
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+            }
+            PiToHarnessMsg::Debug { app_id, command, params } => {
+                eprintln!("[harness] pi: debug '{command}' on app '{app_id}'");
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    // Clear any stale debug response before setting new command
+                    agent.debug_response = None;
+                    agent.debug_command = Some(shared::DebugCommand {
+                        command: command.clone(),
+                        params: params.clone(),
+                    });
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();

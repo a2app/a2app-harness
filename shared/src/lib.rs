@@ -25,6 +25,22 @@ pub struct AgentDoc {
     /// fails to evaluate. The harness bridge loop forwards this to pi
     /// as a `{"type":"error",...}` message.
     pub error_message: Option<String>,
+    /// Debug command from pi to the makepad-host.
+    /// Set by the harness when pi sends a debug request,
+    /// cleared by the makepad-host after processing.
+    pub debug_command: Option<DebugCommand>,
+    /// Debug response from the makepad-host back to pi.
+    /// Set by the makepad-host after processing a debug command,
+    /// cleared by the harness after forwarding to pi.
+    pub debug_response: Option<String>,
+}
+
+#[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]
+pub struct DebugCommand {
+    /// The type of debug command: "widget_dump", "widget_snapshot", "widget_query", "click", "type_text"
+    pub command: String,
+    /// JSON-encoded parameters (varies by command)
+    pub params: String,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]
