@@ -90,7 +90,7 @@ impl MakepadHostApp {
         });
 
         if should_exit {
-            eprintln!("[makepad-host] should_exit received — exiting");
+            // should_exit — exiting
             std::process::exit(0);
         }
 
@@ -125,11 +125,7 @@ impl MakepadHostApp {
         }
 
         if splash_body != self.last_splash_body || app_id != self.last_app_id {
-            eprintln!(
-                "[makepad-host] rendering splash for app '{}' ({} chars)",
-                app_id,
-                splash_body.len()
-            );
+            // rendering splash for app
 
             self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
             self.ui.widget(cx, ids!(source)).set_text(cx, &splash_body);
@@ -166,9 +162,7 @@ impl MakepadHostApp {
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
-                    eprintln!(
-                        "[makepad-host] set app status to Launched (error: {had_error})"
-                    );
+                    // app status set to Launched
                 }
             });
 
@@ -194,11 +188,11 @@ impl AppMain for MakepadHostApp {
 
         match event {
             Event::Startup => {
-                eprintln!("[makepad-host] Startup event");
+                // Startup event
                 self.sync_from_doc(cx);
             }
             Event::Signal => {
-                eprintln!("[makepad-host] Doc change signal — re-syncing");
+                // Doc change signal — re-syncing
                 self.sync_from_doc(cx);
             }
             _ => {}

@@ -158,7 +158,7 @@ fn write_doc_field(field: &str, value: String) {
 /// Report an error to the pi extension by writing to the doc's `error_message` field.
 fn report_error(message: &str) {
     write_doc_field("error_message", message.to_string());
-    eprintln!("[splash] error: {}", message);
+    // error logged
 }
 
 #[allow(dead_code)]
@@ -175,6 +175,6 @@ impl AgentSplashRef {
     /// which the harness sees via CRDT sync and forwards to pi over JSON WS.
     pub fn send_response(&self, _cx: &mut Cx, data: &str) {
         write_doc_field("user_response", data.to_string());
-        eprintln!("[splash] send_response: {}", data);
+        // response sent
     }
 }
