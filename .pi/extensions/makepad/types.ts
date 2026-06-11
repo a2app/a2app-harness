@@ -34,4 +34,15 @@ export interface ErrorMessage {
   message: string;
 }
 
-export type HarnessMessage = WelcomeMessage | StatusMessage | UserResponseMessage | ErrorMessage;
+export interface DebugResponseMessage {
+  type: "debug_response";
+  app_id: string;
+  result: string;
+}
+
+export type HarnessMessage =
+  | WelcomeMessage
+  | StatusMessage
+  | UserResponseMessage
+  | ErrorMessage
+  | DebugResponseMessage;

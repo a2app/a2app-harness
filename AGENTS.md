@@ -84,6 +84,7 @@ A TypeScript pi extension. Uses plain WebSocket (no CRDT).
 ```json
 {"type": "launch", "app_id": "todo-1", "splash_body": "..."}
 {"type": "clear", "app_id": "todo-1"}
+{"type": "debug", "app_id": "todo-1", "command": "widget_snapshot", "params": "{}"}
 {"type": "exit"}
 ```
 
@@ -92,7 +93,109 @@ A TypeScript pi extension. Uses plain WebSocket (no CRDT).
 {"type": "welcome"}
 {"type": "status", "app_id": "todo-1", "status": "Launched"}
 {"type": "user_response", "app_id": "todo-1", "response": "..."}
+{"type": "debug_response", "app_id": "todo-1", "result": "..."}
 ```
+
+## Debug System (`check_debug_app` tool)
+
+The `check_debug_app` tool (extended with `debug_command`/`debug_params`)
+inspects and interacts with the running Makepad Splash app. Debug commands
+flow through: pi → harness → CRDT doc → makepad-host (processes) → response back.
+
+### Parameters
+
+| Parameter | Type | Purpose |
+|-----------|------|---------|
+| `app_id` | optional string | App to debug (defaults to current) |
+| `retry_splash_body` | optional string | Re-launch with corrected body |
+| `debug_command` | optional string | One of: `widget_dump`, `widget_snapshot`, `widget_query`, `click`, `type_text` |
+| `debug_params` | optional string | JSON-encoded params for the command |
+| `timeout_seconds` | optional number | Max wait for debug response (default 10, max 30) |
+
+### Debug Commands
+
+| Command | Params | Description |
+|---------|--------|-------------|
+| `widget_dump` | `"{}"` | Compact text tree: `W3 <count>` then `index parent id type x y w h` per line |
+| `widget_snapshot` | `"{}"` | Full JSON array of all widgets with `id`, `widget_type`, `x`, `y`, `width`, `height`, `text`, `value`, `checked`, `visible`, `enabled` |
+| `widget_query` | query string like `"id:my_button"` or `"type:Button"` | Returns matching widget positions as text lines |
+| `click` | `{"x":100,"y":200}` | Simulate MouseDown+MouseUp at absolute window coordinates |
+| `type_text` | raw string like `"hello"` | Inject text into the first TextInput found in the splash content |
+
+**Important:** For `click`, use x,y coordinates from `widget_dump` or `widget_snapshot`
+— `widget_id` lookup doesn't work reliably because splash content subtrees are
+orphaned from the main widget tree (parent = -1). The widget dump shows absolute
+window coordinates; calculate center as `x + w/2, y + h/2`.
+
+### How It Works
+
+1. **Pi extension** sends `{"type":"debug","app_id":"...","command":"widget_snapshot","params":"{}"}`
+2. **Harness** writes `debug_command` to the shared CRDT doc
+3. **Makepad-host** receives the doc change via `Event::Signal`
+4. **app.rs** `process_debug_commands()` reads the command and executes it:
+   - _Read-only commands_ (`widget_dump`, `snapshot`, `query`): use `cx.widget_tree()` API directly
+   - _`click`_: stores coordinates in `self.pending_click`, dispatched **before** `self.ui.handle_event()`
+     on the next Signal/Draw cycle as synthetic `MouseDownEvent`+`MouseUpEvent` sent
+     directly to the splash widget (bypassing the Window's window_id check)
+   - _`type_text`_: calls `walk_widgets_set_text()` which traverses the splash's
+     `WidgetRef` children recursively via `try_children()`, finds the first
+     `TextInput` widget by `borrow::<TextInput>()`, and calls `set_text()`
+5. Result is written to `debug_response` on the doc
+6. **Harness bridge loop** detects `debug_response`, forwards it as
+   `{"type":"debug_response",...}` to pi, then clears it from the doc
+
+### Critical: Event Ordering in `handle_event`
+
+In `app.rs`, `dispatch_pending_type_text` and `dispatch_pending_click` run
+**BEFORE** `self.ui.handle_event()` on Signal/Draw events. This ensures
+synthetic input state is ready before the widget tree processes events:
+```rust
+fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+    if matches!(event, Event::Signal | Event::Draw(_)) {
+        self.dispatch_pending_type_text(cx);  // write __pi_type_text or walk widgets first
+        self.dispatch_pending_click(cx);      // inject mouse events next
+    }
+    self.ui.handle_event(cx, event, &mut Scope::empty());  // then process everything
+    // ... sync, process_debug_commands
+}
+```
+
+### Splash Subtree Orphan Issue
+
+Splash content (the inner View created by `View::script_from_value`) has
+parent = -1 in the widget tree graph. This means:
+- `WidgetTree::find_within(uid, path)` won't find widgets inside the splash
+  content — they're not in the search root's subtree.
+- `widget_snapshot` DOES include them (iterates the full dense index).
+- `widget_dump` shows them with parent `-1`.
+- `click` dispatches events directly to the splash widget via
+  `splash.handle_event()`, which correctly routes through the actual view
+  hierarchy (not the widget tree).
+- `type_text` walks `try_children()` on the splash's `WidgetRef` directly
+  (not the widget tree), so it finds children correctly.
+- **Always use coordinates from the dump/snapshot for clicks** — widget_id
+  lookups via `find_within` won't work for splash content.
+
+### First Use Pattern
+
+1. `check_debug_app debug_command=widget_dump debug_params="{}"`
+   — discover widget IDs, positions, and types
+2. Note the `x y w h` columns. Calculate click center: `x + w/2, y + h/2`
+3. `check_debug_app debug_command=click debug_params='{"x":52,"y":227}'`
+   — click the button at its center
+4. `check_debug_app debug_command=widget_snapshot debug_params="{}"`
+   — verify state changed (check `text` field of target widget)
+5. `check_debug_app debug_command=type_text debug_params="hello"`
+   — type into a TextInput, then click the "Show" button to verify
+
+### Known Limitations
+
+| Issue | Cause | Workaround |
+|-------|-------|------------|
+| `debug_response` may arrive repeatedly | Bridge loop forwards it on each doc change until cleared | Accept first response; ignore duplicates |
+| Widget tree `find_within` fails for splash content | Splash View has parent = -1 in graph | Use coordinates from dump/snapshot for clicks; type_text walks children directly |
+| Widget text may show as `" "` (space) instead of `""` | AgentSplash's `__pi_response` label initializes with space | Use `value` field for TextInput, not `text` field |
+| Multiple queued clicks may stack before processing | Clicks stored in `pending_click` field | Add delays between click commands
 
 ## Shared Document (`AgentDoc` in `shared/src/lib.rs`)
 
@@ -104,6 +207,9 @@ pub struct AgentDoc {
     pub extension_requests: bool,          // pi has a pending request
     pub should_exit: bool,                 // graceful shutdown
     pub user_response: Option<String>,     // splash sends data back
+    pub error_message: Option<String>,     // rendering error
+    pub debug_command: Option<DebugCommand>, // debug tool commands
+    pub debug_response: Option<String>,    // debug tool responses
 }
 ```
 

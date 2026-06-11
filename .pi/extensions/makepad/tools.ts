@@ -261,7 +261,17 @@ export function registerTools(pi: ExtensionAPI): void {
     name: "check_debug_app",
     label: "Check/Debug App",
     description:
-      "Check the last render error for the current or specified app, and optionally retry with a corrected splash body.",
+      "Inspect the running app's widget tree, check errors, retry with corrected body, or simulate interactions (click, type text).",
+    promptSnippet:
+      "Inspect or interact with the running Makepad mini-app",
+    promptGuidelines: [
+      "Use check_debug_app to inspect the widget tree, query widgets, or simulate interactions.",
+      "Available debug_command values: widget_dump (text tree of all widgets), widget_snapshot (JSON list with positions/text), widget_query (search by id or type), click (simulate mouse click), type_text (simulate text input).",
+      "For click: provide debug_params as JSON with widget_id or x,y.",
+      "For type_text: provide text raw as debug_params.",
+      "For widget_dump/snapshot: provide '{}' as debug_params.",
+      "First use widget_snapshot to discover widget IDs and positions.",
+    ],
     parameters: Type.Object({
       app_id: Type.Optional(
         Type.String({
@@ -272,6 +282,24 @@ export function registerTools(pi: ExtensionAPI): void {
         Type.String({
           description:
             "Optional corrected splash body to re-launch (replaces the current app)",
+        }),
+      ),
+      debug_command: Type.Optional(
+        Type.String({
+          description:
+            "Debug command: widget_dump, widget_snapshot, widget_query, click, type_text",
+        }),
+      ),
+      debug_params: Type.Optional(
+        Type.String({
+          description:
+            "Parameters for the debug command (JSON-encoded string). For click: JSON with widget_id or x,y. For type_text: raw text string.",
+        }),
+      ),
+      timeout_seconds: Type.Optional(
+        Type.Number({
+          description:
+            "Max seconds to wait for debug response (default 10, max 30)",
         }),
       ),
     }),
@@ -287,16 +315,75 @@ export function registerTools(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: "No app specified and no current app is running. Use 'agents-viewer-1' or provide an app_id.",
+              text: "No app specified and no current app is running. Provide an app_id or launch an app first.",
             },
           ],
           details: {},
         };
       }
 
-      // If retrying with a corrected splash body, launch it
+      // ── Debug command mode ────────────────────────────────────────
+      if (params.debug_command) {
+        try {
+          await ensureConnected();
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `Failed to connect: ${err}` }],
+            details: { error: String(err) },
+            isError: true,
+          };
+        }
+
+        const cmd = params.debug_command;
+        const raw_params = params.debug_params || "{}";
+        const timeout = Math.min(params.timeout_seconds || 10, 30) * 1000;
+
+        sendToHarness({ type: "debug", app_id: appId, command: cmd, params: raw_params });
+
+        const rawResult = await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            unsub();
+            reject(new Error(`Timed out after ${timeout / 1000}s waiting for debug response.`));
+          }, timeout);
+          let active = true;
+          const unsub = onMessage((msg: HarnessMessage) => {
+            if (!active) return;
+            if (msg.type === "debug_response" && msg.app_id === appId) {
+              clearTimeout(timer);
+              active = false;
+              unsub();
+              resolve(msg.result);
+            }
+          });
+        });
+
+        let formatted = rawResult;
+        let isErr = false;
+        try {
+          const parsed = JSON.parse(rawResult);
+          if (parsed.error) {
+            isErr = true;
+            formatted = `Error: ${parsed.error}`;
+          } else if (parsed.status === "pending") {
+            if (cmd === "click") {
+              formatted = `Click queued at (${parsed.x}, ${parsed.y}).`;
+            } else if (cmd === "type_text") {
+              formatted = `Text "${parsed.text}" queued for input.`;
+            }
+          }
+        } catch {
+          // raw text output
+        }
+
+        return {
+          content: [{ type: "text", text: formatted }],
+          details: { app_id: appId, command: cmd, result: rawResult },
+          isError: isErr,
+        };
+      }
+
+      // ── Retry splash body mode ────────────────────────────────────
       if (params.retry_splash_body) {
-        // Re-launch using the internal logic
         try {
           await ensureConnected();
         } catch (err) {
@@ -340,15 +427,15 @@ export function registerTools(pi: ExtensionAPI): void {
             );
             let statusReceived = false;
             let statusTimer: ReturnType<typeof setTimeout> | null = null;
-            let listenerActive = true;
+            let active = true;
 
             const unsub = onMessage((msg: HarnessMessage) => {
-              if (!listenerActive) return;
+              if (!active) return;
 
               if (msg.type === "error" && msg.app_id === appId) {
                 clearTimeout(timeout);
                 if (statusTimer) clearTimeout(statusTimer);
-                listenerActive = false;
+                active = false;
                 unsub();
                 lastErrors.set(appId, msg.message);
                 if (currentApp) {
@@ -369,7 +456,7 @@ export function registerTools(pi: ExtensionAPI): void {
                 }
                 statusTimer = setTimeout(() => {
                   clearTimeout(timeout);
-                  listenerActive = false;
+                  active = false;
                   unsub();
                   resolve({
                     ok: true,
@@ -388,7 +475,7 @@ export function registerTools(pi: ExtensionAPI): void {
         };
       }
 
-      // Just report the current error state
+      // ── Report mode (default) ────────────────────────────────────
       const storedError = lastErrors.get(appId);
       const currentAppForId = currentApp?.app_id === appId ? currentApp : null;
       const currentError = currentAppForId?.last_error;
@@ -405,8 +492,8 @@ export function registerTools(pi: ExtensionAPI): void {
                 status: currentAppForId?.status || "unknown",
                 error: error || null,
                 hint: error
-                  ? "Use check_debug_app with retry_splash_body set to a corrected Splash body to re-launch."
-                  : "No errors recorded. If the app shows a blue/blank screen, the splash body may have a syntax issue not caught by pre-validation.",
+                  ? "Use check_debug_app with retry_splash_body set to a corrected Splash body to re-launch, or use debug_command to inspect the widget tree."
+                  : "No errors. Use check_debug_app debug_command='widget_snapshot' debug_params='{}' to inspect the app.",
               },
               null,
               2,
