@@ -102,19 +102,54 @@ async fn background_main() {
     }
 
     // Main change listener loop
-    // When the doc changes (new app from harness, user_response from AgentSplash),
-    // set DOC_CHANGED flag so the Makepad main thread picks it up on next Draw.
+    //
+    // IMPORTANT: Only signal the UI thread for changes ORIGINATED by the
+    // harness (new app, debug command, exit). Changes the host itself wrote
+    // to the doc (debug_response, user_response, status update) MUST NOT
+    // trigger another signal — otherwise the harness clearing them creates
+    // a re-entrant Signal cascade that crashes Makepad's event loop (the
+    // CRDT sync fires during event processing, which intersects with
+    // Makepad's internal NSTimer callbacks, causing panic_cannot_unwind).
+    //
+    // Track the last-known harness-originated fields and only signal when
+    // a NEW value appears (current.is_some() + different from last).
+    // Ignore transitions TO None (the host itself cleared the field).
     let mut changes = doc_handle.changes();
-    while let Some(_change) = changes.next().await {
-        let should_exit = doc_handle.with_document(|doc| {
-            use autosurgeon::hydrate;
-            let agent: AgentDoc = hydrate(doc).unwrap_or_default();
-            // change detected
-            agent.should_exit
-        });
+    let mut last_pending_id: Option<String> = None;
+    let mut last_debug_cmd: Option<String> = None;
 
-        // Signal the Makepad main thread to re-sync
-        SignalToUI::set_ui_signal();
+    while let Some(_change) = changes.next().await {
+        let (should_exit, should_signal) = {
+            let (current_id, current_cmd, exit) = doc_handle.with_document(|doc| {
+                use autosurgeon::hydrate;
+                let agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                (
+                    agent.pending_app.as_ref().map(|a| a.id.clone()),
+                    agent.debug_command.as_ref().map(|c| c.command.clone()),
+                    agent.should_exit,
+                )
+            });
+
+            // Only signal when a NEW value appears (is_some guards).
+            // Transitions to None (host clearing the field) are ignored.
+            let signal = exit
+                || (current_id.is_some() && current_id != last_pending_id)
+                || (current_cmd.is_some() && current_cmd != last_debug_cmd);
+
+            // Always update trackers so we don't re-signal for stale values
+            if current_id != last_pending_id {
+                last_pending_id = current_id;
+            }
+            if current_cmd != last_debug_cmd {
+                last_debug_cmd = current_cmd;
+            }
+
+            (exit, signal)
+        };
+
+        if should_signal {
+            SignalToUI::set_ui_signal();
+        }
 
         if should_exit {
             // should_exit — exiting

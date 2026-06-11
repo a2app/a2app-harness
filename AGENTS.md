@@ -444,6 +444,34 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | `send_response()` from splash body | ❌ Not callable | Only callable from parent app code |
 | App replacement | ✅ Works | New `launch` replaces old app |
 | Conditional `if` rendering | ✅ Works | Works at widget level |
+| `as int` type casting | ❌ Produces NaN | `val as int` on a string value gives `NaN`; use string display + `set_text()` instead |
+| Inline variable in Label text | ⚠️ Static only | `Label{text:"Count: " + count}` evaluated at build time; to update, use `ui.<name>.set_text()` |
+| CheckBox `checked` toggle | ✅ Works | `on_click` can toggle `selected:false` state |
+| RadioButton group selection | ✅ Works | `group:1` parameter enables radio group; click selects one |
+| `type_text` + button click pipeline | ✅ Works | Type text into TextInput, then click a button to process it |
+| `Hr{height:1 width:Fill}` divider | ✅ Works | Renders a visible horizontal rule |
+| `Slider` widget renders | ✅ Renders | Present and visible, `on_change` callback fires |
+
+### Verified Limitations
+
+| Limitation | Evidence | Workaround |
+|-----------|----------|------------|
+| `as int` type conversion | `"100" as int` → `NaN°F` | Use string manipulation + `set_text()` only |
+| Inline expressions in Labels | `"Score: " + score` stays at initial value | Always use `ui.<name>.set_text()` for dynamic content |
+| `type_text` bypasses `on_return` | Text set directly, callback not fired | Click a button that reads `ui.<name>.text()` to process |
+| Closing app leaves stale view | Old content persists visually | Fixed (see below) |
+
+### Close/Clear Fix (2026-06-11)
+
+**Problem:** When `close_makepad_app` was called, `AgentSplash::set_text("")` set `render_ok = true` but **never cleared `self.view`** — the previously rendered widget tree stayed visible. On the next `draw_walk()` call, the old content was still rendered.
+
+**Root cause:** In `agent_splash.rs`, the `eval_body()` function returned early on empty body without modifying `self.view`. The `set_text()` method also skipped view clearing in the else branch.
+
+**Fix:** Two changes in `makepad-host/src/agent_splash.rs`:
+1. `eval_body()` when `body.is_empty()` now renders an empty `View{width:Fill height:Fit}` and replaces `self.view` with it
+2. `set_text()` when `v.is_empty()` now calls `self.eval_body(cx)` instead of just `self.render_ok = true`
+
+This ensures the splash area shows an empty container when no app is running.
 
 ### Horizontal Layout (inner `View{flow:Right}`)
 
