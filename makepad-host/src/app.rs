@@ -57,6 +57,16 @@ script_mod! {
     }
 }
 
+/// Deferred UI changes to be applied on the next Draw event.
+/// Set by sync_from_doc (called on Signal), applied by apply_pending_updates (called on Draw).
+struct PendingUiUpdate {
+    splash_body: Option<String>,
+    source_body: Option<String>,
+    status: Option<String>,
+    error_msg: Option<String>,
+    should_exit: bool,
+}
+
 #[derive(Script, ScriptHook)]
 pub struct MakepadHostApp {
     #[live]
@@ -69,11 +79,13 @@ pub struct MakepadHostApp {
     pending_click: Option<(f64, f64)>, // (x, y) to click on next event cycle
     #[rust]
     pending_type_text: Option<String>, // text to type on next event cycle
+    #[rust]
+    pending_update: Option<PendingUiUpdate>, // deferred UI changes for next Draw
 }
 
 impl MakepadHostApp {
     /// Read the current app state from the shared doc and update the UI.
-    fn sync_from_doc(&mut self, cx: &mut Cx) {
+    fn sync_from_doc(&mut self, _cx: &mut Cx) {
         let doc_handle = match SHARED_DOC.get() {
             Some(h) => h,
             None => return,
@@ -100,12 +112,17 @@ impl MakepadHostApp {
             std::process::exit(0);
         }
 
-        // Show error if present
-        if let Some(ref err) = error_msg {
-            self.ui.label(cx, ids!(error_line)).set_text(cx, &format!("⚠ {}", err));
-        } else {
-            self.ui.label(cx, ids!(error_line)).set_text(cx, "");
-        }
+        // Store deferred UI updates (applied on next Draw event)
+        let mut update = PendingUiUpdate {
+            splash_body: None,
+            source_body: None,
+            status: None,
+            error_msg: None,
+            should_exit: false,
+        };
+
+        // Always include the error message state — Some("") to clear, Some(err) to show
+        update.error_msg = Some(error_msg.as_ref().map(|e| format!("⚠ {}", e)).unwrap_or_default());
 
         if splash_body.is_empty() && app_id.is_empty() {
             // No app — clear everything
@@ -120,35 +137,22 @@ impl MakepadHostApp {
                     tx.commit();
                 }
             });
-            self.ui.widget(cx, ids!(splash)).set_text(cx, "");
-            self.ui.widget(cx, ids!(source)).set_text(cx, "");
-            self.ui.label(cx, ids!(status_line))
-                .set_text(cx, "Waiting for app launch…");
-            self.ui.label(cx, ids!(error_line)).set_text(cx, "");
+            update.splash_body = Some(String::new());
+            update.source_body = Some(String::new());
+            update.status = Some("Waiting for app launch…".to_string());
             self.last_app_id.clear();
             self.last_splash_body.clear();
+            self.pending_update = Some(update);
             return;
         }
 
         if splash_body != self.last_splash_body || app_id != self.last_app_id {
-            // rendering splash for app
+            // Defer splash rendering to the next Draw event
+            update.splash_body = Some(splash_body.clone());
+            update.source_body = Some(splash_body.clone());
+            update.status = Some(format!("App: {}", app_id));
 
-            self.ui.widget(cx, ids!(splash)).set_text(cx, &splash_body);
-            self.ui.widget(cx, ids!(source)).set_text(cx, &splash_body);
-            self.ui.label(cx, ids!(status_line))
-                .set_text(cx, &format!("App: {}", app_id));
-
-            // Check if an error was reported during rendering (set_text calls eval_body
-            // which writes to doc's error_message on failure).
-            // If rendering failed, keep the error_message; otherwise clear it.
-            let had_error = doc_handle.with_document(|doc| {
-                use autosurgeon::hydrate;
-                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
-                agent.error_message.is_some()
-            });
-
-            // Update the doc status from Pending to Launched.
-            // Only clear previous error if rendering was successful.
+            // Doc status update still happens immediately on Signal
             doc_handle.with_document(|doc| {
                 use autosurgeon::{hydrate, reconcile};
                 let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
@@ -162,19 +166,19 @@ impl MakepadHostApp {
                     if let Some(ref mut app) = agent.pending_app {
                         app.status = shared::AppStatus::Launched;
                     }
-                    if !had_error {
-                        agent.error_message = None;
-                    }
+                    // Only clear error if the body evaluation will succeed;
+                    // we can't know yet since we deferred, so keep the error
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
-                    // app status set to Launched
                 }
             });
 
             self.last_app_id = app_id;
             self.last_splash_body = splash_body;
         }
+
+        self.pending_update = Some(update);
     }
 
     /// Process pending debug commands from the shared doc.
@@ -316,14 +320,44 @@ impl MakepadHostApp {
         Some((rect.pos.x + rect.size.x / 2.0, rect.pos.y + rect.size.y / 2.0))
     }
 
+    /// Apply deferred UI updates that were noted during sync_from_doc.
+    /// Called on Draw events before the UI is rendered, ensuring widget
+    /// tree mutations happen during the render phase, not during Signal.
+    fn apply_pending_updates(&mut self, cx: &mut Cx) {
+        let Some(update) = self.pending_update.take() else {
+            return;
+        };
+
+        if update.should_exit {
+            std::process::exit(0);
+        }
+
+        if let Some(err) = &update.error_msg {
+            self.ui.label(cx, ids!(error_line)).set_text(cx, err);
+        }
+
+        if let Some(body) = &update.splash_body {
+            self.ui.widget(cx, ids!(splash)).set_text(cx, body);
+        }
+        if let Some(body) = &update.source_body {
+            self.ui.widget(cx, ids!(source)).set_text(cx, body);
+        }
+        if let Some(status) = &update.status {
+            self.ui.label(cx, ids!(status_line)).set_text(cx, status);
+        }
+    }
+
     /// Dispatch a pending click by sending MouseDown + MouseUp events.
-    /// Events are dispatched to the splash widget directly, bypassing the
-    /// Window's window_id check.
+    /// Events are dispatched directly to the AgentSplash widget, NOT through
+    /// the root UI tree, because splash content widgets are orphaned from
+    /// the main widget tree (parent = -1) and can't be reached via normal
+    /// tree traversal.
     fn dispatch_pending_click(&mut self, cx: &mut Cx) {
         let Some((x, y)) = self.pending_click.take() else {
             return;
         };
 
+        // Get the splash widget to dispatch events directly
         let splash = self.ui.widget(cx, &[id!(splash)]);
         if splash.is_empty() {
             return;
@@ -332,30 +366,29 @@ impl MakepadHostApp {
         let abs = dvec2(x, y);
         let modifiers = KeyModifiers::default();
         let time = 0.0;
-        // Use WindowId(0, 0) as default — the splash widget does not
-        // check window_id (only Window does).
         let window_id = WindowId(0, 0);
 
-        // MouseDown
-        let md_event = MouseDownEvent {
+        // MouseDown — dispatch directly to the splash widget
+        // The splash's handle_event dispatches to its inner view hierarchy
+        let md_event = Event::MouseDown(MouseDownEvent {
             abs,
             button: MouseButton::PRIMARY,
             window_id,
             modifiers,
             handled: Cell::new(Area::Empty),
             time,
-        };
-        splash.handle_event(cx, &Event::MouseDown(md_event), &mut Scope::empty());
+        });
+        splash.handle_event(cx, &md_event, &mut Scope::empty());
 
-        // MouseUp
-        let mu_event = MouseUpEvent {
+        // MouseUp — dispatch directly to the splash widget
+        let mu_event = Event::MouseUp(MouseUpEvent {
             abs,
             button: MouseButton::PRIMARY,
             window_id,
             modifiers,
             time,
-        };
-        splash.handle_event(cx, &Event::MouseUp(mu_event), &mut Scope::empty());
+        });
+        splash.handle_event(cx, &mu_event, &mut Scope::empty());
     }
 
     /// Dispatch pending type_text by finding a TextInput in the splash
@@ -441,6 +474,17 @@ impl AppMain for MakepadHostApp {
             self.dispatch_pending_click(cx);
         }
 
+        // ── Apply deferred UI updates before rendering ────────────
+        // sync_from_doc runs on Signal and stores pending updates in
+        // self.pending_update. We apply them on the next Draw (before
+        // the UI renders) so that widget tree mutations (splash body
+        // eval, set_text) happen during the render phase. We also apply
+        // at the end of Signal handling to ensure close/clear operations
+        // take effect even if no Draw event follows immediately.
+        if matches!(event, Event::Draw(_)) {
+            self.apply_pending_updates(cx);
+        }
+
         self.ui.handle_event(cx, event, &mut Scope::empty());
 
         match event {
@@ -450,6 +494,9 @@ impl AppMain for MakepadHostApp {
             Event::Signal => {
                 self.sync_from_doc(cx);
                 self.process_debug_commands(cx);
+                // Apply pending updates at end of Signal too, so that
+                // close/clear operations render even without a Draw event
+                self.apply_pending_updates(cx);
             }
             _ => {}
         }

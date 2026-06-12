@@ -136,7 +136,9 @@ window coordinates; calculate center as `x + w/2, y + h/2`.
    - _Read-only commands_ (`widget_dump`, `snapshot`, `query`): use `cx.widget_tree()` API directly
    - _`click`_: stores coordinates in `self.pending_click`, dispatched **before** `self.ui.handle_event()`
      on the next Signal/Draw cycle as synthetic `MouseDownEvent`+`MouseUpEvent` sent
-     directly to the splash widget (bypassing the Window's window_id check)
+     **directly to the AgentSplash widget** via `splash.handle_event()`. This bypasses the
+     Window widget entirely — necessary because splash content widgets are orphaned from
+     the widget tree (parent = -1) and can't be reached via normal tree traversal from Root.
    - _`type_text`_: calls `walk_widgets_set_text()` which traverses the splash's
      `WidgetRef` children recursively via `try_children()`, finds the first
      `TextInput` widget by `borrow::<TextInput>()`, and calls `set_text()`
@@ -148,17 +150,60 @@ window coordinates; calculate center as `x + w/2, y + h/2`.
 
 In `app.rs`, `dispatch_pending_type_text` and `dispatch_pending_click` run
 **BEFORE** `self.ui.handle_event()` on Signal/Draw events. This ensures
-synthetic input state is ready before the widget tree processes events:
+synthetic input state is ready before the widget tree processes events.
+
+Additionally, **UI updates from doc changes are deferred**: `sync_from_doc`
+(which reads the shared CRDT doc) runs on Signal and stores pending changes.
+These are applied on the NEXT Draw event (before the UI renders) via
+`apply_pending_updates`. This ensures widget tree mutations (splash body eval,
+set_text) happen during the render phase, not during event processing.
+
 ```rust
 fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+    // Pre-dispatch: synthetic input before UI processes events
     if matches!(event, Event::Signal | Event::Draw(_)) {
-        self.dispatch_pending_type_text(cx);  // write __pi_type_text or walk widgets first
-        self.dispatch_pending_click(cx);      // inject mouse events next
+        self.dispatch_pending_type_text(cx);  // write __pi_type_text or walk widgets
+        self.dispatch_pending_click(cx);      // inject mouse events
     }
-    self.ui.handle_event(cx, event, &mut Scope::empty());  // then process everything
-    // ... sync, process_debug_commands
+
+    // Apply deferred UI updates on Draw (before rendering)
+    if matches!(event, Event::Draw(_)) {
+        self.apply_pending_updates(cx);       // apply splash body, source, status changes
+    }
+
+    self.ui.handle_event(cx, event, &mut Scope::empty());
+
+    match event {
+        Event::Startup => { self.sync_from_doc(cx); }
+        Event::Signal => {
+            self.sync_from_doc(cx);            // read doc, store pending
+            self.process_debug_commands(cx);   // process clicks, type_text, debug queries
+            self.apply_pending_updates(cx);    // apply close/clear changes immediately
+        }
+        _ => {}
+    }
 }
 ```
+
+### Deferred Update Architecture
+
+**Motivation:** In the original architecture, `sync_from_doc` (called on Signal)
+immediately called `set_text()` on widgets (splash body, source code, status line).
+These widget tree mutations happened during event processing, potentially causing
+timing issues with Splash VM evaluation and redraw requests.
+
+**Solution (June 2026):** Defer UI mutations to the render phase:
+1. `sync_from_doc` on Signal → reads doc → stores `PendingUiUpdate` struct
+2. `apply_pending_updates` on Draw → applies stored changes before rendering
+3. Also called at end of Signal handling → ensures close/clear operations render
+   even if no Draw event follows immediately
+
+**`PendingUiUpdate` fields:**
+- `splash_body: Option<String>` — new splash body to render (empty string = clear)
+- `source_body: Option<String>` — source code display text
+- `status: Option<String>` — status line text (e.g. "App: todo-1")
+- `error_msg: Option<String>` — error message to show
+- `should_exit: bool` — if true, exit the process
 
 ### Splash Subtree Orphan Issue
 
@@ -195,7 +240,10 @@ parent = -1 in the widget tree graph. This means:
 | `debug_response` may arrive repeatedly | Bridge loop forwards it on each doc change until cleared | Accept first response; ignore duplicates |
 | Widget tree `find_within` fails for splash content | Splash View has parent = -1 in graph | Use coordinates from dump/snapshot for clicks; type_text walks children directly |
 | Widget text may show as `" "` (space) instead of `""` | AgentSplash's `__pi_response` label initializes with space | Use `value` field for TextInput, not `text` field |
-| Multiple queued clicks may stack before processing | Clicks stored in `pending_click` field | Add delays between click commands
+| Multiple queued clicks may stack before processing | Clicks stored in `pending_click` field | Add delays between click commands |
+| Click must dispatch directly to splash, not Root | Splash content orphaned (parent=-1) | `splash.handle_event()` not `self.ui.handle_event()` |
+| Synthetic events need `WindowId(0,0)` | First window gets index 0 | Use `WindowId(0, 0)` for MouseDown/MouseUp events |
+| `text_input.text()` can't read Rust-set values | Splash VM reads from own cache | Use counters and `set_text()` in Splash code instead |
 
 ## Shared Document (`AgentDoc` in `shared/src/lib.rs`)
 
@@ -448,9 +496,13 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | Inline variable in Label text | ⚠️ Static only | `Label{text:"Count: " + count}` evaluated at build time; to update, use `ui.<name>.set_text()` |
 | CheckBox `checked` toggle | ✅ Works | `on_click` can toggle `selected:false` state |
 | RadioButton group selection | ✅ Works | `group:1` parameter enables radio group; click selects one |
-| `type_text` + button click pipeline | ✅ Works | Type text into TextInput, then click a button to process it |
+| `type_text` + button click pipeline | ⚠️ Partially | type_text sets TextInput value, but Splash VM `text()` returns `[Error:WrongValue]` for values set by Rust code; use `.value` instead? |
 | `Hr{height:1 width:Fill}` divider | ✅ Works | Renders a visible horizontal rule |
 | `Slider` widget renders | ✅ Renders | Present and visible, `on_change` callback fires |
+| `send_response()` via `__pi_response.set_text()` | ✅ Works | Hidden label writes response to shared doc, forwarded by harness bridge |
+| Deferred UI updates | ✅ Works | sync_from_doc on Signal → store pending → apply on Draw |
+| Synthetic click dispatch to splash | ✅ Works | Dispatch directly to AgentSplash (not through Root/Window) |
+| Close app clears visual state | ✅ Works | Empty splash body renders empty View |
 
 ### Verified Limitations
 
@@ -459,19 +511,21 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | `as int` type conversion | `"100" as int` → `NaN°F` | Use string manipulation + `set_text()` only |
 | Inline expressions in Labels | `"Score: " + score` stays at initial value | Always use `ui.<name>.set_text()` for dynamic content |
 | `type_text` bypasses `on_return` | Text set directly, callback not fired | Click a button that reads `ui.<name>.text()` to process |
-| Closing app leaves stale view | Old content persists visually | Fixed (see below) |
+| `text_input.text()` returns `[Error:WrongValue]` for Rust-set values | Splash VM `text()` can't read values set by Rust `set_text()` | Use `set_text()` via `ui.<name>.set_text()` in Splash code, not via Rust's `walk_widgets_set_text` |
+| String concat with `text()` result fails | `"Prefix: " + text_input.text()` produces `[Error:WrongValue]` | Assign to variable and pass to `set_text()` directly; or use pure integer counters for concatenation |
+| Closing app leaves stale view | Old content persisted when close didn't trigger Draw event | Fixed — `apply_pending_updates` now runs at end of Signal handling too (June 2026) |
+| Click dispatch must go to splash directly | Splash content orphaned (parent=-1) from widget tree | Events dispatched via `splash.handle_event()`, not `self.ui.handle_event()` |
+| WindowId(1,0) doesn't match actual window | First window has index 0, generation 0 | Use `WindowId(0, 0)` for synthetic events |
 
-### Close/Clear Fix (2026-06-11)
+### Close/Clear Fix (2026-06-11 & 2026-06-12)
 
-**Problem:** When `close_makepad_app` was called, `AgentSplash::set_text("")` set `render_ok = true` but **never cleared `self.view`** — the previously rendered widget tree stayed visible. On the next `draw_walk()` call, the old content was still rendered.
+**Problem (2026-06-11):** When `close_makepad_app` was called, `AgentSplash::set_text("")` set `render_ok = true` but **never cleared `self.view`** — the previously rendered widget tree stayed visible.
 
-**Root cause:** In `agent_splash.rs`, the `eval_body()` function returned early on empty body without modifying `self.view`. The `set_text()` method also skipped view clearing in the else branch.
+**Fix (2026-06-11):** In `agent_splash.rs`, `eval_body()` renders an empty `View{width:Fill height:Fit}` when body is empty.
 
-**Fix:** Two changes in `makepad-host/src/agent_splash.rs`:
-1. `eval_body()` when `body.is_empty()` now renders an empty `View{width:Fill height:Fit}` and replaces `self.view` with it
-2. `set_text()` when `v.is_empty()` now calls `self.eval_body(cx)` instead of just `self.render_ok = true`
+**Problem (2026-06-12):** After the deferred update architecture was introduced, `apply_pending_updates` only ran on Draw events. If no Draw event followed a close operation, the visual state wasn't cleared.
 
-This ensures the splash area shows an empty container when no app is running.
+**Fix (2026-06-12):** `apply_pending_updates` now also runs at the end of `Event::Signal` handling in `handle_event()`, ensuring close/clear operations take effect immediately.
 
 ### Horizontal Layout (inner `View{flow:Right}`)
 
