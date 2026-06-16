@@ -831,6 +831,18 @@ cd .pi/extensions/makepad && npm test
 ```
 
 
+## Test Walkthrough Protocol
+
+When a user asks for a test run / to walk through a series of apps step by step:
+
+1. For each test step, **stop and explain** what you're about to do and what the user should see on the Makepad window.
+2. **Wait for the user to confirm** before executing.
+3. If user confirms → execute and show results.
+4. If user rejects → debug or adjust.
+5. Only move to the next step/app when user explicitly confirms the current step is complete.
+6. Keep each step small — one interaction (e.g., one type_text, one click, one snapshot) per confirmation.
+7. Always show coordinates before clicking.
+
 ## End of task flow
 
 - At the end of a task, suggest a commit message to the user, based on the current diff.

@@ -116,6 +116,7 @@ impl AgentSplash {
 impl Widget for AgentSplash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        self.redraw(cx);
         
         // After each event, check if the splash body updated __pi_response.
         // Splash apps call ui.__pi_response.set_text("data") to send
