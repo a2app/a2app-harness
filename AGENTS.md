@@ -57,7 +57,7 @@ The Makepad UI process. Runs Makepad on the main thread, samod client on a backg
 - Finds the shared CRDT document, stores handle in `SHARED_DOC` static
 - Background thread: listens for doc changes → signals Makepad main thread via `SIGUSR1`
 - Main thread: reads `pending_app` from doc → renders splash in AgentSplash widget
-- AgentSplash widget: exposes `send_response()` which writes `user_response` back to the doc
+- AgentSplash widget: injects `__pi_response` hidden label; splash apps call `ui.__pi_response.set_text()` to write `user_response` back to the doc
 - On `should_exit`: exits the process
 
 **Environment variables (set by harness):**
@@ -272,16 +272,231 @@ pub struct AgentDoc {
 6. Makepad reads the doc, renders the splash body in AgentSplash widget
 
 ### Makepad Host → Harness → pi (user response)
-1. Splash app calls `ui.splash.send_response("some data")`
-2. AgentSplash widget writes `user_response = "some data"` to the local DocHandle
+
+The splash app communicates back to the pi agent via a **hidden `__pi_response` label** that is automatically injected into every splash body. This replaces the old `ui.splash.send_response()` API.
+
+**How it works:**
+1. Splash app calls `ui.__pi_response.set_text("some data")` in any `on_click` handler
+2. `AgentSplash::handle_event()` detects the label text changed → calls `write_doc_field("user_response", data)` to CRDT doc
 3. Change syncs to the harness over samod WS
-4. Harness's bridge loop sees the change, pushes `{"type":"user_response"}` to pi over JSON WS
+4. Harness's bridge loop sees the change, pushes `{"type":"user_response","app_id":"...","response":"..."}` to pi over JSON WS
+5. Pi extension receives via `doc-bridge.ts` WebSocket message handler
+
+**Splash code example:**
+```splash
+ButtonFlat{text:"Send" on_click:||{
+    ui.__pi_response.set_text("action:count,value:42")
+}}
+```
+
+The response can be any string — JSON, key=value pairs, or plain text.
+
+**Buffer system:** Every incoming message is buffered in `doc-bridge.ts` by type, so responses that arrive between tool calls are never lost.
 
 ### Shutdown
 1. pi sends `{"type":"exit"}` over JSON WS (or pi exits)
 2. Harness sets `should_exit = true` in the doc (triggering makepad-host to exit)
 3. Harness kills the makepad-host child process
 4. Harness exits
+
+## Two-Way Communication System
+
+Two-way communication between the pi agent and the splash app is the core value of a2app_harness.
+The splash app can not only display UI — it can **send structured responses back to the pi agent**
+via an event-driven pipeline.
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        TWO-WAY COMMUNICATION FLOW                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PI AGENT ───(1) launch_app ───► HARNESS ──(2) CRDT doc ──► MAKEPAD HOST  │
+│  (tool call)      JSON WS       (bridge)   sync via         (render UI)    │
+│                                     │      samod WS                        │
+│                                     │                                       │
+│  PI AGENT ◄───(5) user_response ────┘ ◄─(4) detect change── MAKEPAD HOST  │
+│  (event)          JSON WS           (bridge loop)    ◄──(3) click btn     │
+│                                                         __pi_response      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Direction 1: Pi Agent → Makepad Host (Launch/Update)
+
+| Step | Component | Action | Protocol |
+|------|-----------|--------|----------|
+| 1 | Pi tool | Calls `launch_makepad_app` with splash body | — |
+| 2 | doc-bridge.ts | Sends `{"type":"launch","app_id","splash_body"}` | JSON WS :2341 |
+| 3 | Harness | Writes `pending_app` to CRDT doc (Pending → Launched) | Local doc write |
+| 4 | samod WS | Syncs CRDT change to makepad-host | samod WS :2342 |
+| 5 | Makepad host | Receives Signal → reads doc → renders splash | — |
+
+### Direction 2: Makepad Host → Pi Agent (Response)
+
+| Step | Component | Action | Protocol |
+|------|-----------|--------|----------|
+| 1 | Splash app | User clicks button → `ui.__pi_response.set_text("...")` | — |
+| 2 | AgentSplash | `handle_event()` detects label text change | — |
+| 3 | AgentSplash | Calls `write_doc_field("user_response", data)` | Local doc write |
+| 4 | samod WS | Syncs CRDT change (user_response field) | samod WS :2342 |
+| 5 | Harness | Bridge loop sees doc change | — |
+| 6 | Harness | Forwards `{"type":"user_response"}` to pi | JSON WS :2341 |
+| 7 | doc-bridge.ts | Buffers event + dispatches to handlers | — |
+| 8 | Tool | Handler receives `user_response` data | — |
+
+### The `__pi_response` Mechanism
+
+Every splash body evaluated by `AgentSplash` is automatically wrapped with a suffix that
+injects a hidden label:
+
+```rust
+// In agent_splash.rs:
+const SPLASH_SUFFIX: &str = "  __pi_response := Label{text:\"\"}";
+```
+
+This label is invisible (zero-size, no background) and can be written to from any
+`on_click` closure in the splash body:
+
+```splash
+ButtonFlat{text:"Send" on_click:||{
+    ui.__pi_response.set_text("any string data here")
+}}
+```
+
+**Detection in AgentSplash::handle_event():**
+
+```rust
+let response_widget = self.widget(cx, &[id!(__pi_response)]);
+if !response_widget.is_empty() {
+    let current = response_widget.text();
+    if current != self.last_response && !current.is_empty() {
+        let new_response = current.clone();
+        self.last_response = current;
+        write_doc_field("user_response", new_response.clone());
+    }
+}
+```
+
+Key behaviors:
+- Only detects **changes** (compares against `last_response`)
+- Only sends **non-empty** strings (initial value is a single space `" "`)
+- `last_response` is reset to `""` each time a new splash body is set
+
+### Harness Bridge Loop (doc → pi forwarding)
+
+In `harness/src/main.rs`, the bridge loop watches CRDT doc changes via
+`doc_handle.changes()`. When it detects `user_response` has been set, it
+pushes to the pi WebSocket:
+
+```rust
+if let Some(ref response) = has_response {
+    let msg = HarnessToPiMsg::UserResponse {
+        app_id: id.clone(),
+        response: response.clone(),
+    };
+    let _ = bridge.lock().await.pi_tx.send(json);
+}
+```
+
+### Persistent Event Buffer (doc-bridge.ts)
+
+All incoming messages from the harness are captured in a `Map<string, HarnessMessage>`
+event buffer. This ensures responses are never lost, even if they arrive between
+tool calls:
+
+```typescript
+const eventBuffer: Map<string, HarnessMessage> = new Map();
+
+export function getBufferedEvent(type: string): HarnessMessage | undefined {
+  return eventBuffer.get(type);
+}
+
+export function getAllBufferedEvents(): HarnessMessage[] {
+  return Array.from(eventBuffer.values());
+}
+
+export function clearEventBuffer(): void {
+  eventBuffer.clear();
+}
+```
+
+The buffer stores one message per type (last-write-wins), since the CRDT doc is the
+source of truth and events are just notifications. Buffer can be cleared explicitly
+via `clearEventBuffer()` or implicitly by tools that consume events.
+
+### New Tools (registered in pi extension)
+
+#### `inspect_makepad_doc`
+
+Queries the harness for the full CRDT document state. Protocol:
+- Pi sends: `{"type": "get_doc"}` over JSON WS
+- Harness responds: `{"type": "doc_state", "app_id", "user_response", "error_message", "status"}`
+
+Also checks the local event buffer for any `user_response` or `error` messages
+that arrived between tool calls. Clears the buffer after reading.
+
+**Use cases:**
+- Check if a splash app has sent a response
+- Check for render errors
+- See what app is currently running
+
+#### `wait_for_response`
+
+An event-driven listener that blocks until a `user_response` is received from the
+splash app. This enables a **service worker** pattern:
+
+```
+1. Agent launches a splash app with ui.__pi_response.set_text() buttons
+2. Agent calls wait_for_response with a timeout
+3. wait_for_response registers a handler and awaits
+4. When user clicks a button, the response flows through the full pipeline
+5. wait_for_response resolves with the response data
+```
+
+**Parameters:**
+- `app_id` (optional) — filter by app (defaults to current)
+- `timeout_seconds` (optional) — max wait time (default 30, max 120)
+- `clear_buffer` (optional) — clear buffered responses before waiting (default true)
+
+**Returns:**
+- `app_id` — the app that sent the response
+- `response` — the string data sent via `__pi_response.set_text()`
+- `source` — `"live"` (just arrived) or `"buffered"` (was already in the buffer)
+
+**Example usage flow:**
+```splash
+// Launch this app:
+ButtonFlat{text:"Submit" on_click:||{
+    ui.__pi_response.set_text("form:submitted,name:Alice")
+}}
+```
+
+Then from the agent: `wait_for_response app_id="my-app"`
+
+### Verified End-to-End (2026-06-16)
+
+| Test | Result |
+|------|--------|
+| Launch app with __pi_response buttons | ✅ Renders correctly |
+| Click "Send Hello Back" → `__pi_response` text changes | ✅ `"Hello from the splash app!"` |
+| Click "Action: Count" → `__pi_response` text changes | ✅ `"action:count,value:42"` |
+| Click "Action: Data" → `__pi_response` text changes | ✅ `"action:data,temperature:72,humidity:45,status:ok"` |
+| Multiple sequential clicks update correctly | ✅ Each click overwrites previous response |
+| Event buffer captures responses between tool calls | ✅ Always-on, per-type Map |
+| `inspect_makepad_doc` queries doc state | ✅ New tool (needs extension reload) |
+| `wait_for_response` blocks on event | ✅ New tool (needs extension reload) |
+
+### Interactive Test Procedure
+
+To manually verify two-way communication:
+
+1. Launch a splash app with a button that calls `ui.__pi_response.set_text()`
+2. Use `widget_snapshot` to find button coordinates
+3. Click the button via `check_debug_app debug_command=click debug_params='{"x":...,"y":...}'`
+4. Take another `widget_snapshot` — check that `__pi_response` label text changed
+5. The harness bridge loop automatically forwards the change to the pi extension
 
 ## Build
 

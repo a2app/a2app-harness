@@ -1,10 +1,10 @@
 import { Type } from "typebox";
 
-import { connectToHarness, sendToHarness, onMessage } from "./doc-bridge.js";
+import { connectToHarness, sendToHarness, onMessage, getBufferedEvent, getAllBufferedEvents, clearEventBuffer } from "./doc-bridge.js";
 import { startHarness, stopHarness } from "./harness.js";
 import { STANDARD_APPS } from "./standard-apps.js";
 import { validateSplashBody } from "./validate-splash.js";
-import type { HarnessMessage, AppState } from "./types.js";
+import type { HarnessMessage, AppState, GetDocMessage } from "./types.js";
 
 type ExtensionAPI = any;
 
@@ -532,6 +532,277 @@ export function registerTools(pi: ExtensionAPI): void {
       return {
         content: [{ type: "text", text: "read_value not yet implemented." }],
         details: { found: false },
+      };
+    },
+  });
+
+  // ── Doc Inspector Tool ───────────────────────────────────────────────
+  //
+  // Queries the harness for the current state of the shared CRDT document.
+  // This is a read-only snapshot of all fields: pending_app, user_response,
+  // error_message, status. Use this to check if a splash app has sent a
+  // response, check for render errors, or see what app is currently running.
+  //
+  pi.registerTool({
+    name: "inspect_makepad_doc",
+    label: "Inspect Makepad Doc",
+    description:
+      "Query the current state of the shared CRDT document (pending_app, user_response, error_message, status).",
+    promptSnippet:
+      "Inspect the shared CRDT document state",
+    promptGuidelines: [
+      "Use inspect_makepad_doc to read the full shared document state from the harness.",
+      "Returns: app_id, user_response, error_message, and status fields.",
+      "Great for checking if a splash app has sent a response via __pi_response.set_text().",
+    ],
+    parameters: Type.Object({}),
+    async execute(
+      _id: string,
+      _params: any,
+      _signal: AbortSignal,
+      _onUpdate: any,
+    ) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `Failed to connect: ${err}` },
+          ],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
+      // Send get_doc request
+      sendToHarness({ type: "get_doc" });
+
+      // Wait for doc_state response (with timeout)
+      const result = await new Promise<{
+        app_id: string | null;
+        user_response: string | null;
+        error_message: string | null;
+        status: string | null;
+      }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          unsub();
+          reject(new Error("Timed out waiting for doc_state response"));
+        }, 5_000);
+        let active = true;
+        const unsub = onMessage((msg: HarnessMessage) => {
+          if (!active) return;
+          if (msg.type === "doc_state") {
+            clearTimeout(timeout);
+            active = false;
+            unsub();
+            resolve({
+              app_id: msg.app_id,
+              user_response: msg.user_response,
+              error_message: msg.error_message,
+              status: msg.status,
+            });
+          }
+        });
+      });
+
+      // Also check the buffer for any user_response that arrived recently
+      const bufferedResponse = getBufferedEvent("user_response");
+      let bufferedText = "";
+      if (bufferedResponse && bufferedResponse.type === "user_response") {
+        bufferedText = ` [buffered: ${bufferedResponse.response}]`;
+      }
+
+      // Also check buffer for errors
+      const bufferedError = getBufferedEvent("error");
+      let bufferedErrorText = "";
+      if (bufferedError && bufferedError.type === "error") {
+        bufferedErrorText = ` [buffered: ${bufferedError.message}]`;
+      }
+
+      // Clear the buffer so we don't re-read stale events
+      clearEventBuffer();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                app_id: result.app_id,
+                user_response: result.user_response,
+                error_message: result.error_message || bufferedErrorText.replace(/^ \[buffered: /, "").replace(/\]$/, "") || null,
+                status: result.status,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+
+  // ── Wait-for-Response Tool ───────────────────────────────────────────
+  //
+  // An event-driven listener that blocks until a user_response is received
+  // from the splash app. This enables a "service worker" pattern:
+  //
+  //   1. Launch an app that sends responses (via __pi_response.set_text())
+  //   2. Call wait_for_response — it sets up a persistent listener
+  //   3. The tool awaits the response, with configurable timeout
+  //   4. When the splash app calls __pi_response.set_text("..."), the
+  //      response flows through: CRDT doc → harness bridge → JSON WS → tool
+  //
+  // The response is also buffered in doc-bridge.ts so other tools can
+  // inspect it later via inspect_makepad_doc or by checking the buffer.
+  //
+  pi.registerTool({
+    name: "wait_for_response",
+    label: "Wait for Response",
+    description:
+      "Block and wait for a user_response from the splash app. Sets up an event-driven listener that triggers when the splash app calls __pi_response.set_text().",
+    promptSnippet:
+      "Wait for a splash app to respond via __pi_response.set_text()",
+    promptGuidelines: [
+      "Use wait_for_response to asynchronously receive data from the splash app.",
+      "The splash app sends data by calling ui.__pi_response.set_text('...') in its on_click handler.",
+      "This is the primary way for native UI apps to communicate back to the pi agent.",
+      "You can optionally filter by app_id and set a timeout.",
+    ],
+    parameters: Type.Object({
+      app_id: Type.Optional(
+        Type.String({
+          description: "App ID to wait for a response from (defaults to current app)",
+        }),
+      ),
+      timeout_seconds: Type.Optional(
+        Type.Number({
+          description: "Max seconds to wait (default 30, max 120)",
+        }),
+      ),
+      clear_buffer: Type.Optional(
+        Type.Boolean({
+          description: "Clear any previous buffered response before waiting (default true)",
+        }),
+      ),
+    }),
+    async execute(
+      _id: string,
+      params: any,
+      _signal: AbortSignal,
+      onUpdate: any,
+    ) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `Failed to connect: ${err}` },
+          ],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
+      const appId = params.app_id || currentApp?.app_id;
+      if (!appId && !params.app_id) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No app specified and no current app. Provide app_id or launch an app first.",
+            },
+          ],
+          details: {},
+          isError: true,
+        };
+      }
+
+      const timeoutMs = Math.min(params.timeout_seconds || 30, 120) * 1000;
+
+      // Optionally clear the buffer
+      if (params.clear_buffer !== false) {
+        clearEventBuffer();
+      }
+
+      // Check the buffer first for any already-arrived response
+      const bufferedResponse = getBufferedEvent("user_response");
+      if (bufferedResponse && bufferedResponse.type === "user_response") {
+        if (!appId || bufferedResponse.app_id === appId) {
+          clearEventBuffer();
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    app_id: bufferedResponse.app_id,
+                    response: bufferedResponse.response,
+                    source: "buffered",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            details: {
+              app_id: bufferedResponse.app_id,
+              response: bufferedResponse.response,
+            },
+          };
+        }
+      }
+
+      // Wait for the response
+      const result = await new Promise<{
+        app_id: string;
+        response: string;
+      }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          unsub();
+          reject(
+            new Error(
+              `Timed out after ${timeoutMs / 1000}s waiting for response from '${appId || "any"}'.`,
+            ),
+          );
+        }, timeoutMs);
+        let active = true;
+        const unsub = onMessage((msg: HarnessMessage) => {
+          if (!active) return;
+          if (msg.type === "user_response") {
+            if (!appId || msg.app_id === appId) {
+              clearTimeout(timeout);
+              active = false;
+              unsub();
+              resolve({
+                app_id: msg.app_id,
+                response: msg.response,
+              });
+            }
+          }
+        });
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                app_id: result.app_id,
+                response: result.response,
+                source: "live",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: {
+          app_id: result.app_id,
+          response: result.response,
+        },
       };
     },
   });
