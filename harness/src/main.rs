@@ -81,8 +81,13 @@ fn main() {
 
 async fn background_main(headless: bool) {
     // ── 1. Create samod repo and shared doc ──────────────────────────
+    // IMPORTANT: samod uses InMemoryStorage by default (no disk persistence).
+    // The `load()` call just initializes the runtime, it does NOT load from disk.
+    // Every harness restart starts with a fresh, empty CRDT document.
+    // See samod docs: Repo::build_tokio() returns RepoBuilder<InMemoryStorage, ...>
     let repo = samod::Repo::build_tokio().load().await;
 
+    // Create a fresh in-memory automerge document with default AgentDoc
     let mut initial = automerge::Automerge::new();
     {
         let mut tx = initial.transaction();
@@ -96,7 +101,8 @@ async fn background_main(headless: bool) {
         .await
         .expect("create shared document");
 
-    // Clear any stale state
+    // Safety: clear all fields in case the default had any non-null values.
+    // Even though we create a fresh doc, this ensures determinism.
     doc_handle.with_document(|doc| {
         use autosurgeon::{hydrate, reconcile};
         let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();

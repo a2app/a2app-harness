@@ -244,6 +244,43 @@ parent = -1 in the widget tree graph. This means:
 | Click must dispatch directly to splash, not Root | Splash content orphaned (parent=-1) | `splash.handle_event()` not `self.ui.handle_event()` |
 | Synthetic events need `WindowId(0,0)` | First window gets index 0 | Use `WindowId(0, 0)` for MouseDown/MouseUp events |
 | `text_input.text()` can't read Rust-set values | Splash VM reads from own cache | Use counters and `set_text()` in Splash code instead |
+| Debug commands timeout after heavy session use | makepad-host accumulates runtime state that eventually blocks Signal-driven doc sync | **Rebuild + restart**: `cargo build -p harness -p makepad-host` then kill old processes. Or: close app, wait, re-launch. If that fails, restart the harness by killing both processes. |
+| `RadioButton`'s `on_click` can't call `set_text()` | RadioButton internal event handling overrides/conflicts with label updates from within its own `on_click` callback | Set variables in the radio's `on_click`, then use a separate `Button`'s `on_click` to call `set_text()` to read and display those variables. Variables ARE updated correctly from radio clicks. |
+
+### Runtime State Accumulation (Debug Freeze)
+
+**Symptom:** After running multiple apps in rapid succession with many click/snapshot commands, `widget_snapshot` or other debug commands start returning `"No result provided"` or timing out. Even after closing the app and launching a new one, the issue persists.
+
+**Root cause:** The makepad-host process accumulates runtime state across successive app launches and debug operations. Eventually, the Signal-driven event cycle that processes `debug_command` from the shared doc stops responding. The harness bridge loop detects doc changes and forwards messages to pi, but makepad-host never writes `debug_response` back.
+
+**Resolution:**
+1. Kill the old processes: `kill <harness_pid> <makepad_host_pid>`
+2. Rebuild: `cargo build -p harness -p makepad-host`
+3. Launch a new app (this spawns fresh processes)
+
+**Why rebuild helps:** Recompilation ensures the binary matches the current pi extension code. But the more important fix is **killing the old processes** — fresh makepad-host and harness processes start clean.
+
+**Prevention:** If you notice debug commands getting slower or failing, restart early rather than continuing a long test session.
+
+### RadioButton `on_click` Limitation
+
+**Symptom:** A `RadioButton`'s `on_click` callback sets a variable correctly (`selected_radio = 1`), but calling `ui.some_label.set_text(...)` from within the same callback doesn't update the label's visible text.
+
+**Root cause:** The `RadioButton` widget's internal event handling completes after the user's `on_click` callback runs. During this post-processing, the RadioButton redraws itself, which can undo or override `set_text()` calls made during the callback — particularly on labels that are siblings or outside the radio's own widget subtree.
+
+**Workaround:** Don't call `set_text()` directly from within a `RadioButton`'s `on_click`. Instead:
+- Set a variable (this works correctly)
+- Have a separate `Button` or other widget read that variable and call `set_text()`
+
+Example:
+```splash
+// ❌ Won't work — label stays at initial value
+RadioButton{text:"A" group:1 on_click:||{selected = "A"; ui.status.set_text("Selected: A")}}
+
+// ✅ Works — set variable only, read from separate button
+RadioButton{text:"A" group:1 on_click:||{selected = "A"}}
+Button{text:"Refresh" on_click:||{ui.status.set_text("Selected: " + selected)}}
+```
 
 ## Shared Document (`AgentDoc` in `shared/src/lib.rs`)
 
@@ -842,6 +879,22 @@ When a user asks for a test run / to walk through a series of apps step by step:
 5. Only move to the next step/app when user explicitly confirms the current step is complete.
 6. Keep each step small — one interaction (e.g., one type_text, one click, one snapshot) per confirmation.
 7. Always show coordinates before clicking.
+
+## CRDT State: In-Memory Only, No Disk Persistence
+
+The CRDT document used to communicate between the harness and makepad-host is **purely in-memory**.
+
+- `samod::Repo::build_tokio()` returns `RepoBuilder<InMemoryStorage, ...>` — samod's default storage backend is in-memory
+- `repo.create(initial)` creates a fresh document each time — no file backing
+- `automerge::Automerge::new()` creates a fresh document in memory — no file persistence
+- The only files written are **ready markers** (e.g., `/tmp/makepad_host_ready_*`) — simple text files to signal process readiness, not CRDT data
+- When the harness exits, all CRDT state is **gone permanently**
+- When a new harness starts, it creates a fresh doc with a default `AgentDoc` (all fields cleared)
+
+**What this means:**
+- No stale state can leak between sessions
+- Restarting the harness (killing both processes) always starts clean
+- No files to clean up (except ready markers, which are auto-removed)
 
 ## End of task flow
 
