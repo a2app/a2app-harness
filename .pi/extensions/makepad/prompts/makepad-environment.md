@@ -304,6 +304,59 @@ RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true
 }
 ```
 
+## Standard Workflow: Launch → Interact → Get Response → Close
+
+Always follow this exact sequence. Each step has an explicit action.
+
+### Step 1: Launch
+```
+launch_makepad_app(app_id="my-app", splash_body="...")
+```
+Rules:
+- Every container MUST have `height: Fit`
+- Every TextInput MUST have numeric height (e.g., height:34)
+- No `on_render`
+- To send data back: `ButtonFlat{text:"Send" on_click:||{ui.__pi_response.set_text("data")}}`
+
+### Step 2: Verify + Discover Widgets
+```
+check_debug_app(app_id="my-app", debug_command="widget_snapshot", debug_params="{}")
+```
+Returns JSON array. Find the target button in the last entries (orphaned widgets, parent=-1).
+Each entry has: `id`, `widget_type`, `x`, `y`, `width`, `height`, `text`, `value`.
+
+### Step 3: Fill TextInput (optional)
+```
+check_debug_app(app_id="my-app", debug_command="type_text", debug_params="Alice")
+```
+Fills the FIRST TextInput found in the splash tree. Splash VM can read via `ui.<name>.text()`.
+
+### Step 4: Click a Button
+```
+check_debug_app(app_id="my-app", debug_command="click", debug_params='{"x":100,"y":200}')
+```
+Calculate center from snapshot: `x = snapshot.x + snapshot.width/2`, `y = snapshot.y + snapshot.height/2`.
+
+### Step 5: Verify Response
+```
+check_debug_app(app_id="my-app", debug_command="widget_snapshot", debug_params="{}")
+```
+Find the `__pi_response` entry (bottom of JSON array). Its `text` field shows the response string.
+Initial value is `" "` (space). After click, shows whatever `ui.__pi_response.set_text()` was called with.
+
+### Step 6: Read Doc State (optional)
+```
+# Only works after extension reload with new tools
+inspect_makepad_doc()
+```
+Returns `{ app_id, user_response, error_message, status }`.
+
+### Step 7: Close
+```
+close_makepad_app(app_id="my-app")
+list_makepad_apps()  # verify it's gone
+```
+
 ## Debug Commands (`check_debug_app`)
 
 ### Splash Content Orphan Issue

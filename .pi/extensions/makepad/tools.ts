@@ -59,12 +59,16 @@ export function registerTools(pi: ExtensionAPI): void {
     label: "Launch Makepad App",
     description: "Launch a Makepad Splash mini-app in the host window.",
     promptSnippet:
-      "Launch or replace a Makepad mini-app with generated Splash DSL",
+      "Launch or replace a Makepad mini-app with Splash DSL",
     promptGuidelines: [
       "Use launch_makepad_app when the user asks to create, show, or update a native UI app.",
       "Generate only the Splash body - no Root{}, no Window{}, no Rust.",
       "Every TextInput must have a fixed numeric height such as 34.",
       "Do not use on_render in embedded Splash apps.",
+      "AFTER launching, use check_debug_app with debug_command=widget_snapshot to verify the app rendered correctly and discover widget coordinates.",
+      "Container must always have height:Fit.",
+      "To send data from splash to pi, use ui.__pi_response.set_text('...') inside on_click handlers.",
+      "Always check list_makepad_apps or check_debug_app for errors if app doesn't render.",
     ],
     parameters: Type.Object({
       app_id: Type.String({
@@ -266,11 +270,27 @@ export function registerTools(pi: ExtensionAPI): void {
       "Inspect or interact with the running Makepad mini-app",
     promptGuidelines: [
       "Use check_debug_app to inspect the widget tree, query widgets, or simulate interactions.",
-      "Available debug_command values: widget_dump (text tree of all widgets), widget_snapshot (JSON list with positions/text), widget_query (search by id or type), click (simulate mouse click), type_text (simulate text input).",
-      "For click: provide debug_params as JSON with widget_id or x,y.",
-      "For type_text: provide text raw as debug_params.",
-      "For widget_dump/snapshot: provide '{}' as debug_params.",
-      "First use widget_snapshot to discover widget IDs and positions.",
+      "Available debug_command values:",
+      "  - widget_snapshot: Returns full JSON array of all widgets with id, widget_type, x, y, width, height, text, value. Pass debug_params='{}'.",
+      "  - widget_dump: Compact text tree. Pass debug_params='{}'.",
+      "  - widget_query: Search by id or type. Pass query string as debug_params.",
+      "  - click: Simulate mouse click. Calculate center as (x + w/2, y + h/2) from snapshot data. Pass JSON as debug_params, e.g. '{\"x\":100,\"y\":200}'.",
+      "  - type_text: Fill the FIRST TextInput in the splash tree. Pass raw text as debug_params (not JSON). Does NOT trigger on_return callbacks.",
+      "",
+      "STANDARD WORKFLOW for interactivity:",
+      "  1. launch_makepad_app (create app)",
+      "  2. check_debug_app (widget_snapshot, {}) — discover widget positions",
+      "  3. check_debug_app (type_text, 'text') — fill first TextInput (optional)",
+      "  4. check_debug_app (click, '{\"x\":100,\"y\":200}') — click button (center = x+w/2, y+h/2)",
+      "  5. check_debug_app (widget_snapshot, {}) — verify __pi_response label text changed",
+      "  6. check_debug_app (click, ...) — next interaction",
+      "",
+      "IMPORTANT:",
+      "  - Splash content widgets have parent=-1 (orphaned). Do NOT use widget_id for click — use x,y coordinates.",
+      "  - widget_snapshot includes orphaned widgets at the bottom of the JSON array.",
+      "  - __pi_response initial text is ' ' (space). After click, it shows the response string.",
+      "  - The 'value' field on TextInput shows the text content; 'text' field is null for TextInputs.",
+      "  - Splash VM CAN read values set by Rust's set_text() via ui.<name>.text().",
     ],
     parameters: Type.Object({
       app_id: Type.Optional(
@@ -491,9 +511,11 @@ export function registerTools(pi: ExtensionAPI): void {
                 running: currentAppForId !== null,
                 status: currentAppForId?.status || "unknown",
                 error: error || null,
-                hint: error
-                  ? "Use check_debug_app with retry_splash_body set to a corrected Splash body to re-launch, or use debug_command to inspect the widget tree."
-                  : "No errors. Use check_debug_app debug_command='widget_snapshot' debug_params='{}' to inspect the app.",
+                hint: currentAppForId
+                  ? (error
+                    ? "Use check_debug_app with retry_splash_body set to a corrected Splash body to re-launch."
+                    : "No errors. Use check_debug_app debug_command='widget_snapshot' debug_params='{}' to inspect the app.")
+                  : "No app running. Use launch_makepad_app to create one first.",
               },
               null,
               2,
@@ -552,8 +574,15 @@ export function registerTools(pi: ExtensionAPI): void {
       "Inspect the shared CRDT document state",
     promptGuidelines: [
       "Use inspect_makepad_doc to read the full shared document state from the harness.",
-      "Returns: app_id, user_response, error_message, and status fields.",
-      "Great for checking if a splash app has sent a response via __pi_response.set_text().",
+      "Returns JSON: { app_id, user_response, error_message, status }",
+      "Also checks the local event buffer for any user_response that arrived between tool calls.",
+      "Clears the buffer after reading.",
+      "",
+      "USE CASES:",
+      "  - Check if a splash app has sent a response via __pi_response.set_text()",
+      "  - Check for render errors (error_message field)",
+      "  - See what app is currently running",
+      "  - Use AFTER a click to confirm the response was captured in the doc",
     ],
     parameters: Type.Object({}),
     async execute(
@@ -663,12 +692,21 @@ export function registerTools(pi: ExtensionAPI): void {
     description:
       "Block and wait for a user_response from the splash app. Sets up an event-driven listener that triggers when the splash app calls __pi_response.set_text().",
     promptSnippet:
-      "Wait for a splash app to respond via __pi_response.set_text()",
+      "Wait for splash app response (event-driven listener)",
     promptGuidelines: [
       "Use wait_for_response to asynchronously receive data from the splash app.",
       "The splash app sends data by calling ui.__pi_response.set_text('...') in its on_click handler.",
       "This is the primary way for native UI apps to communicate back to the pi agent.",
-      "You can optionally filter by app_id and set a timeout.",
+      "",
+      "STANDARD FLOW:",
+      "  1. Launch app with ui.__pi_response.set_text() buttons",
+      "  2. Call wait_for_response (app_id='my-app', timeout_seconds=30)",
+      "  3. Tool blocks until user clicks a button OR timeout expires",
+      "  4. Returns { app_id, response, source: 'live' | 'buffered' }",
+      "",
+      "Parameters: app_id (optional, defaults to current), timeout_seconds (default 30, max 120), clear_buffer (default true)",
+      "",
+      "If a response was already buffered (arrived between tool calls), returns immediately with source='buffered'.",
     ],
     parameters: Type.Object({
       app_id: Type.Optional(
