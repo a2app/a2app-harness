@@ -487,6 +487,10 @@ Then from the agent: `wait_for_response app_id="my-app"`
 | Event buffer captures responses between tool calls | ✅ Always-on, per-type Map |
 | `inspect_makepad_doc` queries doc state | ✅ New tool (needs extension reload) |
 | `wait_for_response` blocks on event | ✅ New tool (needs extension reload) |
+| `type_text` fills only first TextInput | ✅ Fixed — `walk_widgets_set_text` stops after first match |
+| Colons inside string arguments to `set_text()` | ✅ Works — `"Time: 2:30"` renders correctly, `"1:00"` sends correctly |
+| Splash VM reads Rust-set TextInput values | ✅ Proven: `"A:" + ui.field_a.text()` = `"A:HelloWorld"` after `type_text` |
+| Idle CPU (no debug commands) | ✅ 1.7% — no more 100% spin loop from idle Signals |
 
 ### Interactive Test Procedure
 
@@ -540,7 +544,7 @@ The Splash DSL is a declarative domain-specific language parsed by Makepad's bui
 - Every container **MUST** have `height: Fit` — this is the most common failure mode
 - The `ui` object is built-in; you do NOT need to declare it with `:=`
 - Only certain widgets exist in this Makepad build; others silently fail
-- Colons inside string arguments to `ui.*.set_text()` trigger a validator false positive
+- Colons inside string arguments to `ui.*.set_text()` work correctly (verified with `"Time: 2:30"` and `"1:00"`) — no false positive
 
 ### Mistake: Omitting `height: Fit` on containers
 
@@ -655,7 +659,7 @@ Without it, the container collapses to 0px height and is invisible. This is the 
 ### Validator Pitfalls
 
 - **The `ui` object is built-in in Splash DSL.** The validator must include `"ui"` in `declaredIds` to avoid false positives. Both `validate-splash.ts` AND `dist/validate-splash.js` must be updated.
-- **Colons inside string arguments cause false positives.** A call like `ui.display.set_text("1:00")` triggers a false error because the validator finds the first colon on the line (inside `"1:00"`) and parses the token before it. Workaround: use string concatenation: `ui.display.set_text("1" + ":" + "00")`.
+- **Colons inside string arguments work correctly** (verified with `"Time: 2:30"` and `"current time is 1:00 and that's fine"`).
 - **Both files need updating:** The TypeScript source (`validate-splash.ts`) and the compiled JS (`dist/validate-splash.js`) must be kept in sync. The pi extension loads from `dist/`.
 
 ### Debugging workflow
@@ -679,7 +683,7 @@ When a splash app shows a blue/blank screen or "Splash app could not be rendered
 | "Splash app could not be rendered" toast/fallback | Same — Makepad VM rejected the body |
 | Blue/empty rectangle, no content | Container missing `height: Fit` — it collapsed to 0px |
 | Tool says "launched" but nothing visible | Container has no `height: Fit`, or widget doesn't exist in this build (e.g. `Stack`, `Divider`) |
-| Parser-syntax error using standard template | Validator false positive — check for `:` inside string args like `"1:00"` |
+| Parser-syntax error using standard template | Colons inside string args work correctly (tested with `"Time: 2:30"` and `"current time is 1:00 and that's fine"`) |
 | Nothing appears at all | Harness or makepad-host crashed — check terminal for `eprintln!` output |
 | App launched but status stuck on "Pending" | Pi extension resolved on first status (Pending) before makepad-host updated to Launched; this is a known race condition
 
@@ -711,7 +715,7 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | Inline variable in Label text | ⚠️ Static only | `Label{text:"Count: " + count}` evaluated at build time; to update, use `ui.<name>.set_text()` |
 | CheckBox `checked` toggle | ✅ Works | `on_click` can toggle `selected:false` state |
 | RadioButton group selection | ✅ Works | `group:1` parameter enables radio group; click selects one |
-| `type_text` + button click pipeline | ⚠️ Partially | type_text sets TextInput value, but Splash VM `text()` returns `[Error:WrongValue]` for values set by Rust code; use `.value` instead? |
+| `type_text` + button click pipeline | ✅ Works | type_text fills first TextInput; button click reads value via `ui.<name>.text()` correctly |
 | `Hr{height:1 width:Fill}` divider | ✅ Works | Renders a visible horizontal rule |
 | `Slider` widget renders | ✅ Renders | Present and visible, `on_change` callback fires |
 | `send_response()` via `__pi_response.set_text()` | ✅ Works | Hidden label writes response to shared doc, forwarded by harness bridge |
@@ -726,8 +730,7 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | `as int` type conversion | `"100" as int` → `NaN°F` | Use string manipulation + `set_text()` only |
 | Inline expressions in Labels | `"Score: " + score` stays at initial value | Always use `ui.<name>.set_text()` for dynamic content |
 | `type_text` bypasses `on_return` | Text set directly, callback not fired | Click a button that reads `ui.<name>.text()` to process |
-| `text_input.text()` returns `[Error:WrongValue]` for Rust-set values | Splash VM `text()` can't read values set by Rust `set_text()` | Use `set_text()` via `ui.<name>.set_text()` in Splash code, not via Rust's `walk_widgets_set_text` |
-| String concat with `text()` result fails | `"Prefix: " + text_input.text()` produces `[Error:WrongValue]` | Assign to variable and pass to `set_text()` directly; or use pure integer counters for concatenation |
+| ~~`text_input.text()` returns `[Error:WrongValue]`~~ | ✅ FIXED — Splash VM reads Rust-set values correctly | Proven: `"A:" + ui.field_a.text() + ",B:" + ui.field_b.text()` returned `A:HelloWorld,B:` after Rust `set_text()` |
 | Closing app leaves stale view | Old content persisted when close didn't trigger Draw event | Fixed — `apply_pending_updates` now runs at end of Signal handling too (June 2026) |
 | Click dispatch must go to splash directly | Splash content orphaned (parent=-1) from widget tree | Events dispatched via `splash.handle_event()`, not `self.ui.handle_event()` |
 | WindowId(1,0) doesn't match actual window | First window has index 0, generation 0 | Use `WindowId(0, 0)` for synthetic events |
@@ -741,6 +744,37 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 **Problem (2026-06-12):** After the deferred update architecture was introduced, `apply_pending_updates` only ran on Draw events. If no Draw event followed a close operation, the visual state wasn't cleared.
 
 **Fix (2026-06-12):** `apply_pending_updates` now also runs at the end of `Event::Signal` handling in `handle_event()`, ensuring close/clear operations take effect immediately.
+
+### `walk_widgets_set_text` Fix (2026-06-16)
+
+**Problem:** `type_text` debug command filled ALL TextInput widgets with the typed text, not just the first one. The `walk_widgets_set_text` function recursively walked all children and set text on every TextInput found.
+
+**Fix:** Added a `found` boolean flag that stops traversal after the first TextInput is found:
+```rust
+fn walk_widgets_set_text(widget: WidgetRef, cx: &mut Cx, text: &str) -> bool {
+    if widget.borrow::<makepad_widgets::TextInput>().is_some() {
+        widget.set_text(cx, text);
+        return true;
+    }
+    let mut found = false;
+    widget.try_children(&mut |_, child| {
+        if !found {
+            found = Self::walk_widgets_set_text(child, cx, text);
+        }
+    });
+    found
+}
+```
+
+Verified: `type_text "HelloWorld"` → only `field_a` has value "HelloWorld", `field_b` remains empty.
+
+### Idle Signal Spiral Fix (2026-06-16)
+
+**Problem:** `sync_from_doc` always stored a `PendingUiUpdate` on every Signal, even when nothing changed. `apply_pending_updates` called `set_text()` on the error line every time, causing continuous redraw loops and 100% CPU.
+
+**Fix:** Added early-return check comparing current doc values against `last_app_id`, `last_splash_body`, and `last_error_msg`. If nothing changed, the function returns immediately without storing a pending update.
+
+Verified: CPU drops to ~1.7% idle after launch, no more spin loop.
 
 ### Horizontal Layout (inner `View{flow:Right}`)
 

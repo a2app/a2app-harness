@@ -81,6 +81,8 @@ pub struct MakepadHostApp {
     pending_type_text: Option<String>, // text to type on next event cycle
     #[rust]
     pending_update: Option<PendingUiUpdate>, // deferred UI changes for next Draw
+    #[rust]
+    last_error_msg: String,
 }
 
 impl MakepadHostApp {
@@ -121,9 +123,6 @@ impl MakepadHostApp {
             should_exit: false,
         };
 
-        // Always include the error message state — Some("") to clear, Some(err) to show
-        update.error_msg = Some(error_msg.as_ref().map(|e| format!("⚠ {}", e)).unwrap_or_default());
-
         if splash_body.is_empty() && app_id.is_empty() {
             // No app — clear everything
             doc_handle.with_document(|doc| {
@@ -145,6 +144,19 @@ impl MakepadHostApp {
             self.pending_update = Some(update);
             return;
         }
+
+        // Early return if nothing changed (avoids unnecessary UI updates on idle Signals)
+        let error_text = error_msg.as_ref().map(|e| format!("⚠ {}", e)).unwrap_or_default();
+        if splash_body == self.last_splash_body
+            && app_id == self.last_app_id
+            && error_text == self.last_error_msg
+        {
+            return; // Nothing changed — skip update
+        }
+
+        // Something changed — update tracking values
+        self.last_error_msg = error_text.clone();
+        update.error_msg = Some(error_text);
 
         if splash_body != self.last_splash_body || app_id != self.last_app_id {
             // Defer splash rendering to the next Draw event
@@ -410,16 +422,20 @@ impl MakepadHostApp {
     }
 
     /// Recursively walk widget children looking for a TextInput and set its text.
-    fn walk_widgets_set_text(widget: WidgetRef, cx: &mut Cx, text: &str) {
+    fn walk_widgets_set_text(widget: WidgetRef, cx: &mut Cx, text: &str) -> bool {
         // Check if this widget is a TextInput (not the source code view)
         if widget.borrow::<makepad_widgets::TextInput>().is_some() {
             widget.set_text(cx, text);
-            return;
+            return true;
         }
-        // Walk children
+        // Walk children; stop at first TextInput found
+        let mut found = false;
         widget.try_children(&mut |_, child| {
-            Self::walk_widgets_set_text(child, cx, text);
+            if !found {
+                found = Self::walk_widgets_set_text(child, cx, text);
+            }
         });
+        found
     }
 }
 
@@ -461,6 +477,7 @@ impl AppMain for MakepadHostApp {
     fn after_new_from_script(_vm: &mut ScriptVm, app: &mut Self) {
         app.last_app_id = String::new();
         app.last_splash_body = String::new();
+        app.last_error_msg = String::new();
         app.pending_click = None;
         app.pending_type_text = None;
     }

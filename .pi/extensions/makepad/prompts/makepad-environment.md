@@ -148,16 +148,13 @@ Each new non-empty text triggers a new response. Empty strings are ignored.
 | `ToggleButton` | ❌ Doesn't exist | Use `ToggleFlat` instead |
 | `set_text()` triggering `on_return` | ❌ Bypassed | `type_text` debug sets TextInput value directly but does NOT fire `on_return` callback |
 
-## Known Limitation: Colons in String Arguments
+## Note: Colons in String Arguments
 
-**Avoid colons (`:`) inside string arguments passed to `ui.*.set_text()` calls.** The pre-validation parser incorrectly extracts the part before the first colon on each line, so this triggers a false error:
-
+**Colons inside string arguments work correctly.** Tested examples:
 ```
-❌ ui.display.set_text("1:00")       ← colon inside string argument triggers false positive
-✅ ui.display.set_text("1" + ":" + "00")  ← workaround
+ui.display.set_text("Time: 2:30")                                        ← ✅ renders "Time: 2:30"
+ui.__pi_response.set_text("current time is 1:00 and that's fine")        ← ✅ sends "current time is 1:00 and that's fine"
 ```
-
-This is a known bug in the compiled validator. It will be fixed when the pi process restarts with updated code.
 
 ## Widget Availability
 
@@ -322,7 +319,8 @@ Splash content widgets (the inner View created by evaluating the body) have `par
 - Click coordinates from the dump/snapshot are **window-content-relative**
 - Calculate center as `x + w/2, y + h/2`
 - Setting `widget_id` for click lookup does NOT work for splash content
-- `type_text` writes directly to the TextInput but does NOT trigger `on_return` callbacks — you need to click a button that reads the value to process it
+- `type_text` writes directly to the **first** TextInput found in the splash tree but does NOT trigger `on_return` callbacks — you need to click a button that reads the value to process it
+- Splash VM **CAN** read values set by Rust's `set_text()` via `ui.<name>.text()` (verified: `"A:" + ui.field_a.text()` returned `"A:HelloWorld"` after Rust set the value)
 
 ## Host Process Awareness
 
@@ -330,6 +328,13 @@ Splash content widgets (the inner View created by evaluating the body) have `par
 - `list_makepad_apps` shows the last stored state, which may be stale if the host crashed
 - If debug commands time out, the host may have crashed — try launching a fresh app
 - The harness does NOT currently detect host crashes automatically
+
+## Known Bugs (Internally Tracked)
+
+| Bug | Status | Impact |
+|-----|--------|--------|
+| `walk_widgets_set_text` fills ALL TextInputs instead of just the first | ✅ FIXED (June 2026) | `type_text` now only fills the first TextInput |
+| 100% CPU loop from idle Signals | ✅ FIXED (June 2026) | `sync_from_doc` now checks if anything changed before storing pending updates |
 
 ## Tools
 
