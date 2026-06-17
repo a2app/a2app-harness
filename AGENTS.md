@@ -286,16 +286,21 @@ parent = -1 in the widget tree graph. This means:
 
 **Important:** Even the previously-documented workaround (set variable in `on_click`, read with separate Button) does NOT work — the variable does not persist at all.
 
-**Recommendation:** Use `CheckBox` / `CheckBoxFlat` instead if you need togglable state that persists. CheckBox variables ARE preserved correctly.
+**Recommendation:** Use `ButtonFlat` with a manual toggle pattern instead. Neither `RadioButton`/`ToggleFlat` nor `CheckBox`/`CheckBoxFlat` reliably persist Splash VM variables set in `on_click` — only the visual widget-tree state updates correctly.
 
 ```splash
 // ❌ RadioButton — variable does NOT persist
 RadioButton{text:"A" group:1 on_click:||{selected = "A"}}
 Button{text:"Submit" on_click:||{ui.__pi_response.set_text(selected)}}  // returns "" (not "A")
 
-// ✅ CheckBox — variable persists correctly
+// ❌ CheckBox — variable also does NOT persist (confirmed 2026-06-17)
 CheckBoxFlat{checked:false on_click:||{toggled = !toggled}}
-Button{text:"Submit" on_click:||{ui.__pi_response.set_text("" + toggled)}}  // returns "true"
+Button{text:"Submit" on_click:||{ui.__pi_response.set_text("" + toggled)}}  // returns "false" despite visual check
+
+// ✅ ButtonFlat — variable persists correctly
+let toggled = false
+ButtonFlat{text:"Toggle" on_click:||{toggled = !toggled; ui.display.set_text("" + toggled)}}
+ButtonFlat{text:"Submit" on_click:||{ui.__pi_response.set_text("" + toggled)}}  // returns "true"
 ```
 
 ## Debug System Failure Analysis (2026-06-17)
@@ -851,7 +856,7 @@ Then from the agent: `wait_for_response app_id="my-app"`
 | Idle CPU (no debug commands) | ✅ 1.7% — no more 100% spin loop from idle Signals |
 | Counter app: increment button + display | ✅ Click "+ Increment" → label updates "Count: 1" |
 | Text echo: type_text → Show Text → display | ✅ type_text "Hello" → click "Show" → "You typed: Hello Makepad" |
-| CheckBox toggle + variable persistence | ✅ CheckBox `checked: true` and `task_done` variable persists |
+| CheckBox toggle + variable persistence | ⚠️ Visual `checked: true` updates, but Splash VM variable does NOT persist (same issue as RadioButton) |
 | RadioButton: visual check but variable lost | ⚠️ `checked: true` in widget tree, but `selected` variable stays "None" |
 | Calculator: sequential digit input via buttons | ✅ Click 7 → click 2 → display shows "72" |
 | ToggleFlat: variable lost after toggle | ⚠️ Visual state renders but toggled variable doesn't persist |
@@ -1057,7 +1062,7 @@ When a splash app shows a blue/blank screen or "Splash app could not be rendered
 | App launched but status stuck on "Pending" | Pi extension resolved on first status (Pending) before makepad-host updated to Launched; this is a known race condition |
 | Click misses target / wrong widget hit | Window coordinates shifted between snapshot and click; orphaned coordinates are relative to splash container, not absolute window | Always take fresh `widget_snapshot` before clicking; recalculate center each time |
 | Stale old content shows after launching new app | Rapid close+launch; makepad-host hasn't processed the new splash body yet | Close app, wait 1-2 seconds, then launch new app |
-| RadioButton/ToggleFlat shows checked but variable is initial value | RadioButton/ToggleFlat internal post-processing loses `on_click` variable assignments | Use `CheckBoxFlat` instead for persistent state |
+| CheckBox/RadioButton/ToggleFlat shows checked but variable is initial value | Widget internal post-processing loses `on_click` variable assignments for CheckBox, RadioButton, and ToggleFlat | Use `ButtonFlat` with manual toggle instead |
 | Debug commands timing out after many interactions | Runtime state accumulation in makepad-host after many app launches | Kill both processes, rebuild, and restart
 
 ## Widget Reliability Reference (2026-06-17)
@@ -1073,7 +1078,6 @@ which widgets to use for reliable interactive apps.
 | **`Button`** | Same as ButtonFlat | Standard buttons |
 | **`Label`** | `set_text()` updates visible text, inline expressions work at build time | Display values, titles, status |
 | **`TextInput`** | `type_text` fills first input, `text()` reads value, `set_text()` writes | Text entry, editable fields |
-| **`CheckBox`** / **`CheckBoxFlat`** | `checked` visual state toggles, `on_click` variable persists | Boolean toggles with persistent state |
 | **`Hr`** | Renders full-width line divider | Visual separation between sections |
 | **`RoundedView`** | Container with rounded corners, groups child widgets correctly | App root container, grouping |
 
@@ -1116,8 +1120,9 @@ ButtonFlat{text:"Show" on_click:||{ui.display.set_text(ui.field.text())}}
 |--------|-------------|---------------------|
 | **`RadioButton`** | `checked: true` updates correctly in widget tree | ❌ Splash VM variable set in `on_click` is LOST after RadioButton internal post-processing |
 | **`ToggleFlat`** | `checked` visual state renders | ❌ Same limitation as RadioButton — variable doesn't persist |
+| **`CheckBox`** / **`CheckBoxFlat`** | `checked: true` updates correctly in widget tree | ❌ Same limitation as RadioButton — variable doesn't persist (confirmed 2026-06-17) |
 
-**Recommendation:** Use `CheckBoxFlat` or `ButtonFlat` toggle patterns instead.
+**Recommendation:** Use `ButtonFlat` with manual toggle pattern for persistent state variables.
 
 ### Unavailable / Non-Rendering
 
@@ -1135,8 +1140,8 @@ ButtonFlat{text:"Show" on_click:||{ui.display.set_text(ui.field.text())}}
 ### Best Practices for Testable Apps
 
 1. **Use `ButtonFlat` as your primary interactive widget** — most reliable for clicks, variable writes, and `__pi_response`
-2. **Use `CheckBoxFlat` for boolean state** — variables persist correctly
-3. **Avoid `RadioButton` and `ToggleFlat`** if you need persistent state variables
+2. **Avoid `CheckBoxFlat`, `RadioButton`, and `ToggleFlat`** for persistent state variables — only visual `checked` state toggles
+3. **Use `ButtonFlat` with manual toggle** for boolean state that needs to persist
 4. **Use `Hr` for dividers** instead of unavailable `Divider`
 5. **Always take a fresh `widget_snapshot`** before clicking — coordinates can shift
 6. **Wait between interactions** — rapid sequential clicks may stack
@@ -1169,7 +1174,7 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | `as int` type casting | ❌ Produces NaN | `val as int` on a string value gives `NaN`; use string display + `set_text()` instead |
 | Inline variable in Label text | ⚠️ Static only | `Label{text:"Count: " + count}` evaluated at build time; to update, use `ui.<name>.set_text()` |
 | `let variable reassignment` | ✅ Works | `let x = 0; x = x + 1` works for counters and accumulators |
-| `CheckBox` / `CheckBoxFlat` toggle | ✅ Works | `on_click` can toggle variable; visual `checked` state updates correctly |
+| `CheckBox` / `CheckBoxFlat` toggle | ⚠️ Visual only | Visual `checked` state updates, but Splash VM variable does NOT persist; use ButtonFlat for persistent state |
 | `RadioButton` group selection | ⚠️ Visual only | `group:1` parameter enables visual radio group; `checked` state renders correctly BUT splash VM variable set in `on_click` does NOT persist (see RadioButton limitation) |
 | `ToggleFlat` toggle | ⚠️ Visual only | Same limitation as RadioButton — visual state renders but variable doesn't persist |
 | `type_text` + button click pipeline | ✅ Works | type_text fills first TextInput; button click reads value via `ui.<name>.text()` correctly |
