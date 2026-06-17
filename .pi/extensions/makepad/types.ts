@@ -40,9 +40,24 @@ export interface DebugResponseMessage {
   result: string;
 }
 
+export interface DocStateMessage {
+  type: "doc_state";
+  app_id: string | null;
+  user_response: string | null;
+  error_message: string | null;
+  status: string | null;
+}
+
 export type HarnessMessage =
   | WelcomeMessage
   | StatusMessage
   | UserResponseMessage
   | ErrorMessage
-  | DebugResponseMessage;
+  | DebugResponseMessage
+  | DocStateMessage;
+
+// ── Pi → Harness message types ─────────────────────────────────────────
+
+export interface GetDocMessage {
+  type: "get_doc";
+}

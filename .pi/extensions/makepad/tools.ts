@@ -1,10 +1,10 @@
 import { Type } from "typebox";
 
-import { connectToHarness, sendToHarness, onMessage } from "./doc-bridge.js";
+import { connectToHarness, sendToHarness, onMessage, getBufferedEvent, getAllBufferedEvents, clearEventBuffer } from "./doc-bridge.js";
 import { startHarness, stopHarness } from "./harness.js";
 import { STANDARD_APPS } from "./standard-apps.js";
 import { validateSplashBody } from "./validate-splash.js";
-import type { HarnessMessage, AppState } from "./types.js";
+import type { HarnessMessage, AppState, GetDocMessage } from "./types.js";
 
 type ExtensionAPI = any;
 
@@ -59,12 +59,16 @@ export function registerTools(pi: ExtensionAPI): void {
     label: "Launch Makepad App",
     description: "Launch a Makepad Splash mini-app in the host window.",
     promptSnippet:
-      "Launch or replace a Makepad mini-app with generated Splash DSL",
+      "Launch or replace a Makepad mini-app with Splash DSL",
     promptGuidelines: [
       "Use launch_makepad_app when the user asks to create, show, or update a native UI app.",
       "Generate only the Splash body - no Root{}, no Window{}, no Rust.",
       "Every TextInput must have a fixed numeric height such as 34.",
       "Do not use on_render in embedded Splash apps.",
+      "AFTER launching, use check_debug_app with debug_command=widget_snapshot to verify the app rendered correctly and discover widget coordinates.",
+      "Container must always have height:Fit.",
+      "To send data from splash to pi, use ui.__pi_response.set_text('...') inside on_click handlers.",
+      "Always check list_makepad_apps or check_debug_app for errors if app doesn't render.",
     ],
     parameters: Type.Object({
       app_id: Type.String({
@@ -266,11 +270,27 @@ export function registerTools(pi: ExtensionAPI): void {
       "Inspect or interact with the running Makepad mini-app",
     promptGuidelines: [
       "Use check_debug_app to inspect the widget tree, query widgets, or simulate interactions.",
-      "Available debug_command values: widget_dump (text tree of all widgets), widget_snapshot (JSON list with positions/text), widget_query (search by id or type), click (simulate mouse click), type_text (simulate text input).",
-      "For click: provide debug_params as JSON with widget_id or x,y.",
-      "For type_text: provide text raw as debug_params.",
-      "For widget_dump/snapshot: provide '{}' as debug_params.",
-      "First use widget_snapshot to discover widget IDs and positions.",
+      "Available debug_command values:",
+      "  - widget_snapshot: Returns full JSON array of all widgets with id, widget_type, x, y, width, height, text, value. Pass debug_params='{}'.",
+      "  - widget_dump: Compact text tree. Pass debug_params='{}'.",
+      "  - widget_query: Search by id or type. Pass query string as debug_params.",
+      "  - click: Simulate mouse click. Calculate center as (x + w/2, y + h/2) from snapshot data. Pass JSON as debug_params, e.g. '{\"x\":100,\"y\":200}'.",
+      "  - type_text: Fill the FIRST TextInput in the splash tree. Pass raw text as debug_params (not JSON). Does NOT trigger on_return callbacks.",
+      "",
+      "STANDARD WORKFLOW for interactivity:",
+      "  1. launch_makepad_app (create app)",
+      "  2. check_debug_app (widget_snapshot, {}) — discover widget positions",
+      "  3. check_debug_app (type_text, 'text') — fill first TextInput (optional)",
+      "  4. check_debug_app (click, '{\"x\":100,\"y\":200}') — click button (center = x+w/2, y+h/2)",
+      "  5. check_debug_app (widget_snapshot, {}) — verify __pi_response label text changed",
+      "  6. check_debug_app (click, ...) — next interaction",
+      "",
+      "IMPORTANT:",
+      "  - Splash content widgets have parent=-1 (orphaned). Do NOT use widget_id for click — use x,y coordinates.",
+      "  - widget_snapshot includes orphaned widgets at the bottom of the JSON array.",
+      "  - __pi_response initial text is ' ' (space). After click, it shows the response string.",
+      "  - The 'value' field on TextInput shows the text content; 'text' field is null for TextInputs.",
+      "  - Splash VM CAN read values set by Rust's set_text() via ui.<name>.text().",
     ],
     parameters: Type.Object({
       app_id: Type.Optional(
@@ -491,9 +511,11 @@ export function registerTools(pi: ExtensionAPI): void {
                 running: currentAppForId !== null,
                 status: currentAppForId?.status || "unknown",
                 error: error || null,
-                hint: error
-                  ? "Use check_debug_app with retry_splash_body set to a corrected Splash body to re-launch, or use debug_command to inspect the widget tree."
-                  : "No errors. Use check_debug_app debug_command='widget_snapshot' debug_params='{}' to inspect the app.",
+                hint: currentAppForId
+                  ? (error
+                    ? "Use check_debug_app with retry_splash_body set to a corrected Splash body to re-launch."
+                    : "No errors. Use check_debug_app debug_command='widget_snapshot' debug_params='{}' to inspect the app.")
+                  : "No app running. Use launch_makepad_app to create one first.",
               },
               null,
               2,
@@ -532,6 +554,293 @@ export function registerTools(pi: ExtensionAPI): void {
       return {
         content: [{ type: "text", text: "read_value not yet implemented." }],
         details: { found: false },
+      };
+    },
+  });
+
+  // ── Doc Inspector Tool ───────────────────────────────────────────────
+  //
+  // Queries the harness for the current state of the shared CRDT document.
+  // This is a read-only snapshot of all fields: pending_app, user_response,
+  // error_message, status. Use this to check if a splash app has sent a
+  // response, check for render errors, or see what app is currently running.
+  //
+  pi.registerTool({
+    name: "inspect_makepad_doc",
+    label: "Inspect Makepad Doc",
+    description:
+      "Query the current state of the shared CRDT document (pending_app, user_response, error_message, status).",
+    promptSnippet:
+      "Inspect the shared CRDT document state",
+    promptGuidelines: [
+      "Use inspect_makepad_doc to read the full shared document state from the harness.",
+      "Returns JSON: { app_id, user_response, error_message, status }",
+      "Also checks the local event buffer for any user_response that arrived between tool calls.",
+      "Clears the buffer after reading.",
+      "",
+      "USE CASES:",
+      "  - Check if a splash app has sent a response via __pi_response.set_text()",
+      "  - Check for render errors (error_message field)",
+      "  - See what app is currently running",
+      "  - Use AFTER a click to confirm the response was captured in the doc",
+    ],
+    parameters: Type.Object({}),
+    async execute(
+      _id: string,
+      _params: any,
+      _signal: AbortSignal,
+      _onUpdate: any,
+    ) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `Failed to connect: ${err}` },
+          ],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
+      // Send get_doc request
+      sendToHarness({ type: "get_doc" });
+
+      // Wait for doc_state response (with timeout)
+      const result = await new Promise<{
+        app_id: string | null;
+        user_response: string | null;
+        error_message: string | null;
+        status: string | null;
+      }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          unsub();
+          reject(new Error("Timed out waiting for doc_state response"));
+        }, 5_000);
+        let active = true;
+        const unsub = onMessage((msg: HarnessMessage) => {
+          if (!active) return;
+          if (msg.type === "doc_state") {
+            clearTimeout(timeout);
+            active = false;
+            unsub();
+            resolve({
+              app_id: msg.app_id,
+              user_response: msg.user_response,
+              error_message: msg.error_message,
+              status: msg.status,
+            });
+          }
+        });
+      });
+
+      // Also check the buffer for any user_response that arrived recently
+      const bufferedResponse = getBufferedEvent("user_response");
+      let bufferedText = "";
+      if (bufferedResponse && bufferedResponse.type === "user_response") {
+        bufferedText = ` [buffered: ${bufferedResponse.response}]`;
+      }
+
+      // Also check buffer for errors
+      const bufferedError = getBufferedEvent("error");
+      let bufferedErrorText = "";
+      if (bufferedError && bufferedError.type === "error") {
+        bufferedErrorText = ` [buffered: ${bufferedError.message}]`;
+      }
+
+      // Clear the buffer so we don't re-read stale events
+      clearEventBuffer();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                app_id: result.app_id,
+                user_response: result.user_response,
+                error_message: result.error_message || bufferedErrorText.replace(/^ \[buffered: /, "").replace(/\]$/, "") || null,
+                status: result.status,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: result,
+      };
+    },
+  });
+
+  // ── Wait-for-Response Tool ───────────────────────────────────────────
+  //
+  // An event-driven listener that blocks until a user_response is received
+  // from the splash app. This enables a "service worker" pattern:
+  //
+  //   1. Launch an app that sends responses (via __pi_response.set_text())
+  //   2. Call wait_for_response — it sets up a persistent listener
+  //   3. The tool awaits the response, with configurable timeout
+  //   4. When the splash app calls __pi_response.set_text("..."), the
+  //      response flows through: CRDT doc → harness bridge → JSON WS → tool
+  //
+  // The response is also buffered in doc-bridge.ts so other tools can
+  // inspect it later via inspect_makepad_doc or by checking the buffer.
+  //
+  pi.registerTool({
+    name: "wait_for_response",
+    label: "Wait for Response",
+    description:
+      "Block and wait for a user_response from the splash app. Sets up an event-driven listener that triggers when the splash app calls __pi_response.set_text().",
+    promptSnippet:
+      "Wait for splash app response (event-driven listener)",
+    promptGuidelines: [
+      "Use wait_for_response to asynchronously receive data from the splash app.",
+      "The splash app sends data by calling ui.__pi_response.set_text('...') in its on_click handler.",
+      "This is the primary way for native UI apps to communicate back to the pi agent.",
+      "",
+      "STANDARD FLOW:",
+      "  1. Launch app with ui.__pi_response.set_text() buttons",
+      "  2. Call wait_for_response (app_id='my-app', timeout_seconds=30)",
+      "  3. Tool blocks until user clicks a button OR timeout expires",
+      "  4. Returns { app_id, response, source: 'live' | 'buffered' }",
+      "",
+      "Parameters: app_id (optional, defaults to current), timeout_seconds (default 30, max 120), clear_buffer (default true)",
+      "",
+      "If a response was already buffered (arrived between tool calls), returns immediately with source='buffered'.",
+    ],
+    parameters: Type.Object({
+      app_id: Type.Optional(
+        Type.String({
+          description: "App ID to wait for a response from (defaults to current app)",
+        }),
+      ),
+      timeout_seconds: Type.Optional(
+        Type.Number({
+          description: "Max seconds to wait (default 30, max 120)",
+        }),
+      ),
+      clear_buffer: Type.Optional(
+        Type.Boolean({
+          description: "Clear any previous buffered response before waiting (default true)",
+        }),
+      ),
+    }),
+    async execute(
+      _id: string,
+      params: any,
+      _signal: AbortSignal,
+      onUpdate: any,
+    ) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `Failed to connect: ${err}` },
+          ],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
+      const appId = params.app_id || currentApp?.app_id;
+      if (!appId && !params.app_id) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No app specified and no current app. Provide app_id or launch an app first.",
+            },
+          ],
+          details: {},
+          isError: true,
+        };
+      }
+
+      const timeoutMs = Math.min(params.timeout_seconds || 30, 120) * 1000;
+
+      // Optionally clear the buffer
+      if (params.clear_buffer !== false) {
+        clearEventBuffer();
+      }
+
+      // Check the buffer first for any already-arrived response
+      const bufferedResponse = getBufferedEvent("user_response");
+      if (bufferedResponse && bufferedResponse.type === "user_response") {
+        if (!appId || bufferedResponse.app_id === appId) {
+          clearEventBuffer();
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    app_id: bufferedResponse.app_id,
+                    response: bufferedResponse.response,
+                    source: "buffered",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            details: {
+              app_id: bufferedResponse.app_id,
+              response: bufferedResponse.response,
+            },
+          };
+        }
+      }
+
+      // Wait for the response
+      const result = await new Promise<{
+        app_id: string;
+        response: string;
+      }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          unsub();
+          reject(
+            new Error(
+              `Timed out after ${timeoutMs / 1000}s waiting for response from '${appId || "any"}'.`,
+            ),
+          );
+        }, timeoutMs);
+        let active = true;
+        const unsub = onMessage((msg: HarnessMessage) => {
+          if (!active) return;
+          if (msg.type === "user_response") {
+            if (!appId || msg.app_id === appId) {
+              clearTimeout(timeout);
+              active = false;
+              unsub();
+              resolve({
+                app_id: msg.app_id,
+                response: msg.response,
+              });
+            }
+          }
+        });
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                app_id: result.app_id,
+                response: result.response,
+                source: "live",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: {
+          app_id: result.app_id,
+          response: result.response,
+        },
       };
     },
   });

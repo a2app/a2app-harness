@@ -82,6 +82,23 @@ impl AgentSplash {
     fn eval_body(&mut self, cx: &mut Cx) -> bool {
         let body = self.body.as_ref().to_string();
         if body.is_empty() {
+            // Render an empty View to clear the splash area
+            let code = "use mod.prelude.widgets.*View{width:Fill height:Fit}".to_string();
+            let script_mod = ScriptMod {
+                cargo_manifest_path: String::new(),
+                module_path: String::new(),
+                file: String::new(),
+                line: self.self_id(),
+                column: 0,
+                code: String::new(),
+                values: vec![],
+            };
+            cx.with_vm(|vm| {
+                let value = vm.eval_with_append_source(script_mod, &code, NIL.into());
+                if value.is_object() {
+                    self.view = View::script_from_value(vm, value);
+                }
+            });
             return true;
         }
 
@@ -99,6 +116,7 @@ impl AgentSplash {
 impl Widget for AgentSplash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        self.redraw(cx);
         
         // After each event, check if the splash body updated __pi_response.
         // Splash apps call ui.__pi_response.set_text("data") to send
@@ -134,7 +152,7 @@ impl Widget for AgentSplash {
                     report_error("Splash body could not be rendered");
                 }
             } else {
-                self.render_ok = true;
+                self.render_ok = self.eval_body(cx);
             }
             self.redraw(cx);
         }

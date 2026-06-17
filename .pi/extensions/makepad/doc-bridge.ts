@@ -13,12 +13,48 @@ let messageHandlers: Array<(msg: HarnessMessage) => void> = [];
 let connectedResolve: (() => void) | null = null;
 let connectedPromise: Promise<void> | null = null;
 
+// ── Persistent event buffer ──────────────────────────────────────────────
+//
+// The event buffer accumulates incoming messages from the harness so that
+// tools can inspect recent events even if they weren't listening at the
+// moment the message arrived. This enables a "service worker" pattern where
+// events are delivered asynchronously and can be processed by any tool.
+//
+// Buffer is keyed by message type, storing the most recent message of each
+// type. This is intentionally NOT a queue — we only keep the latest value
+// for each event type (user_response, error, status, etc.) because:
+//   a) The CRDT doc state is the source of truth; these are just notifications
+//   b) The harness sends many status/error updates; only the latest matters
+//
+// To clear: use clearEventBuffer()
+
+const eventBuffer: Map<string, HarnessMessage> = new Map();
+
+/** Get the latest message of a specific type from the buffer (or undefined) */
+export function getBufferedEvent(type: string): HarnessMessage | undefined {
+  return eventBuffer.get(type);
+}
+
+/** Get a copy of all buffered events */
+export function getAllBufferedEvents(): HarnessMessage[] {
+  return Array.from(eventBuffer.values());
+}
+
+/** Clear the event buffer */
+export function clearEventBuffer(): void {
+  eventBuffer.clear();
+}
+
+// ── Message handlers ────────────────────────────────────────────────────
+
 export function onMessage(handler: (msg: HarnessMessage) => void): () => void {
   messageHandlers.push(handler);
   return () => {
     messageHandlers = messageHandlers.filter((h) => h !== handler);
   };
 }
+
+// ── Connection management ────────────────────────────────────────────────
 
 export async function connectToHarness(): Promise<void> {
   if (connectedPromise) return connectedPromise;
@@ -51,12 +87,18 @@ export async function connectToHarness(): Promise<void> {
       socket.on("message", (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString()) as HarnessMessage;
+          
+          // Buffer the event (keyed by type) for later inspection
+          eventBuffer.set(msg.type, msg);
+
           if (msg.type === "welcome") {
             if (connectedResolve) {
               connectedResolve();
               connectedResolve = null;
             }
           }
+
+          // Notify all registered handlers
           for (const handler of messageHandlers) {
             handler(msg);
           }

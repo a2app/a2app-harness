@@ -31,6 +31,8 @@ enum PiToHarnessMsg {
     Clear { app_id: String },
     #[serde(rename = "debug")]
     Debug { app_id: String, command: String, params: String },
+    #[serde(rename = "get_doc")]
+    GetDoc,
     #[serde(rename = "exit")]
     Exit,
 }
@@ -48,6 +50,8 @@ enum HarnessToPiMsg {
     Error { app_id: String, message: String },
     #[serde(rename = "debug_response")]
     DebugResponse { app_id: String, result: String },
+    #[serde(rename = "doc_state")]
+    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String> },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -77,8 +81,13 @@ fn main() {
 
 async fn background_main(headless: bool) {
     // ── 1. Create samod repo and shared doc ──────────────────────────
+    // IMPORTANT: samod uses InMemoryStorage by default (no disk persistence).
+    // The `load()` call just initializes the runtime, it does NOT load from disk.
+    // Every harness restart starts with a fresh, empty CRDT document.
+    // See samod docs: Repo::build_tokio() returns RepoBuilder<InMemoryStorage, ...>
     let repo = samod::Repo::build_tokio().load().await;
 
+    // Create a fresh in-memory automerge document with default AgentDoc
     let mut initial = automerge::Automerge::new();
     {
         let mut tx = initial.transaction();
@@ -92,7 +101,8 @@ async fn background_main(headless: bool) {
         .await
         .expect("create shared document");
 
-    // Clear any stale state
+    // Safety: clear all fields in case the default had any non-null values.
+    // Even though we create a fresh doc, this ensures determinism.
     doc_handle.with_document(|doc| {
         use autosurgeon::{hydrate, reconcile};
         let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
@@ -457,6 +467,27 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
                     tx.commit();
+                });
+            }
+            PiToHarnessMsg::GetDoc => {
+                eprintln!("[harness] pi: get_doc");
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::hydrate;
+                    let agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
+                    let status = agent.pending_app.as_ref().map(|a| match &a.status {
+                        shared::AppStatus::Pending => "Pending".to_string(),
+                        shared::AppStatus::Launched => "Launched".to_string(),
+                    });
+                    let msg = HarnessToPiMsg::DocState {
+                        app_id,
+                        user_response: agent.user_response,
+                        error_message: agent.error_message,
+                        status,
+                    };
+                    let json = serde_json::to_string(&msg).unwrap_or_default();
+                    let _ = fwd_tx.send(json);
                 });
             }
             PiToHarnessMsg::Clear { app_id } => {
