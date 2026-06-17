@@ -919,6 +919,9 @@ The Splash DSL is a declarative domain-specific language parsed by Makepad's bui
 - The `ui` object is built-in; you do NOT need to declare it with `:=`
 - Only certain widgets exist in this Makepad build; others silently fail
 - Colons inside string arguments to `ui.*.set_text()` work correctly (verified with `"Time: 2:30"` and `"1:00"`) — no false positive
+- **`for` loops render widgets at build-time only** — array changes do NOT trigger re-renders; use `set_text()` for dynamic content
+- **Functions with `for` loops return empty strings** when called from `on_click` — build strings inline in the closure instead
+- **Inline string building with `text()` + `set_text()` + `\n`** is the correct pattern for dynamic list displays
 
 ### Mistake: Omitting `height: Fit` on containers
 
@@ -931,6 +934,71 @@ Every `View`, `RoundedView`, etc. **MUST have explicit `height: Fit`**. Without 
 ```
 
 Note that `RoundedView` does NOT have a default height of `Fit`. Every container needs it explicitly.
+
+### Mistake: Relying on `for` loops for dynamic rendering or string building
+
+**`for` loops in Splash DSL only render widgets at build time, not dynamically.**
+
+When a `for` loop generates widgets (like a task list), those widgets are created
+once when the body is first evaluated and **never re-rendered** when the underlying
+array changes. This means:
+
+```splash
+// ❌ WON'T WORK — for loop creates widgets once, never updates
+let tasks = []
+for t in tasks {
+  Label{text: t}
+}
+ButtonFlat{text:"Add" on_click:||{
+  tasks = tasks + ["New task"]  // Array updates, but UI doesn't re-render!
+}}
+```
+
+**Functions with `for` loops that build strings also return empty results** when
+called from `on_click` handlers. The string accumulation logic (`result = result + t`)
+inside a function called from a closure produces empty strings:
+
+```splash
+// ❌ WON'T WORK — function with for loop returns empty string
+fn task_display_text() {
+  let result = ""
+  for t in tasks {
+    result = result + t
+  }
+  result
+}
+ButtonFlat{text:"Show" on_click:||{
+  ui.display.set_text(task_display_text())  // Shows nothing!
+}}
+```
+
+**✅ Correct pattern: Inline string building with `text()` + `set_text()`**
+
+Instead of relying on `for` loops or functions, build the display string inline
+in the `on_click` handler by reading the current label text and appending:
+
+```splash
+let task_count = 0
+RoundedView{width:Fill height:Fit flow:Down padding:16 spacing:8
+  task_input := TextInput{width:200 height:34}
+  ButtonFlat{text:"Add" on_click:||{
+    let t = ui.task_input.text()
+    if t != "" {
+      task_count = task_count + 1
+      let current = ui.task_display.text()
+      if current == " " { current = "" }         // Handle initial space
+      if current != "" { current = current + "\n" }  // Newline separator
+      ui.task_display.set_text(current + task_count + ". " + t)
+      ui.task_input.set_text("")
+    }
+  }}
+  task_display := Label{text:"" font_size:14.0}
+}
+```
+
+There is **no workaround** for dynamic widget generation via `for` loops in Splash
+DSL — you cannot re-render a subtree when an array changes. Always use string-based
+`set_text()` for dynamic content.
 
 ### Mistake: Using `Stack`, `Divider`, `ProgressBar`, `IconButton`, `ToggleButton`
 
@@ -1098,6 +1166,26 @@ if task_done { done = done + 1 }  // Works in Splash DSL
 ButtonFlat{text:"Submit" on_click:||{ui.__pi_response.set_text("" + count)}}
 ```
 
+**Inline string building for dynamic lists (todo-style):**
+```splash
+let task_count = 0
+task_display := Label{text:"" font_size:14.0}
+ButtonFlat{text:"Add" on_click:||{
+  let t = ui.task_input.text()
+  if t != "" {
+    task_count = task_count + 1
+    let current = ui.task_display.text()
+    if current == " " { current = "" }
+    if current != "" { current = current + "\n" }
+    ui.task_display.set_text(current + task_count + ". " + t)
+  }
+}}
+```
+This pattern replaces broken `for`-loop-based rendering. Append to the label's
+text on each add operation using `ui.<name>.text()` to read current content,
+then `ui.<name>.set_text()` to write the updated content. Works with
+multiline `\n` content.
+
 **type_text → click pipeline:**
 ```splash
 field := TextInput{width:Fill height:34}
@@ -1146,6 +1234,9 @@ ButtonFlat{text:"Show" on_click:||{ui.display.set_text(ui.field.text())}}
 5. **Always take a fresh `widget_snapshot`** before clicking — coordinates can shift
 6. **Wait between interactions** — rapid sequential clicks may stack
 7. **Use `close` + wait 1-2s + `launch`** if a new app shows stale content
+8. **Do NOT use `for` loops for dynamic content** — `for` loops only render at build time; use `set_text()` string building instead
+9. **Do NOT call functions containing `for` loops from `on_click`** — they return empty strings; inline all string building in the closure
+10. **Use `text()` + `set_text()` with `\n` concatenation** for multiline list displays in a single Label
 
 ### Logs
 
@@ -1187,6 +1278,10 @@ If you can't see logs, check if the pi process is running in a visible terminal.
 | Synthetic click dispatch to splash | ✅ Works | Dispatch directly to AgentSplash (not through Root/Window) |
 | Close app clears visual state | ✅ Works | Empty splash body renders empty View |
 | Sequential digit input via buttons | ✅ Works | Pattern `a = a*10+7` builds multi-digit numbers from button clicks |
+| `for` loop widget rendering | ❌ Static only | Widgets from `for` loops are created at build time; array changes don't re-render — use `set_text()` for dynamic content |
+| `for` loop string building in functions | ❌ Returns empty | Functions containing `for` loops called from `on_click` return empty strings — use inline string building instead |
+| Inline `\n` string building in `on_click` | ✅ Works | `ui.<name>.set_text(current + "\n" + new_item)` builds multiline displays dynamically — verified with 3-item task list |
+| Calculator arithmetic (72 + 19) | ✅ Works | `a = a*10+digit` pattern + `b = a; a = 0` for operand swap; `if op == "+" { a = a + b }` computes addition |
 
 ### Verified Limitations
 
