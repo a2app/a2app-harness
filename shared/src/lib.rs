@@ -21,6 +21,10 @@ pub struct AgentDoc {
     /// (`send_response`), synced to the harness via CRDT, then forwarded
     /// to pi over JSON WS.
     pub user_response: Option<String>,
+    /// Monotonically increasing version counter for user_response.
+    /// Incremented by makepad-host on each write so the bridge loop
+    /// can detect changes even when the value is the same.
+    pub user_response_version: u64,
     /// Error message set by the Makepad host when the splash body
     /// fails to evaluate. The harness bridge loop forwards this to pi
     /// as a `{"type":"error",...}` message.

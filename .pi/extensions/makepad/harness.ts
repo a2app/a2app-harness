@@ -1,6 +1,7 @@
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const JSON_WS_PORT = 2341;
 
@@ -16,10 +17,18 @@ function findHarnessBinary(workspaceRoot: string): string {
     resolve(workspaceRoot, "harness/target/debug/harness"),
   ];
 
+  // Also resolve from this extension file's own location (works even if CWD doesn't match project root)
+  const __filename = fileURLToPath(import.meta.url);
+  const extDir = dirname(__filename); // .pi/extensions/makepad/dist/
+  const projectRoot = resolve(extDir, "../../../../");
+  candidates.push(resolve(projectRoot, "target/debug/harness"));
+  candidates.push(resolve(projectRoot, "harness/target/debug/harness"));
+
   const found = candidates.find((p) => existsSync(p));
   if (!found) {
     throw new Error(
-      "Harness binary not found. Build with 'cargo build -p harness' or set LSP_AGENT_HARNESS_BINARY.",
+      `Harness binary not found. Build with 'cargo build -p harness' or set LSP_AGENT_HARNESS_BINARY.` +
+      ` (searched: ${candidates.join(", ")})`,
     );
   }
 

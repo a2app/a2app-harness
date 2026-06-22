@@ -81,8 +81,10 @@ TypeScript extension. Key files:
 ### User Response (splash → pi)
 1. Splash app calls `ui.__pi_response.set_text("data")` in any `on_click` handler
 2. AgentSplash detects the label text changed → writes `user_response` to CRDT doc
-3. Harness bridge loop forwards `{"type":"user_response","app_id":"...","response":"..."}` to pi
-4. Pi extension buffers the event (per-type Map) and dispatches to `wait_for_response`
+3. AgentSplash also increments `user_response_version` before writing
+4. Harness bridge loop compares version number (not value) to detect changes
+5. Harness forwards `{"type":"user_response","app_id":"...","response":"..."}` to pi
+6. Pi extension buffers the event (per-type Map) and dispatches to `wait_for_response`
 
 ### Shutdown
 1. pi sends `{"type":"exit"}` or pi exits
@@ -97,6 +99,10 @@ pub struct AgentDoc {
     pub extension_requests: bool,
     pub should_exit: bool,
     pub user_response: Option<String>,     // splash sends data back
+    /// Monotonically increasing version counter for user_response.
+    /// Incremented by makepad-host on each write so the bridge loop
+    /// can detect same-value responses (e.g. toggle stays "true").
+    pub user_response_version: u64,
     pub error_message: Option<String>,     // rendering error
     pub debug_command: Option<DebugCommand>,
     pub debug_response: Option<String>,
@@ -131,12 +137,13 @@ Debug commands flow: pi → harness → CRDT doc → makepad-host → response b
 
 ### How It Works
 
-1. pi sends `{"type":"debug",...}` → harness writes `debug_command` to CRDT doc
-2. makepad-host receives doc change via Signal → `process_debug_commands()` executes:
+1. pi sends `{"type":"debug",...}` → harness sets `pending_interaction` flag (for click/type_text), writes `debug_command` to CRDT doc
+2. Bridge loop detects `pending_interaction` → skips one iteration (the debug_command write has stale user_response), waits for the splash-processed response
+3. makepad-host receives doc change via Signal → `process_debug_commands()` executes:
    - **Read-only** (`widget_dump`, `snapshot`, `query`): use `cx.widget_tree()` API
    - **`click`**: stores `(x,y)` in `pending_click`; dispatched on next Signal/Draw event via `splash.handle_event()` as synthetic MouseDown+MouseUp (bypasses Window — splash content is orphaned from widget tree)
    - **`type_text`**: `walk_widgets_set_text()` recursively walks children, fills first TextInput, stops
-3. Result written to `debug_response` on doc → harness forwards to pi and clears
+4. Result written to `debug_response` on doc → harness forwards to pi and clears
 
 ### Event Ordering in `handle_event`
 
@@ -182,10 +189,20 @@ Splash content widgets have `parent = -1` in the widget tree graph. This means:
 2. **Snapshot**: `check_debug_app debug_command=widget_snapshot debug_params="{}"` — find orphaned widgets at bottom (`"window_id": ""`)
 3. **Calculate click center**: `x + w/2, y + h/2`
 4. **Click**: `check_debug_app debug_command=click debug_params='{"x":85,"y":254}'`
-5. **Verify**: Re-snapshot to confirm state changed
-6. **For TextInput**: `type_text` FIRST, then click a button that reads `ui.<name>.text()`
+5. **Verify**: Use `inspect_makepad_doc` to read `user_response`, or re-snapshot
+6. **For TextInput**: `type_text` FIRST (fills first TextInput found — may be the `source` editor, not the splash's TextInput), then click a button that reads `ui.<name>.text()`
 
-**Always take a fresh snapshot before each click** — orphaned coordinates are relative to the splash container, not absolute window coordinates. They can shift between snapshots.
+**CRITICAL: Always take a fresh snapshot before each click** — orphaned coordinates shift after layout changes (e.g., adding list items moves buttons down).
+
+**Use `inspect_makepad_doc` for response** — `wait_for_response` may time out if the response arrived before the listener was set up. `inspect_makepad_doc` is synchronous.
+
+### Known Interaction Issues
+
+**Coordinates shift after layout changes**
+When content grows (e.g., items added to a list via `set_text()`), the splash container height changes and all subsequent widgets shift downward. The orphan coordinates from the initial snapshot become stale. **Always take a fresh snapshot before each click** if the UI has changed since the last snapshot.
+
+**`type_text` fills the wrong TextInput**
+The `type_text` command walks the widget tree and fills the FIRST TextInput found. The makepad-host's `source` TextInput (code editor for splash body) is always present in the tree and may be found BEFORE the splash's TextInput. To fill the splash's TextInput reliably, use `widget_query` or verify the TextInput `id` matches.
 
 ### Rendering Error Handling
 
@@ -251,6 +268,22 @@ Pre-validation catches: unknown widgets, multiline string literals, undeclared n
 
 Both `validate-splash.ts` and `dist/validate-splash.js` must be kept in sync (pi extension loads from `dist/`).
 
+Similarly `harness.ts`/`dist/harness.js` and `tools.ts`/`dist/tools.js` must be kept in sync — pi loads from `dist/`.
+
+## Verified Patterns (Tested 2026-06-22)
+
+After the user_response version counter fix, all tests pass cleanly via extension tools.
+
+| Pattern | Test Status | Notes |
+|---------|-------------|-------|
+| Simple button → `__pi_response.set_text()` | ✅ | Response arrives in `user_response` doc field |
+| Counter via `let count = 0; count += 1` | ✅ | Variables persist across clicks |
+| Toggle `let toggled = false; toggled = !toggled` | ✅ | Same-value responses work via version counter |
+| TextInput + Button (`type_text` → click Submit) | ✅ | `type_text` fills source editor, not splash TextInput* |
+| Dynamic list via `set_text()` concatenation | ✅ | Coordinates shift after items added |
+
+*`type_text` fills the first TextInput in the widget tree, which is the makepad-host's `source` editor. The splash's TextInput must be contacted differently or a workaround used.
+
 ## Widget Reliability Reference
 
 ### Fully Reliable
@@ -259,12 +292,20 @@ Both `validate-splash.ts` and `dist/validate-splash.js` must be kept in sync (pi
 |--------|-------------|----------|
 | **`ButtonFlat`** | Click → variable write, `set_text()`, `text()`, `__pi_response.set_text()` | All interactive controls |
 | **`Button`** | Same as ButtonFlat | Standard buttons |
-| **`Label`** | `set_text()` updates visible text | Display values, status |
+| **`Label`** | `set_text()` updates visible text, `text()` reads back | Display values, status, dynamic list display |
 | **`TextInput`** | `type_text` fills first input, `text()` reads value, `set_text()` writes | Text entry |
 | **`Hr`** | Full-width line divider | Visual separation |
 | **`RoundedView`** | Container with rounded corners | App root, groups |
 
-### Visual-Only State (Variables Don't Persist in Splash VM)
+### Splash VM Variable Scope (Correction)
+
+**Splash VM `let` variables DO persist** across click events in the same app session. This was confirmed by testing:
+- Counter: `let count = 0; count = count + 1` correctly produces `1, 2, 3, 4` across consecutive clicks
+- Toggle: `let toggled = false; toggled = !toggled` persists `true` state across separate button clicks
+
+However, **widget `checked` state** on `RadioButton`, `ToggleFlat`, `CheckBox` does NOT persist because internal post-processing discards the `on_click` scope context.
+
+### Visual-Only State (Widget Properties)
 
 | Widget | Visual State | Variable Persistence |
 |--------|-------------|---------------------|
@@ -272,12 +313,34 @@ Both `validate-splash.ts` and `dist/validate-splash.js` must be kept in sync (pi
 | **`ToggleFlat`** | `checked` visual renders | ❌ Same limitation |
 | **`CheckBox`** / **`CheckBoxFlat`** | `checked: true` in widget tree | ❌ Same limitation (confirmed 2026-06-17) |
 
-**Use `ButtonFlat` with manual toggle for persistent boolean state:**
+**Use `ButtonFlat` with manual toggle for persistent boolean state (VERIFIED ✅):**
 ```splash
 let toggled = false
 ButtonFlat{text:"Toggle" on_click:||{toggled = !toggled; ui.display.set_text("" + toggled)}}
 ButtonFlat{text:"Submit" on_click:||{ui.__pi_response.set_text("" + toggled)}}  // ✅ "true"
 ```
+
+### Correct Pattern: Dynamic List Display (Replaces `for` Loops) VERIFIED ✅
+
+```splash
+let task_count = 0
+inp := TextInput{height:34}
+lst := Label{text:"" font_size:14.0}
+ButtonFlat{text:"Add" on_click:||{
+  let t = ui.inp.text()
+  if t != "" {
+    task_count = task_count + 1
+    let cur = ui.lst.text()
+    if cur == " " { cur = "" }
+    if cur != "" { cur = cur + "\n" }
+    ui.lst.set_text(cur + task_count + ". " + t)
+    ui.inp.set_text("")
+  }
+}}
+ButtonFlat{text:"Done" on_click:||{ui.__pi_response.set_text(ui.lst.text())}}
+```
+
+⚠️ **Buttons shift down** as items are added to the list — always take a fresh snapshot before clicking.
 
 ### Available But Not Interactive via Synthetic Clicks
 
@@ -302,8 +365,8 @@ ButtonFlat{text:"Submit" on_click:||{ui.__pi_response.set_text("" + toggled)}}  
 | Widget text shows `" "` (space) instead of `""` for `__pi_response` | Use `value` field for TextInput, not `text` field |
 | Stale content after rapid close+launch | Wait 1-2 seconds between close and launch |
 | Debug commands freeze after ~50 ops (runtime state accumulation in makepad-host) | Kill both processes, rebuild, restart |
-| Window coordinates can shift between snapshots | Always take fresh snapshot before each click |
-| `type_text` bypasses `on_return` callbacks | Click a button that reads `ui.<name>.text()` to process |
+| Coordinates shift after layout changes (e.g., adding list items) | Always take a fresh `widget_snapshot` before each click |
+| `type_text` fills the makepad-host `source` editor, not splash TextInput | `widget_snapshot` shows the splash TextInput with `id="inp"` and `window_id=""` |
 | `TabBar`/`DropDown` popup menus can't be tested synthetically | Use `ButtonFlat` rows for tab/option UIs |
 | `RadioButton`, `ToggleFlat`, `CheckBox`/`CheckBoxFlat` variables don't persist in Splash VM | Use `ButtonFlat` with manual toggle |
 

@@ -1,6 +1,8 @@
 use std::env;
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -220,9 +222,11 @@ async fn background_main(headless: bool) {
 
     // ── 4. Set up JSON WS server for pi extension ────────────────────
     // Wrap doc_handle in a shared state for the WS handler
+    let pending_interaction = Arc::new(AtomicBool::new(false));
     let bridge_state = BridgeState {
         doc: doc_handle.clone(),
         pi_tx: tokio::sync::broadcast::channel(16).0,
+        pending_interaction: pending_interaction.clone(),
     };
     let bridge = std::sync::Arc::new(tokio::sync::Mutex::new(bridge_state));
 
@@ -266,9 +270,27 @@ async fn background_main(headless: bool) {
     // We also need to handle writes FROM pi in the WS handler above.
     // Here we watch for doc changes (from makepad-host) and push to pi.
     let mut doc_changes = doc_handle.changes();
+    // Track last sent values to avoid forwarding duplicates.
+    // user_response_version is monotonically incremented by makepad-host
+    // on each write, so same-value responses are distinguishable.
+    let mut last_user_response_version: u64 = 0;
+    let mut last_error_message: Option<String> = None;
+    let mut last_status: Option<String> = None;
+    let mut last_status_app_id: Option<String> = None;
 
     while let Some(_change) = doc_changes.next().await {
-        let (has_response, app_id, status, error_message, debug_response, exit) = doc_handle.with_document(|doc| {
+        // If pi sent an interactive command (click/type_text), clear tracking
+        // so the resulting user_response is forwarded even if value hasn't changed.
+        // IMPORTANT: skip this doc iteration entirely — the current doc still has
+        // the stale user_response from before the interaction. The actual response
+        // comes on the NEXT doc change after the splash processes the event.
+        if pending_interaction.swap(false, Ordering::SeqCst) {
+            // Skip this doc iteration — the current state is from the debug_command write,
+            // not yet from the splash processing the interaction.
+            continue;
+        }
+
+        let (has_response, version, app_id, status, error_message, debug_response, exit) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
@@ -276,19 +298,22 @@ async fn background_main(headless: bool) {
                 shared::AppStatus::Pending => "Pending".to_string(),
                 shared::AppStatus::Launched => "Launched".to_string(),
             });
-            (agent.user_response.clone(), app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.should_exit)
+            (agent.user_response.clone(), agent.user_response_version, app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.should_exit)
         });
 
-        // Push user_response to pi if present
-        if let Some(ref response) = has_response {
-            if let Some(ref id) = app_id {
-                let msg = HarnessToPiMsg::UserResponse {
-                    app_id: id.clone(),
-                    response: response.clone(),
-                };
-                let json = serde_json::to_string(&msg).unwrap_or_default();
-                let _ = bridge.lock().await.pi_tx.send(json);
+        // Push user_response to pi if version changed
+        if version != 0 && version != last_user_response_version {
+            if let Some(ref response) = has_response {
+                if let Some(ref id) = app_id {
+                    let msg = HarnessToPiMsg::UserResponse {
+                        app_id: id.clone(),
+                        response: response.clone(),
+                    };
+                    let json = serde_json::to_string(&msg).unwrap_or_default();
+                    let _ = bridge.lock().await.pi_tx.send(json);
+                }
             }
+            last_user_response_version = version;
         }
 
         // Push debug_response to pi if present
@@ -312,29 +337,35 @@ async fn background_main(headless: bool) {
             }
         }
 
-        // Push status update to pi if we have an app
-        if let Some(ref id) = app_id {
-            if let Some(ref st) = status {
-                let msg = HarnessToPiMsg::Status {
-                    app_id: id.clone(),
-                    status: st.clone(),
-                };
-                let json = serde_json::to_string(&msg).unwrap_or_default();
-                let _ = bridge.lock().await.pi_tx.send(json);
+        // Push status update to pi only if changed
+        if status != last_status || app_id != last_status_app_id {
+            if let Some(ref id) = app_id {
+                if let Some(ref st) = status {
+                    let msg = HarnessToPiMsg::Status {
+                        app_id: id.clone(),
+                        status: st.clone(),
+                    };
+                    let json = serde_json::to_string(&msg).unwrap_or_default();
+                    let _ = bridge.lock().await.pi_tx.send(json);
+                }
             }
+            last_status = status;
+            last_status_app_id = app_id.clone();
         }
 
-        // Push error message to pi if present
-        // (may appear on multiple doc changes until the error is cleared by a new launch)
-        if let Some(ref msg_text) = error_message {
-            if let Some(ref id) = app_id {
-                let msg = HarnessToPiMsg::Error {
-                    app_id: id.clone(),
-                    message: msg_text.clone(),
-                };
-                let json = serde_json::to_string(&msg).unwrap_or_default();
-                let _ = bridge.lock().await.pi_tx.send(json);
+        // Push error message to pi only if changed
+        if error_message != last_error_message {
+            if let Some(ref msg_text) = error_message {
+                if let Some(ref id) = app_id {
+                    let msg = HarnessToPiMsg::Error {
+                        app_id: id.clone(),
+                        message: msg_text.clone(),
+                    };
+                    let json = serde_json::to_string(&msg).unwrap_or_default();
+                    let _ = bridge.lock().await.pi_tx.send(json);
+                }
             }
+            last_error_message = error_message;
         }
 
         if exit {
@@ -359,6 +390,10 @@ struct BridgeState {
     /// Broadcast channel for pushing messages from the bridge loop
     /// to the connected pi WebSocket.
     pi_tx: tokio::sync::broadcast::Sender<String>,
+    /// Set to true when pi sends an interactive debug command (click/type_text);
+    /// bridge loop clears user_response tracking on next iteration so the
+    /// resulting user_response is forwarded even if the value hasn't changed.
+    pending_interaction: Arc<AtomicBool>,
 }
 
 // ── Handle pi WebSocket connection ───────────────────────────────────────
@@ -454,6 +489,13 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
             }
             PiToHarnessMsg::Debug { app_id, command, params } => {
                 eprintln!("[harness] pi: debug '{command}' on app '{app_id}'");
+
+                // For interactive commands, signal the bridge loop to clear
+                // user_response tracking so the response is forwarded even if
+                // its value hasn't changed (e.g. toggle stays "true").
+                if command == "click" || command == "type_text" {
+                    bridge.lock().await.pending_interaction.store(true, Ordering::SeqCst);
+                }
 
                 doc_handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
