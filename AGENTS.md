@@ -201,8 +201,8 @@ Splash content widgets have `parent = -1` in the widget tree graph. This means:
 **Coordinates shift after layout changes**
 When content grows (e.g., items added to a list via `set_text()`), the splash container height changes and all subsequent widgets shift downward. The orphan coordinates from the initial snapshot become stale. **Always take a fresh snapshot before each click** if the UI has changed since the last snapshot.
 
-**`type_text` fills the wrong TextInput**
-The `type_text` command walks the widget tree and fills the FIRST TextInput found. The makepad-host's `source` TextInput (code editor for splash body) is always present in the tree and may be found BEFORE the splash's TextInput. To fill the splash's TextInput reliably, use `widget_query` or verify the TextInput `id` matches.
+**`type_text` fills the first TextInput within splash children**
+The `type_text` command calls `walk_widgets_set_text(splash, ...)` which walks the splash widget's own children recursively. This means it only ever searches orphan splash widgets — it will **not** accidentally fill the makepad-host `source` editor. However, if the splash body itself contains multiple TextInputs, it fills the first one found (breadth-first walk order). To verify which input was filled, check the `value` field of orphan TextInputs in the widget_snapshot.
 
 ### Rendering Error Handling
 
@@ -279,10 +279,10 @@ After the user_response version counter fix, all tests pass cleanly via extensio
 | Simple button → `__pi_response.set_text()` | ✅ | Response arrives in `user_response` doc field |
 | Counter via `let count = 0; count += 1` | ✅ | Variables persist across clicks |
 | Toggle `let toggled = false; toggled = !toggled` | ✅ | Same-value responses work via version counter |
-| TextInput + Button (`type_text` → click Submit) | ✅ | `type_text` fills source editor, not splash TextInput* |
+| TextInput + Button (`type_text` → click Submit) | ✅ | `type_text` walks splash children, not full tree |
 | Dynamic list via `set_text()` concatenation | ✅ | Coordinates shift after items added |
 
-*`type_text` fills the first TextInput in the widget tree, which is the makepad-host's `source` editor. The splash's TextInput must be contacted differently or a workaround used.
+*`type_text` calls `walk_widgets_set_text(splash, ...)` — it walks only the splash widget's own children, so it fills the first TextInput found within the splash content. Works reliably for splash TextInputs; use `widget_snapshot` to verify which orphan TextInput's `value` changed.
 
 ## Widget Reliability Reference
 
@@ -366,7 +366,7 @@ ButtonFlat{text:"Done" on_click:||{ui.__pi_response.set_text(ui.lst.text())}}
 | Stale content after rapid close+launch | Wait 1-2 seconds between close and launch |
 | Debug commands freeze after ~50 ops (runtime state accumulation in makepad-host) | Kill both processes, rebuild, restart |
 | Coordinates shift after layout changes (e.g., adding list items) | Always take a fresh `widget_snapshot` before each click |
-| `type_text` fills the makepad-host `source` editor, not splash TextInput | `widget_snapshot` shows the splash TextInput with `id="inp"` and `window_id=""` |
+| `type_text` fills first TextInput within splash children | Use `widget_snapshot` and check which orphan TextInput's `value` changed |
 | `TabBar`/`DropDown` popup menus can't be tested synthetically | Use `ButtonFlat` rows for tab/option UIs |
 | `RadioButton`, `ToggleFlat`, `CheckBox`/`CheckBoxFlat` variables don't persist in Splash VM | Use `ButtonFlat` with manual toggle |
 
