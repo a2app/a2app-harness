@@ -166,7 +166,10 @@ fn write_doc_field(field: &str, value: String) {
             use autosurgeon::{hydrate, reconcile};
             let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
             match field {
-                "user_response" => agent.user_response = Some(value),
+                "user_response" => {
+                    agent.user_response = Some(value);
+                    agent.user_response_version += 1;
+                }
                 "error_message" => agent.error_message = Some(value),
                 _ => {}
             }
