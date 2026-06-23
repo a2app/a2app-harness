@@ -37,6 +37,10 @@ pub struct AgentDoc {
     /// Set by the makepad-host after processing a debug command,
     /// cleared by the harness after forwarding to pi.
     pub debug_response: Option<String>,
+    /// Data sent from pi to the splash app.
+    /// Written by the harness when pi sends a send_pi_response message,
+    /// read and cleared by the makepad-host's AgentSplash.
+    pub pi_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]

@@ -46,6 +46,7 @@ export interface DocStateMessage {
   user_response: string | null;
   error_message: string | null;
   status: string | null;
+  pi_response?: string | null;
 }
 
 export type HarnessMessage =
@@ -60,4 +61,10 @@ export type HarnessMessage =
 
 export interface GetDocMessage {
   type: "get_doc";
+}
+
+export interface SendPiResponseMessage {
+  type: "send_pi_response";
+  app_id: string;
+  data: string;
 }

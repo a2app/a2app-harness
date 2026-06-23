@@ -386,4 +386,61 @@ RoundedView{
     }
 }`,
   },
+
+  "ai-chat": {
+    description:
+      "AI Chat app with background sub-agent session. Uses Start/Send/Read buttons to interact with a sub-agent.",
+    splashBody: `let session_id = ""
+let conversation = ""
+
+fn update_display(text){
+  let cur = ui.display.text()
+  if cur == " " { cur = "" }
+  ui.display.set_text(cur + "\n" + text)
+}
+
+RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true draw_bg.color:#x1e1e2e draw_bg.border_radius:10.0
+  Label{text:"AI Chat (Sub-Session)" draw_text.color:#fff draw_text.text_style.font_size:16}
+  display := Label{text:"Welcome! Click 'Start AI' to begin." width:Fill draw_text.color:#ddd draw_text.text_style.font_size:11}
+  Hr{height:1 width:Fill}
+  input := TextInput{width:Fill height:34 empty_text:"Type your message..."}
+  View{flow:Right spacing:8 align:Align{x:0.5 y:0.5}
+    ButtonFlat{text:"Start AI" on_click:||{
+      let data = ui.__pi_data.text()
+      if session_id == "" && data != "" && data != " " {
+        session_id = data
+        update_display("[Session ready: " + session_id + "]")
+      }
+      if session_id == "" {
+        ui.__pi_response.set_text("ai:start")
+        update_display("[Requesting AI session...]")
+      } else {
+        update_display("[Session active: " + session_id + "]")
+      }
+    }}
+    ButtonFlat{text:"Send" on_click:||{
+      let data = ui.__pi_data.text()
+      if data != "" && data != " " && data != session_id {
+        update_display("AI: " + data)
+      }
+      let msg = ui.input.text()
+      if msg != "" {
+        update_display("You: " + msg)
+        ui.__pi_response.set_text("ai:ask:" + session_id + ":" + msg)
+        ui.input.set_text("")
+      }
+    }}
+    ButtonFlat{text:"Read Reply" on_click:||{
+      let data = ui.__pi_data.text()
+      if data != "" && data != " " && data != session_id {
+        update_display("AI: " + data)
+      } else if data == session_id {
+        update_display("[No new response yet]")
+      }
+    }}
+  }
+  Hr{height:1 width:Fill}
+  status := Label{text:"Session: not started" width:Fill draw_text.color:#888 draw_text.text_style.font_size:9}
+}`,
+  },
 };

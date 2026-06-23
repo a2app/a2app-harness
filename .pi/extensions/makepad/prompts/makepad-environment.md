@@ -225,6 +225,7 @@ Pass `standard_app: "<name>"` to `launch_makepad_app` for built-in templates:
 | `counter` | Increment/decrement/reset counter |
 | `notes` | Quick notes with add, delete, clear-all (5 slots) |
 | `todo` | Task list with add, toggle, delete, clear-completed (5 slots) |
+| `ai-chat` | AI Chat with background sub-agent session. Start/Send/Read buttons interact with a sub-agent. |
 
 **Note:** There is no timer standard app — `set_interval()` is not available in this Makepad build.
 
@@ -357,6 +358,56 @@ close_makepad_app(app_id="my-app")
 list_makepad_apps()  # verify it's gone
 ```
 
+## AI Chat Workflow: Splash ↔ Background Sub-Agent
+
+Use the `ai-chat` standard app to build an AI chat UI that talks to a background
+sub-agent session. The sub-agent is an independent AgentSession created via the
+pi SDK that the splash app communicates with through you (the pi agent) as relay.
+
+### Flow (One Conversation Round)
+
+1. **Launch the app:**
+   ```
+   launch_makepad_app(app_id="ai-chat-1", standard_app="ai-chat")
+   ```
+
+2. **Start background session:**
+   - Use `check_debug_app` to click the "Start AI" button in the splash
+   - The splash sends `ui.__pi_response.set_text("ai:start")`
+   - **You detect this via `wait_for_response` or `inspect_makepad_doc`**
+   - Call `start_background_session(system_prompt="You are a helpful AI.")` to create the sub-session
+   - Use `send_pi_response(app_id="ai-chat-1", data="<session_id>")` to send the session_id back
+
+3. **Send a message:**
+   - Use `check_debug_app` to click "Send" after typing a message
+   - The splash sends `ai:ask:<session_id>:<message>`
+   - **You detect this, extract the message, and call:**
+     ```
+     send_background_message(session_id="bg-xxx", message="Hello")
+     ```
+   - **Send the AI response back:**
+     ```
+     send_pi_response(app_id="ai-chat-1", data="<ai_response>")
+     ```
+
+4. **Read reply:**
+   - Use `check_debug_app` to click the "Read Reply" button
+   - The splash reads `__pi_data.text()` and displays the AI response
+   - Repeat from step 3 for follow-up messages (history is preserved in the sub-session)
+
+### Button Reference
+
+| Button | Action | Sends | Receives |
+|--------|--------|-------|----------|
+| "Start AI" | Creates or checks session | `ai:start` | session_id via `__pi_data` |
+| "Send" | Sends user message + reads pending reply | `ai:ask:<sid>:<msg>` | response via `__pi_data` |
+| "Read Reply" | Reads AI response from `__pi_data` | (none) | response via `__pi_data` |
+
+### Note
+
+The sub-agent **has no tools** — it can only respond with text. It maintains
+conversation history across calls, so follow-up messages see previous context.
+
 ## Debug Commands (`check_debug_app`)
 
 ### Splash Content Orphan Issue
@@ -397,3 +448,8 @@ Splash content widgets (the inner View created by evaluating the body) have `par
 - `check_debug_app(app_id?, retry_splash_body?, debug_command?, debug_params?, timeout_seconds?)` — Inspect the widget tree, check errors, retry with a fix, or simulate interactions
 - `store_value(key, value, description)` — Persist a value
 - `read_value(key)` — Read a stored value
+- `send_pi_response(app_id, data)` — Send data to the running splash app (read by splash via ui.__pi_data.text())
+- `start_background_session(system_prompt?, provider?, model_id?, thinking_level?)` — Create a sub-agent session for AI chat
+- `send_background_message(session_id, message, max_wait_seconds?)` — Send a prompt to a background sub-agent and get a response
+- `list_background_sessions()` — List active sub-agent sessions
+- `stop_background_session(session_id)` — Stop and dispose a sub-agent session
