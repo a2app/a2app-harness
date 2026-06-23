@@ -480,19 +480,97 @@ async function initSession(appId: string, initialMessage?: string): Promise<stri
 }
 
 function handleAutoMessage(data: string, appId: string): void {
+  // ── ai:init:<system_prompt> ────────────────────────────────────────
+  // App provides its own system prompt for the sub-agent session.
+  // If a session already exists for this app, it is disposed and replaced
+  // with a new one using the app-provided system prompt.
+  if (data.startsWith("ai:init:")) {
+    const systemPrompt = data.slice(8); // remove "ai:init:"
+    (async () => {
+      try {
+        // Dispose existing session for this app if any
+        const existingSid = appSessionMap.get(appId);
+        if (existingSid) {
+          const existing = sessions.get(existingSid);
+          if (existing) {
+            try { existing.session.dispose(); } catch {}
+          }
+          sessions.delete(existingSid);
+        }
+
+        // Create new session with the app-provided system prompt
+        const { AuthStorage, ModelRegistry, SessionManager, createAgentSession } =
+          await import("@earendil-works/pi-coding-agent");
+        const { getModel } = await import("@earendil-works/pi-ai");
+
+        const model = getModel("deepseek", "deepseek-v4-flash");
+        if (!model) {
+          console.error("[bg-agent] Model not found for init");
+          return;
+        }
+
+        const authStorage = AuthStorage.create();
+        const modelRegistry = ModelRegistry.create(authStorage, process.env.HOME + "/.pi/agent/models.json");
+
+        const { session } = await createAgentSession({
+          model,
+          thinkingLevel: "off",
+          authStorage,
+          modelRegistry,
+          sessionManager: SessionManager.inMemory(),
+          tools: [],
+        });
+
+        const sessionId = "bg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+        sessions.set(sessionId, {
+          session,
+          provider: "deepseek",
+          modelId: "deepseek-v4-flash",
+          createdAt: Date.now(),
+        });
+        appSessionMap.set(appId, sessionId);
+
+        // Send the app-provided system prompt as the first message to set context.
+        // The agent session doesn't expose a systemPrompt option via createAgentSession,
+        // so we seed the conversation with a context-setting message.
+        if (systemPrompt) {
+          let _initResp = "";
+          const _unsub = session.subscribe((event: any) => {
+            if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+              _initResp += event.assistantMessageEvent.delta;
+            }
+          });
+          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false });
+          _unsub();
+        }
+
+        // Confirm to the splash app that the session was initialized
+        sendToHarness({ type: "send_pi_response", app_id: appId, data: "[Session initialized with app-provided system prompt]" });
+        console.log("[bg-agent] Session initialized for app", appId, "with system prompt:", systemPrompt);
+      } catch (err) {
+        console.error("[bg-agent] Error initializing session:", err);
+        sendToHarness({ type: "send_pi_response", app_id: appId, data: "[Error initializing session: " + err + "]" });
+      }
+    })();
+    return;
+  }
+
+  // ── ai:ask:<message> ───────────────────────────────────────────────
+  // Send a message to the sub-agent session associated with this app.
   if (data.startsWith("ai:ask:")) {
     const message = data.slice(7); // remove "ai:ask:"
     if (!message) return;
 
-    // Look up session_id for this app
-    const sid = appSessionMap.get(appId);
-    if (!sid) {
-      console.error("[bg-agent] No session for app:", appId);
-      return;
-    }
-
     (async () => {
       try {
+        // Look up or auto-create session for this app
+        let sid = appSessionMap.get(appId);
+        if (!sid) {
+          console.log("[bg-agent] No session for app", appId, "— auto-creating default session");
+          sid = await initSession(appId, null);
+          if (!sid) return;
+        }
+
         const stored = sessions.get(sid);
         if (!stored) {
           console.error("[bg-agent] Session not found:", sid, "for app:", appId);
@@ -522,7 +600,8 @@ function handleAutoMessage(data: string, appId: string): void {
  * from the harness. Safe to call multiple times.
  */
 export function startAutoBackgroundHandler(): void {
-  // Always register the handler (safe to call multiple times)
+  if (autoHandlerStarted) return;  // Only register once
+  autoHandlerStarted = true;
   try {
     onMessage((msg: any) => {
       if (msg.type === "user_response") {
@@ -532,6 +611,7 @@ export function startAutoBackgroundHandler(): void {
         }
       }
     });
+    console.log("[bg-agent] Auto background handler started");
   } catch (err) {
     console.error("[bg-agent] Failed to start auto handler:", err);
   }
