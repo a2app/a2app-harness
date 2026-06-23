@@ -429,55 +429,51 @@ ButtonFlat{text:"Done" on_click:||{ui.__pi_response.set_text(ui.lst.text())}}
 
 ⚠️ **Buttons shift down** as items are added to the list — always take a fresh snapshot before clicking.
 
-### Standard App Patterns
+### Struct Arrays & Array Operations
 
-The following patterns are extracted from the standard app library (todo, notes, counter, ai-chat) and are verified to work reliably.
-
-#### Struct Arrays & Array Operations
-
-Arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()` are the recommended way to manage dynamic lists. Fields are read via `array[index].field` and updated with `array[index] += {field: newVal}`:
+The Splash VM supports arrays of structs for managing dynamic data. Use `.push()`, `.remove()`, `.len()`, and `.retain()` to mutate the array; use `array[index].field` to read and `array[index] += {field: val}` to update individual fields:
 
 ```splash
-let todos = [
-    {text: "Buy groceries" tag: "errands" done: false}
-    {text: "Write tests" tag: "dev" done: false}
+let items = [
+    {text: "Task 1" tag: "work" done: false}
+    {text: "Task 2" tag: "personal" done: false}
 ]
-let max_todos = 5
+let max_items = 5
 
-fn add_todo(text){
+fn add_item(text){
     let clean = ("" + text).trim()
     if clean == "" { return }
-    if todos.len() >= max_todos { return }
-    todos.push({text: clean tag: "" done: false})
-    sync_rows()
+    if items.len() >= max_items { return }
+    items.push({text: clean tag: "" done: false})
+    sync_all()
 }
 
-fn toggle_todo(index){
-    if index >= todos.len() { return }
-    todos[index] += {done: !todos[index].done}
-    sync_rows()
+fn toggle_item(index){
+    if index >= items.len() { return }
+    items[index] += {done: !items[index].done}
+    sync_all()
 }
 
-fn delete_todo(index){
-    if index >= todos.len() { return }
-    todos.remove(index)
-    sync_rows()
+fn remove_item(index){
+    if index >= items.len() { return }
+    items.remove(index)
+    sync_all()
 }
 
-fn clear_done(){
-    todos.retain(|todo| !todo.done)
-    sync_rows()
+fn clear_flagged(){
+    items.retain(|it| !it.done)
+    sync_all()
 }
 ```
 
-Available array operations: `.push(item)`, `.remove(index)`, `.len()`, `.retain(|item| condition)`, `array[index]` (read), `array[index] += {field: value}` (update one field).
+Available array operations: `.push(item)`, `.remove(index)`, `.len()`, `.retain(|item| condition)`, `array[index]` (read), `array[index] += {field: value}` (update one field). Mutations do NOT re-render widgets — call `sync_all()` after each change to push data to the visible UI.
 
-#### Component / Template Pattern
+### Component / Template Pattern
 
-Define reusable UI components with `let` and instantiate with property overrides:
+You can define reusable widget templates with `let` and instantiate them with property overrides. This reduces duplication when building lists of similar rows:
 
 ```splash
-let TodoRow = RoundedView{
+let ItemRow = RoundedView{
     width: Fill height: Fit
     padding: Inset{top: 8 bottom: 8 left: 12 right: 12}
     flow: Right spacing: 10
@@ -485,24 +481,24 @@ let TodoRow = RoundedView{
     new_batch: true
     draw_bg.color: #x2a2a3a
     draw_bg.border_radius: 8.0
-    label := Label{text: "task" width: Fill draw_text.color: #xddd}
-    toggle := ButtonFlatter{text: "Toggle" width: 56 height: 28}
-    delete := ButtonFlatter{text: "Delete" width: 56 height: 28}
+    label := Label{text: "item" width: Fill draw_text.color: #xddd}
+    action := ButtonFlatter{text: "Do" width: 56 height: 28}
+    remove := ButtonFlatter{text: "X" width: 56 height: 28}
 }
 
 // Instantiate with overrides
-todo_row_0 := TodoRow{
-    label.text: "Buy groceries"
-    toggle.on_click: || toggle_todo(0)
-    delete.on_click: || delete_todo(0)
+row_0 := ItemRow{
+    label.text: "First item"
+    action.on_click: || do_something(0)
+    remove.on_click: || remove_item(0)
 }
 ```
 
 Override syntax: `<child-name>.<property>: <value>` — applies to any named child in the template. Also works for event handlers.
 
-#### Pre-allocated Fixed Slots (Replaces `for` Loops for Lists)
+### Pre-allocated Fixed Slots (Replaces `for` Loops)
 
-Since `for` loops render at build-time only, use fixed rows and per-row sync functions:
+`for` loops render widgets only once at build time — array changes do NOT add or remove widgets. For lists with a known max size, pre-allocate a fixed number of rows and use sync functions to update their content:
 
 ```splash
 let items = [{text: "Item 1"} {text: "Item 2"}]
@@ -532,9 +528,9 @@ fn sync_rows(){
 
 Pre-allocate 5 rows for a 5-item max list. Call `sync_rows()` after every mutation.
 
-#### Counter Pattern
+### Numeric State Pattern
 
-Simple numeric state with increment/decrement/reset:
+Splash VM `let` variables persist across clicks, making them suitable for numeric state. To display a number, convert it to a string with `num + ""`:
 
 ```splash
 let count = 0
@@ -548,24 +544,22 @@ RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true
 }
 ```
 
-Use `count + ""` to convert numbers to strings.
+Convert numbers to strings for display: `count + ""`
 
-#### TextInput with on_return
+### TextInput with on_return
+
+TextInput supports an `on_return` callback that fires on Enter. Combine with a Button for both keyboard and mouse flow:
 
 ```splash
 input := TextInput{
     width: Fill height: 34
-    empty_text: "Add a new task"
-    on_return: |text| add_todo(text)
+    empty_text: "Enter something"
+    on_return: |text| add_item(text)
 }
+Button{text: "Add" width: 64 height: 34 on_click: || add_item(ui.input.text())}
 ```
 
-Combine with a Button for both mouse and keyboard flow:
-```splash
-Button{text: "Add" width: 64 height: 34 on_click: || add_todo(ui.input.text())}
-```
-
-#### Styling Reference
+### Styling Reference
 
 | Property | Example | Effect |
 |----------|---------|--------|

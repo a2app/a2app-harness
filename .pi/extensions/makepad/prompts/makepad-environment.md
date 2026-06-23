@@ -216,9 +216,9 @@ RoundedView{
 - Parenthesized `if` conditions — use `if cond { ... }` syntax
 - `on_click` on a `View` or non-button widget — only button types (`Button`, `ButtonFlat`, `ButtonFlatter`) have `on_click`
 
-## Standard App Patterns (AGENTS.md)
+## Splash DSL Patterns (AGENTS.md)
 
-Full app patterns (todo, notes, counter, ai-chat) are documented in the Splash DSL Guide section of `AGENTS.md`. See `AGENTS.md` for struct arrays, component templates, pre-allocated fixed slots, counter patterns, and styling reference.
+Full splash DSL patterns (struct arrays, component templates, pre-allocated fixed slots, counter, styling) are documented in `AGENTS.md` under Splash DSL Guide.
 
 ## Example: Pre-Allocated Dynamic List (since `on_render` is blocked)
 
@@ -351,7 +351,7 @@ list_makepad_apps()  # verify it's gone
 
 ## AI Chat Workflow: Splash ↔ Background Sub-Agent
 
-Use the `ai-chat` standard app to build an AI chat UI that talks to a background
+Use an AI chat splash UI to build an app that talks to a background
 sub-agent session. The sub-agent is an independent AgentSession created via the
 pi SDK that the splash app communicates with through you (the pi agent) as relay.
 
