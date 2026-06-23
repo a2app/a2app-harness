@@ -290,6 +290,8 @@ export function registerTools(pi: ExtensionAPI): void {
       "IMPORTANT:",
       "  - Splash content widgets have parent=-1 (orphaned). Do NOT use widget_id for click — use x,y coordinates.",
       "  - widget_snapshot includes orphaned widgets at the bottom of the JSON array.",
+      "  - Orphan coordinates in snapshot/dump are WINDOW-RELATIVE (relative to window content origin).",
+      "  - Click center = orphan.x + orphan.w/2, orphan.y + orphan.h/2 (no window offset needed).",
       "  - __pi_response initial text is ' ' (space). After click, it shows the response string.",
       "  - The 'value' field on TextInput shows the text content; 'text' field is null for TextInputs.",
       "  - Splash VM CAN read values set by Rust's set_text() via ui.<name>.text().",
