@@ -139,6 +139,7 @@ impl MakepadHostApp {
             update.splash_body = Some(String::new());
             update.source_body = Some(String::new());
             update.status = Some("Waiting for app launch…".to_string());
+
             self.last_app_id.clear();
             self.last_splash_body.clear();
             self.pending_update = Some(update);
@@ -357,6 +358,7 @@ impl MakepadHostApp {
         if let Some(status) = &update.status {
             self.ui.label(cx, ids!(status_line)).set_text(cx, status);
         }
+
     }
 
     /// Dispatch a pending click by sending MouseDown + MouseUp events.

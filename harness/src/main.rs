@@ -29,6 +29,8 @@ const SAMOD_WS_PORT: u16 = 2342;
 enum PiToHarnessMsg {
     #[serde(rename = "launch")]
     Launch { app_id: String, splash_body: String },
+    #[serde(rename = "pi_response")]
+    PiResponse { app_id: String, data: String },
     #[serde(rename = "clear")]
     Clear { app_id: String },
     #[serde(rename = "debug")]
@@ -53,7 +55,7 @@ enum HarnessToPiMsg {
     #[serde(rename = "debug_response")]
     DebugResponse { app_id: String, result: String },
     #[serde(rename = "doc_state")]
-    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String> },
+    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String>, pi_response: Option<String> },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -115,6 +117,7 @@ async fn background_main(headless: bool) {
         agent.error_message = None;
         agent.debug_command = None;
         agent.debug_response = None;
+        agent.pi_response = None;
         let mut tx = doc.transaction();
         reconcile(&mut tx, &agent).expect("reconcile");
         tx.commit();
@@ -525,11 +528,24 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     let msg = HarnessToPiMsg::DocState {
                         app_id,
                         user_response: agent.user_response,
+                        pi_response: agent.pi_response,
                         error_message: agent.error_message,
                         status,
                     };
                     let json = serde_json::to_string(&msg).unwrap_or_default();
                     let _ = fwd_tx.send(json);
+                });
+            }
+            PiToHarnessMsg::PiResponse { app_id, data } => {
+                eprintln!("[harness] pi: pi_response for app '{app_id}' ({} chars)", data.len());
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.pi_response = Some(data);
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
                 });
             }
             PiToHarnessMsg::Clear { app_id } => {
