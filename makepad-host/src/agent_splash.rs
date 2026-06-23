@@ -26,14 +26,19 @@ pub struct AgentSplash {
     /// Tracks the last known text of the __pi_response label
     #[rust]
     last_response: String,
+    /// Tracks the last known text of the __pi_data label (data from pi)
+    #[rust]
+    last_pi_data: String,
 }
 
 // The splash body is wrapped in: <PREFIX><body><SUFFIX>
 // The parser auto-closes the outer View.
 // __pi_response is a hidden label that splash apps can set text on
 // to send a response back to the pi extension.
+// __pi_data is a hidden label that receives data from the pi extension
+// via the shared CRDT doc's pi_response field.
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-const SPLASH_SUFFIX: &str = "  __pi_response := Label{text:\"\"}";
+const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:34 width:Fill}\n  __pi_response := Label{text:\"\"}\n  __pi_data := Label{text:\" \"}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -111,6 +116,49 @@ impl AgentSplash {
     }
 
 
+    /// Read pi_response from the shared doc and set it on the __pi_data label.
+    /// Clears the doc field after reading (one-shot delivery).
+    /// Uses a scoped value to avoid nested with_document() calls.
+    fn sync_pi_data_to_splash(&mut self, cx: &mut Cx) {
+        // Step 1: Read pi_response from doc (outside any widget operations)
+        let incoming = SHARED_DOC.get().and_then(|handle| {
+            handle.with_document(|doc| {
+                use autosurgeon::hydrate;
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.pi_response.clone()
+            })
+        });
+
+        // Step 2: Update widget if we have new data
+        if let Some(data) = incoming {
+            if !data.is_empty() && data != self.last_pi_data {
+                self.last_pi_data = data.clone();
+                let data_widget = self.widget(cx, &[id!(__pi_data)]);
+                if !data_widget.is_empty() {
+                    data_widget.set_text(cx, &data);
+                }
+                // Also update the visible __ai_text widget so response auto-displays
+                // TextInput uses set_text which triggers re-layout
+                let output_widget = self.widget(cx, &[id!(__ai_text)]);
+                if !output_widget.is_empty() {
+                    output_widget.set_text(cx, &data);
+                }
+                self.redraw(cx);
+                
+                // Step 3: Clear the doc field (separate call, no nesting)
+                if let Some(handle) = SHARED_DOC.get() {
+                    handle.with_document(|doc| {
+                        use autosurgeon::{hydrate, reconcile};
+                        let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                        agent.pi_response = None;
+                        let mut tx = doc.transaction();
+                        let _ = reconcile(&mut tx, &agent);
+                        tx.commit();
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl Widget for AgentSplash {
@@ -131,6 +179,10 @@ impl Widget for AgentSplash {
             }
         }
 
+        // Check if pi sent new data to the splash app.
+        // Runs on every event to avoid missing updates when Signal is coalesced.
+        self.sync_pi_data_to_splash(cx);
+
 
     }
 
@@ -146,6 +198,7 @@ impl Widget for AgentSplash {
         if self.body.as_ref() != v {
             self.body.set(v);
             self.last_response = String::new(); // reset response tracker
+            self.last_pi_data = String::new();
             if !v.is_empty() {
                 self.render_ok = self.eval_body(cx);
                 if !self.render_ok {
@@ -171,6 +224,7 @@ fn write_doc_field(field: &str, value: String) {
                     agent.user_response_version += 1;
                 }
                 "error_message" => agent.error_message = Some(value),
+                "pi_response" => agent.pi_response = Some(value),
                 _ => {}
             }
             let mut tx = doc.transaction();

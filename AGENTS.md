@@ -40,7 +40,10 @@ Env: `HARNESS_HEADLESS=1` — skip spawning makepad-host (for testing).
 
 The Makepad UI process. Connects to harness samod WS, finds the shared document, renders splash in `AgentSplash` widget. Background thread listens for doc changes → signals main thread via `SIGUSR1`.
 
-AgentSplash injects a hidden `__pi_response := Label{text:""}` into every splash body. Apps call `ui.__pi_response.set_text("...")` to write data back.
+AgentSplash injects three hidden widgets into every splash body:
+- `__pi_response := Label{text:""}` — apps call `set_text()` to send data back to pi
+- `__pi_data := Label{text:" "}` — apps read `text()` to receive data from pi
+- `__ai_text := TextInput{height:34 width:Fill}` — auto-displays AI responses from sub-agent sessions
 
 Env vars (set by harness): `MAKEPAD_HOST_DOC_ID`, `MAKEPAD_HOST_WS_URL`, `MAKEPAD_HOST_READY_MARKER`.
 
@@ -59,6 +62,8 @@ TypeScript extension. Key files:
 {"type": "launch", "app_id": "todo-1", "splash_body": "..."}
 {"type": "clear", "app_id": "todo-1"}
 {"type": "debug", "app_id": "todo-1", "command": "widget_snapshot", "params": "{}"}
+{"type": "send_pi_response", "app_id": "todo-1", "data": "..."}
+{"type": "get_doc"}
 {"type": "exit"}
 ```
 
@@ -68,6 +73,8 @@ TypeScript extension. Key files:
 {"type": "status", "app_id": "todo-1", "status": "Launched"}
 {"type": "user_response", "app_id": "todo-1", "response": "..."}
 {"type": "debug_response", "app_id": "todo-1", "result": "..."}
+{"type": "error", "app_id": "todo-1", "message": "..."}
+{"type": "doc_state", "app_id": "todo-1", "user_response": "...", "error_message": "...", "status": "...", "pi_response": "..."}
 ```
 
 ## Communication Flows
@@ -85,6 +92,14 @@ TypeScript extension. Key files:
 4. Harness bridge loop compares version number (not value) to detect changes
 5. Harness forwards `{"type":"user_response","app_id":"...","response":"..."}` to pi
 6. Pi extension buffers the event (per-type Map) and dispatches to `wait_for_response`
+
+### Pi Response (pi → splash)
+1. pi (or extension auto-handler) sends `{"type":"send_pi_response","app_id":"...","data":"..."}` over JSON WS
+2. Harness writes `pi_response` to CRDT doc + sets `extension_requests = true`
+3. CRDT syncs to makepad-host over samod WS
+4. Background thread detects `pi_response` change → signals UI thread
+5. AgentSplash reads `pi_response`, writes it to `__ai_text` widget (TextInput) and `__pi_data` label
+6. Splash app reads response via `ui.__ai_text.text()` or `ui.__pi_data.text()`
 
 ### Shutdown
 1. pi sends `{"type":"exit"}` or pi exits
@@ -106,6 +121,7 @@ pub struct AgentDoc {
     pub error_message: Option<String>,     // rendering error
     pub debug_command: Option<DebugCommand>,
     pub debug_response: Option<String>,
+    pub pi_response: Option<String>,       // pi sends data to splash
 }
 ```
 
@@ -211,6 +227,77 @@ When splash body fails to render:
 2. `error_message` is written to CRDT doc
 3. Harness forwards `{"type":"error","app_id":"...","message":"..."}` to pi
 4. The launch tool has a 1.5s debounce window after receiving `status=Launched` to collect any error messages. Errors persist in a `lastErrors` map per app_id.
+
+## Background Sub-Agent Sessions
+
+Splash apps can communicate with background AI sub-agent sessions created via the pi SDK.
+The sub-agent is an independent `AgentSession` that processes prompts and returns responses.
+
+The splash app uses a simple protocol via `__pi_response` and `__pi_data`:
+
+### Protocol
+
+Splash sends: `ui.__pi_response.set_text("ai:ask:" + message)`
+Splash reads: `ui.__pi_data.text()` (response from sub-agent)
+
+### Auto-Display via `__ai_text`
+
+The AgentSplash injects a `__ai_text := TextInput{height:34 width:Fill}` widget that
+auto-displays the sub-agent's response — no manual reading needed. When `pi_response`
+is written to the CRDT doc, the background sync thread signals the UI, and the
+AgentSplash calls `__ai_text.set_text(response)` automatically.
+
+### Injected Widgets
+
+| Widget ID | Type | Purpose |
+|-----------|------|---------|
+| `__pi_response` | `Label{text:""}` (hidden) | Splash writes to send responses to pi |
+| `__pi_data` | `Label{text:" "}` (hidden) | Splash reads to get data from pi |
+| `__ai_text` | `TextInput{height:34 width:Fill}` (visible) | Auto-displays AI response from sub-agent |
+
+### Workflow
+
+1. **Create sub-agent**: `start_background_session(provider="deepseek", model_id="deepseek-v4-flash", system_prompt="...")`
+2. **Launch app with session**: `launch_makepad_app(app_id="my-app", splash_body="...", agent_session_id="<sid>")`
+3. **User sends message**: splash calls `ui.__pi_response.set_text("ai:ask:" + msg)`
+4. **Auto-handler** (extension) detects `user_response` → routes to sub-agent → calls `session.prompt()`
+5. **Response sent back**: auto-handler calls `sendToHarness({ type: "send_pi_response", ... })`
+6. **Harness writes doc**: `pi_response = "..."` + `extension_requests = true`
+7. **Signal fires** → `sync_pi_data_to_splash` reads doc → `__ai_text.set_text(response)`
+8. **Response visible** on screen automatically
+
+### Extension Tools
+
+| Tool | Description |
+|------|-------------|
+| `start_background_session` | Create a sub-agent session. Pass `provider`, `model_id`, `system_prompt`, `thinking_level` |
+| `send_background_message` | Send a prompt to an existing sub-agent, wait for response |
+| `list_background_sessions` | List all active sub-agent sessions |
+| `stop_background_session` | Stop and dispose a sub-agent session |
+| `send_pi_response` | Send data from pi to the splash app (read by splash via `ui.__pi_data.text()`) |
+
+### Splash Body Template
+
+Minimal splash body that uses the sub-agent:
+
+```splash
+inp := TextInput{width:Fill height:34 empty_text:"Your message..." on_return:|t|{
+  if t != "" { ui.__pi_response.set_text("ai:ask:" + t); ui.inp.set_text("") }
+}}
+ButtonFlat{text:"Send" on_click:||{
+  let m = ui.inp.text()
+  if m != "" { ui.__pi_response.set_text("ai:ask:" + m); ui.inp.set_text("") }
+}}
+```
+
+The response auto-appears in the `__ai_text` TextInput at the bottom of the layout.
+No display widget needed in the splash body.
+
+### Note
+
+The `__ai_text` TextInput is injected AFTER the user's splash body, so it appears
+at the bottom of the layout. If the splash body has multiple TextInputs, `type_text`
+fills the first one (which is the user's input, not `__ai_text`).
 
 ## Splash DSL Guide
 
@@ -369,6 +456,9 @@ ButtonFlat{text:"Done" on_click:||{ui.__pi_response.set_text(ui.lst.text())}}
 | `type_text` fills first TextInput within splash children | Use `widget_snapshot` and check which orphan TextInput's `value` changed |
 | `TabBar`/`DropDown` popup menus can't be tested synthetically | Use `ButtonFlat` rows for tab/option UIs |
 | `RadioButton`, `ToggleFlat`, `CheckBox`/`CheckBoxFlat` variables don't persist in Splash VM | Use `ButtonFlat` with manual toggle |
+| Background sub-agent may respond slowly (API call takes 5-20s) | Wait for response; check harness logs for `send_pi_response` |
+| `__ai_text` is a TextInput — `type_text` fills the first TextInput in the splash tree | Put user's input TextInput BEFORE `__ai_text` in layout order (default order is correct) |
+| Sub-agent session dispose warning | Call `stop_background_session` when done, or sessions accumulate in extension memory |
 
 ### Recovery from Debug Freeze
 

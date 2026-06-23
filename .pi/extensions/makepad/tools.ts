@@ -4,6 +4,7 @@ import { connectToHarness, sendToHarness, onMessage, getBufferedEvent, getAllBuf
 import { startHarness, stopHarness } from "./harness.js";
 import { STANDARD_APPS } from "./standard-apps.js";
 import { validateSplashBody } from "./validate-splash.js";
+import { registerAppSessionAssociation } from "./background-agent.js";
 import type { HarnessMessage, AppState, GetDocMessage } from "./types.js";
 
 type ExtensionAPI = any;
@@ -20,7 +21,7 @@ const lastErrors = new Map<string, string>();
 // Track pending error listeners (for the debounce window after launch)
 let pendingErrorListener: (() => void) | null = null;
 
-async function ensureConnected(): Promise<void> {
+export async function ensureConnected(): Promise<void> {
   // If we think we're connected but the harness is dead, reset
   if (harnessStarted) {
     // Check if harness is actually alive by doing a quick connect test
@@ -82,6 +83,11 @@ export function registerTools(pi: ExtensionAPI): void {
           description: "Optional standard app key, such as 'todo'",
         }),
       ),
+      agent_session_id: Type.Optional(
+        Type.String({
+          description: "Optional session ID from start_background_session. Associates this app with a background agent.",
+        }),
+      ),
     }),
     async execute(
       _id: string,
@@ -126,6 +132,11 @@ export function registerTools(pi: ExtensionAPI): void {
 
       // Clear any previous error for this app_id
       lastErrors.delete(app_id);
+
+      // If agent_session_id is provided, associate it with this app
+      if (params.agent_session_id) {
+        registerAppSessionAssociation(app_id, params.agent_session_id);
+      }
 
       // Send launch request over JSON WS
       sendToHarness({ type: "launch", app_id, splash_body });

@@ -5,6 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { stopHarness } from "./harness.js";
 import { registerTools } from "./tools.js";
+import { registerBackgroundAgentTools, disposeAllSessions, startAutoBackgroundHandler } from "./background-agent.js";
 import { connectToHarness, onMessage } from "./doc-bridge.js";
 import type { HarnessMessage } from "./types.js";
 
@@ -37,6 +38,11 @@ Tools:
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   registerTools(pi);
+  registerBackgroundAgentTools(pi);
+
+  // Start the auto-handler for ai:* messages from the splash app
+  // This enables the ai-chat standard app to work without pi agent involvement
+  startAutoBackgroundHandler();
 
   pi.on("session_start", async (_event: any, ctx: any) => {
     extensionDir = ctx.extensionPath ?? _dirname ?? "";
@@ -51,6 +57,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       // Not connected.
     }
 
+    disposeAllSessions();
     stopHarness();
   });
 

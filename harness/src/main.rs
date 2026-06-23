@@ -33,6 +33,8 @@ enum PiToHarnessMsg {
     Clear { app_id: String },
     #[serde(rename = "debug")]
     Debug { app_id: String, command: String, params: String },
+    #[serde(rename = "send_pi_response")]
+    SendPiResponse { app_id: String, data: String },
     #[serde(rename = "get_doc")]
     GetDoc,
     #[serde(rename = "exit")]
@@ -53,7 +55,7 @@ enum HarnessToPiMsg {
     #[serde(rename = "debug_response")]
     DebugResponse { app_id: String, result: String },
     #[serde(rename = "doc_state")]
-    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String> },
+    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String>, pi_response: Option<String> },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -527,9 +529,23 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                         user_response: agent.user_response,
                         error_message: agent.error_message,
                         status,
+                        pi_response: agent.pi_response,
                     };
                     let json = serde_json::to_string(&msg).unwrap_or_default();
                     let _ = fwd_tx.send(json);
+                });
+            }
+            PiToHarnessMsg::SendPiResponse { app_id, data } => {
+                eprintln!("[harness] pi: send_pi_response to app '{app_id}': {} chars", data.len());
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.pi_response = Some(data.clone());
+                    agent.extension_requests = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
                 });
             }
             PiToHarnessMsg::Clear { app_id } => {
