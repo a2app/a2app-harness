@@ -289,6 +289,50 @@ The sub-agent is an independent `AgentSession` that processes prompts and return
 Splash sends: `ui.__pi_response.set_text("ai:ask:" + message)`
 Splash reads: `ui.__pi_data.text()` (response from sub-agent)
 
+#### `ai:init:<system_prompt>` (App-Provided System Prompt)
+
+The splash app can set its own system prompt for the sub-agent session by sending:
+```splash
+ui.__pi_response.set_text("ai:init:You are an Italian chef expert...")
+```
+
+When the auto-handler receives `ai:init:`, it:
+1. Disposes any existing session for this app
+2. Creates a new DeepSeek V4 Flash session
+3. Seeds the conversation with the app's system prompt as context
+4. Associates the new session with the app_id for subsequent `ai:ask:` messages
+5. Sends back `[Session initialized with app-provided system prompt]` confirmation
+
+This allows multiple apps to coexist, each with its own AI personality:
+```splash
+prompt_inp := TextInput{width:Fill height:34 empty_text:"Your AI personality..."}
+init_btn := ButtonFlat{text:"Set Prompt & Start" on_click:||{
+    let p = ui.prompt_inp.text()
+    if p == "" { p = "You are a helpful assistant." }
+    ui.__pi_response.set_text("ai:init:" + p)
+}}
+
+inp := TextInput{width:Fill height:34 empty_text:"Ask something..."}
+send_btn := ButtonFlat{text:"Send" on_click:||{
+    let m = ui.inp.text()
+    if m != "" { ui.__pi_response.set_text("ai:ask:" + m); ui.inp.set_text("") }
+}}
+```
+
+**Note:** The system prompt is seeded via conversation context (first message) because `createAgentSession` in the pi SDK does not expose a `systemPrompt` parameter directly. The first prompt sent is `[SYSTEM CONTEXT] <system_prompt>`.
+
+### Auto-Handler (Extension Side)
+
+The extension registers an `onMessage` handler at startup (via `startAutoBackgroundHandler()` in `index.js`) that intercepts all `user_response` messages from the harness. When the response starts with `ai:`, it dispatches to `handleAutoMessage()` which supports:
+
+| Protocol | Purpose |
+|----------|---------|
+| `ai:init:<prompt>` | Create/replace session with app-provided system prompt |
+| `ai:ask:<message>` | Send message to existing session, forward response |
+| `ai:start` | (legacy) Auto-create session |
+
+If no session exists when `ai:ask:` arrives, one is auto-created with a default prompt.
+
 ### Auto-Display via `__ai_text`
 
 The AgentSplash injects a `__ai_text := TextInput{height:34 width:Fill}` widget that
@@ -306,6 +350,7 @@ AgentSplash calls `__ai_text.set_text(response)` automatically.
 
 ### Workflow
 
+#### Option A: Pre-created session
 1. **Create sub-agent**: `start_background_session(provider="deepseek", model_id="deepseek-v4-flash", system_prompt="...")`
 2. **Launch app with session**: `launch_makepad_app(app_id="my-app", splash_body="...", agent_session_id="<sid>")`
 3. **User sends message**: splash calls `ui.__pi_response.set_text("ai:ask:" + msg)`
@@ -314,6 +359,16 @@ AgentSplash calls `__ai_text.set_text(response)` automatically.
 6. **Harness writes doc**: `pi_response = "..."` + `extension_requests = true`
 7. **Signal fires** → `sync_pi_data_to_splash` reads doc → `__ai_text.set_text(response)`
 8. **Response visible** on screen automatically
+
+#### Option B: App-provided system prompt (`ai:init:`)
+1. **Launch app**: `launch_makepad_app(app_id="my-app", splash_body="...")` (no session needed)
+2. **App sends init**: splash calls `ui.__pi_response.set_text("ai:init:" + systemPrompt)`
+3. **Auto-handler** creates a new DeepSeek session, seeds it with the system prompt, associates it with this app
+4. **App sends message**: splash calls `ui.__pi_response.set_text("ai:ask:" + msg)`
+5. Response flows as in Option A steps 4-8
+
+#### Option C: Convenience tool
+1. Use `launch_app_with_agent(app_id="my-app", splash_body="...", system_prompt="...")` — creates session + launches app in one step
 
 ### Extension Tools
 
@@ -346,7 +401,7 @@ No display widget needed in the splash body.
 
 ## 4. Splash DSL Guide (General Reference)
 
-This section covers general Makepad Splash DSL patterns that apply to ANY app body, not just this harness. These are verified to work with the AgentSplash embedded renderer.
+This section covers general Makepad Splash DSL patterns that apply to ANY app body.
 
 ### 4.1 Key Rules
 
@@ -421,8 +476,8 @@ RoundedView{width:Fill height:Fit show_bg:true draw_bg.color:#x334
 
 | Widget | Capabilities | Best For |
 |--------|-------------|----------|
-| **`ButtonFlat`** | Click → variable write, `set_text()`, `text()`, `__pi_response.set_text()` (harness-specific) | All interactive controls |
-| **`Button`** | Same as ButtonFlat | Standard buttons |
+| **`ButtonFlat`** | Click → variable write, `set_text()`, `text()` | All interactive controls |
+| **`Button`** | Click → variable write, `set_text()`, `text()` | Standard buttons |
 | **`Label`** | `set_text()` updates visible text, `text()` reads back | Display values, status, dynamic list display |
 | **`TextInput`** | `type_text` fills first input, `text()` reads value, `set_text()` writes | Text entry |
 | **`Hr`** | Full-width line divider | Visual separation |
@@ -446,23 +501,10 @@ However, **widget `checked` state** on `RadioButton`, `ToggleFlat`, `CheckBox` d
 ```splash
 let toggled = false
 ButtonFlat{text:"Toggle" on_click:||{toggled = !toggled; ui.display.set_text("" + toggled)}}
-ButtonFlat{text:"Submit" on_click:||{ui.__pi_response.set_text("" + toggled)}}
+ButtonFlat{text:"Show" on_click:||{ui.display.set_text("Current: " + toggled)}}
 ```
 
-### 4.6 Container Padding Clips Children's Hit Areas (Harness-Specific)
 
-When using this harness's synthetic click system (`check_debug_app` with `debug_command=click`), containers with `padding` (especially `RoundedView{padding:...}` with `show_bg:true`) create a `draw_clip` in their shader. The hit-test uses `area.clipped_rect()` which includes the parent's clip. Buttons that overflow the padded content area become unhittable.
-
-**Workaround:** Keep interactive buttons as direct orphans without container wrapping:
-```splash
-// ✅ WORKS for synthetic clicks
-ButtonFlat{text:"Click" width:Fill height:40 on_click:||{...}}
-
-// ✅ Also works if button fits within padded area
-RoundedView{padding:16 height:Fit
-  ButtonFlat{text:"Click" width:Fill height:20 on_click:||{...}}
-}
-```
 
 ### 4.7 Patterns
 
@@ -586,10 +628,7 @@ ButtonFlat{text:"Add" on_click:||{
     ui.inp.set_text("")
   }
 }}
-ButtonFlat{text:"Done" on_click:||{ui.__pi_response.set_text(ui.lst.text())}}
 ```
-
-⚠️ Buttons shift down as items are added — always take a fresh snapshot before clicking.
 
 #### 4.7.6 TextInput with on_return
 
@@ -651,22 +690,11 @@ Item{label.text:"new text"}  // silent failure
 | `new_batch` | `true` | Required for text visibility on `show_bg:true` containers |
 | `empty_text` | `"Type here..."` | Placeholder for TextInput |
 
-### 4.10 Available But Not Interactive via Synthetic Clicks
-
-| Widget | Limitation |
-|--------|-----------|
-| **`Slider`** | `on_change` needs mouse drag — can't trigger via synthetic MouseDown/MouseUp |
-| **`DropDown`** | Popup menu is separate overlay window — can't select items synthetically |
-
-### 4.11 Not in Build
+### 4.10 Not in Build
 
 | Widget | Behavior |
 |--------|----------|
 | **`TabBar`** / **`Tab`** | width=0, height=0 — no visible output |
-
-### 4.12 Validation
-
-The pi extension pre-validates splash bodies before launch. Catches: unknown widgets, multiline string literals, undeclared named references, parenthesized `if (cond)`, TextInput without fixed height, `on_render:`, top-level function calls.
 
 ---
 
@@ -685,6 +713,8 @@ All patterns verified end-to-end via extension tools.
 | Dynamic list via `set_text()` | ✅ | 2 items added → doc: `"1. Buy groceries\\n2. Write tests"` |
 | Coordinate shift after layout change | ✅ | Buttons shifted +19px after 2nd list item added |
 | Container padding clipping | ❌ | RoundedView{padding:16} → buttons overflow padded area → unhittable |
+| Sub-agent `ai:ask:` auto-handler (pre-created session) | ✅ | Type text → click Send → `__ai_text` shows AI response (2026-06-24) |
+| `send_pi_response` to splash via `__ai_text` | ✅ | 
 
 ---
 
@@ -706,6 +736,10 @@ All patterns verified end-to-end via extension tools.
 | Background sub-agent slow (5-20s API call) | Wait for response; check harness logs |
 | `__ai_text` is a TextInput — fills before user's in `type_text` | Put user's TextInput FIRST in splash body (default is correct) |
 | Sub-agent session dispose warning | Call `stop_background_session` when done |
+| `ai:init:` needs extension restart to pick up new code | Restart pi after recompiling `background-agent.ts` → `dist/background-agent.js` |
+| Auto-handler runs with cached extension code | Extension compiled dist is loaded at pi startup; recompiling dist only takes effect on next pi session |
+| `start_background_session` stores system_prompt as metadata but doesn't pass to model | Use `ai:init:protocol` from the splash app to set the system prompt, or use `launch_app_with_agent` tool |
+| `createAgentSession` has no `systemPrompt` parameter | System prompt must be seeded via conversation (`session.prompt("[SYSTEM CONTEXT] " + prompt)`) |
 
 ### Recovery from Debug Freeze
 
@@ -792,3 +826,5 @@ All core patterns were tested end-to-end. The following findings correct earlier
 | Dynamic list set_text() | ✅ 2 items added, Done button returned both |
 | Coordinate shift after layout | ✅ Buttons shifted +19px after 2nd list item |
 | Container padding clipping | ❌ RoundedView{padding:16} → unhittable buttons |
+| Sub-agent auto-handler (`ai:ask:` with pre-created session) | ✅ Type text → click Send → `__ai_text` displays AI response |
+| `send_pi_response` → `__ai_text` auto-display | ✅ "Test message from pi to splash app" appeared in `__ai_text` and `__pi_data` within seconds |
