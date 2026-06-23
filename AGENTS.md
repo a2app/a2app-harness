@@ -303,7 +303,9 @@ fills the first one (which is the user's input, not `__ai_text`).
 
 ### Key Rules
 
-- **Every container MUST have `height: Fit`** — most common failure mode
+- **`let`/`fn` declarations must be at the top**, before any widget. The body starts with declarations, then the root widget.
+- **Every container MUST have `height: Fit`** — most common failure mode. Inside a fixed-height parent, `height: Fill` is fine.
+- **Root container MUST use `width: Fill`** — never a fixed pixel width. The app renders inside a parent container that provides the width.
 - `ui` object is built-in; do NOT declare it with `:=`
 - **`for` loops render widgets at build time only** — array changes do NOT re-render. Use `set_text()` for dynamic content.
 - **Functions with `for` loops return empty strings** when called from `on_click` — inline string building instead
@@ -311,24 +313,6 @@ fills the first one (which is the user's input, not `__ai_text`).
 - **Colons inside string arguments work correctly** — `"Time: 2:30"` is fine
 - Every `TextInput` must have a fixed numeric height (e.g. `34`)
 - No `on_render` in embedded apps
-
-### Correct Pattern: Dynamic List Display (Replaces `for` Loops)
-
-```splash
-let task_count = 0
-task_display := Label{text:"" font_size:14.0}
-ButtonFlat{text:"Add" on_click:||{
-  let t = ui.task_input.text()
-  if t != "" {
-    task_count = task_count + 1
-    let current = ui.task_display.text()
-    if current == " " { current = "" }
-    if current != "" { current = current + "\n" }
-    ui.task_display.set_text(current + task_count + ". " + t)
-    ui.task_input.set_text("")
-  }
-}}
-```
 
 ### Correct Pattern: Sequential Digit Input (Calculator)
 
@@ -348,6 +332,53 @@ ButtonFlat{text:"7" on_click:||{a = a*10+7; ui.display.set_text("" + a)}}
 | Divider line | `Divider` | `Hr{height:1 width:Fill}` |
 | Progress bar | `ProgressBar` | `Slider{value:0.65 is_read_only:true}` |
 | Tabbed UI | `TabBar`/`Tab` | `ButtonFlat` rows (TabBar renders zero-size) |
+
+### Styling Gotchas
+
+**`draw_bg.border_radius` takes a float, not an Inset:**
+```splash
+// ✅
+draw_bg.border_radius: 16.0
+
+// ❌ parse error — silently breaks layout
+draw_bg.border_radius: Inset{top:0 bottom:16 left:0 right:0}
+```
+
+**`#x` prefix for hex colors containing 'e':** When a hex color contains the letter `e` adjacent to digits (like `#1e1e2e`), use `#x` to avoid parser ambiguity. Without `#x`, Makepad's parser may misinterpret digits following 'e' as an exponent:
+```splash
+#x2ecc71     // ✅ contains 'e' next to digits, use #x
+#x1e1e2e     // ✅ contains 'e' next to digits, use #x
+#ff4444      // ✅ no 'e' issue, plain # works
+#00ff00      // ✅ no 'e' issue
+```
+
+**Default text color is white:** All text widgets (`Label`, `Button`, etc.) default to `#fff`. For light/white backgrounds, you MUST explicitly set `draw_text.color` to a dark color on every text element, or text will be invisible (white-on-white):
+```splash
+RoundedView{draw_bg.color:#f5f5f5 height:Fit
+  Label{text:"Visible!" draw_text.color:#x222}  // dark text required for light bg
+}
+```
+
+**Label styling shorthand:** Both syntaxes work for Label text styling:
+```splash
+Label{text:"Hello" color:#x2ecc71 font_size:16}              // bare props work
+Label{text:"Hello" draw_text.color:#x2eccyr draw_text.text_style.font_size:16}  // draw_text also works
+```
+The shorthand properties `color:`, `font_size:`, `font_weight:` work directly on Labels. Use whichever is clearer.
+
+**`new_batch: true` for text visibility:** Set `new_batch: true` on any container with `show_bg: true` that contains text children. Without it, text renders **behind** the background (invisible text):
+```splash
+// ✅ Correct
+RoundedView{width:Fill height:Fit new_batch:true show_bg:true draw_bg.color:#x334
+  Label{text:"Visible" draw_text.color:#fff}
+}
+
+// ❌ Text may be invisible (draws behind bg)
+RoundedView{width:Fill height:Fit show_bg:true draw_bg.color:#x334
+  Label{text:"Invisible!" draw_text.color:#fff}
+}
+```
+Use `new_batch: true` on: (a) any container with `show_bg: true` that has text children, (b) parent containers of items with their own backgrounds (repeated list rows), (c) hoverable items.
 
 ### Validation
 
@@ -468,9 +499,38 @@ fn clear_flagged(){
 
 Available array operations: `.push(item)`, `.remove(index)`, `.len()`, `.retain(|item| condition)`, `array[index]` (read), `array[index] += {field: value}` (update one field). Mutations do NOT re-render widgets — call `sync_all()` after each change to push data to the visible UI.
 
+### Naming Children: `:=` vs `:`
+
+Use `:=` for children you want to reference or override later. Use `:` for static children that never change:
+
+```splash
+label := Label{text:"default"}    // ✅ named child — addressable via ui.label, overridable in templates
+label: Label{text:"default"}     // ❌ static child — NOT addressable, overrides fail silently
+```
+
+**Every path segment in an override must use `:=`.** If a named child is nested inside an anonymous container, the override path can't find it:
+
+```splash
+// ❌ label inside unnamed View is unreachable
+let Item = View{flow:Right
+  View{flow:Down
+    label := Label{text:"default"}  // UNREACHABLE: parent View is anonymous, has no name
+  }
+}
+Item{label.text:"new text"}  // silent failure — shows "default"
+
+// ✅ Give every container in the path a := name
+let Item = View{flow:Right
+  texts := View{flow:Down
+    label := Label{text:"default"}  // reachable via texts.label
+  }
+}
+Item{texts.label.text:"new text"}  // works!
+```
+
 ### Component / Template Pattern
 
-You can define reusable widget templates with `let` and instantiate them with property overrides. This reduces duplication when building lists of similar rows:
+Define reusable widget templates with `let` and instantiate with property overrides. This reduces duplication when building lists of similar rows:
 
 ```splash
 let ItemRow = RoundedView{
@@ -486,7 +546,7 @@ let ItemRow = RoundedView{
     remove := ButtonFlatter{text: "X" width: 56 height: 28}
 }
 
-// Instantiate with overrides
+// Instantiate with overrides — every named child in the path must use :=
 row_0 := ItemRow{
     label.text: "First item"
     action.on_click: || do_something(0)
@@ -570,7 +630,7 @@ Button{text: "Add" width: 64 height: 34 on_click: || add_item(ui.input.text())}
 | `padding` | `Inset{top:8 bottom:8 left:12 right:12}` | Inner padding |
 | `spacing` | `10` | Gap between children in flow |
 | `align` | `Align{x:0.5 y:0.5}` | Center alignment |
-| `new_batch` | `true` | Batch rendering for perf |
+| `new_batch` | `true` | Batch rendering — required on containers with `show_bg:true` that contain text; prevents text rendering behind background |
 | `empty_text` | `"Type here..."` | Placeholder for TextInput |
 
 ### Available But Not Interactive via Synthetic Clicks
