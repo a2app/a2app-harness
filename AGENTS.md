@@ -429,6 +429,156 @@ ButtonFlat{text:"Done" on_click:||{ui.__pi_response.set_text(ui.lst.text())}}
 
 ⚠️ **Buttons shift down** as items are added to the list — always take a fresh snapshot before clicking.
 
+### Standard App Patterns
+
+The following patterns are extracted from the standard app library (todo, notes, counter, ai-chat) and are verified to work reliably.
+
+#### Struct Arrays & Array Operations
+
+Arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()` are the recommended way to manage dynamic lists. Fields are read via `array[index].field` and updated with `array[index] += {field: newVal}`:
+
+```splash
+let todos = [
+    {text: "Buy groceries" tag: "errands" done: false}
+    {text: "Write tests" tag: "dev" done: false}
+]
+let max_todos = 5
+
+fn add_todo(text){
+    let clean = ("" + text).trim()
+    if clean == "" { return }
+    if todos.len() >= max_todos { return }
+    todos.push({text: clean tag: "" done: false})
+    sync_rows()
+}
+
+fn toggle_todo(index){
+    if index >= todos.len() { return }
+    todos[index] += {done: !todos[index].done}
+    sync_rows()
+}
+
+fn delete_todo(index){
+    if index >= todos.len() { return }
+    todos.remove(index)
+    sync_rows()
+}
+
+fn clear_done(){
+    todos.retain(|todo| !todo.done)
+    sync_rows()
+}
+```
+
+Available array operations: `.push(item)`, `.remove(index)`, `.len()`, `.retain(|item| condition)`, `array[index]` (read), `array[index] += {field: value}` (update one field).
+
+#### Component / Template Pattern
+
+Define reusable UI components with `let` and instantiate with property overrides:
+
+```splash
+let TodoRow = RoundedView{
+    width: Fill height: Fit
+    padding: Inset{top: 8 bottom: 8 left: 12 right: 12}
+    flow: Right spacing: 10
+    align: Align{y: 0.5}
+    new_batch: true
+    draw_bg.color: #x2a2a3a
+    draw_bg.border_radius: 8.0
+    label := Label{text: "task" width: Fill draw_text.color: #xddd}
+    toggle := ButtonFlatter{text: "Toggle" width: 56 height: 28}
+    delete := ButtonFlatter{text: "Delete" width: 56 height: 28}
+}
+
+// Instantiate with overrides
+todo_row_0 := TodoRow{
+    label.text: "Buy groceries"
+    toggle.on_click: || toggle_todo(0)
+    delete.on_click: || delete_todo(0)
+}
+```
+
+Override syntax: `<child-name>.<property>: <value>` — applies to any named child in the template. Also works for event handlers.
+
+#### Pre-allocated Fixed Slots (Replaces `for` Loops for Lists)
+
+Since `for` loops render at build-time only, use fixed rows and per-row sync functions:
+
+```splash
+let items = [{text: "Item 1"} {text: "Item 2"}]
+
+fn sync_row_0(){
+    if 0 < items.len() {
+        ui.row_0.label.set_text(items[0].text)
+    } else {
+        ui.row_0.label.set_text("Empty slot")
+    }
+}
+
+fn sync_row_1(){
+    if 1 < items.len() {
+        ui.row_1.label.set_text(items[1].text)
+    } else {
+        ui.row_1.label.set_text("Empty slot")
+    }
+}
+
+fn sync_rows(){
+    sync_row_0()
+    sync_row_1()
+    sync_status()
+}
+```
+
+Pre-allocate 5 rows for a 5-item max list. Call `sync_rows()` after every mutation.
+
+#### Counter Pattern
+
+Simple numeric state with increment/decrement/reset:
+
+```splash
+let count = 0
+RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true
+  display := Label{text:"0" draw_text.color:#x44cc88 draw_text.text_style.font_size:32}
+  View{flow:Right spacing:12 align:Align{x:0.5 y:0.5}
+    ButtonFlat{text:"-" on_click:||{count -= 1; ui.display.set_text(count + "")}}
+    ButtonFlat{text:"Reset" on_click:||{count = 0; ui.display.set_text("0")}}
+    ButtonFlat{text:"+" on_click:||{count += 1; ui.display.set_text(count + "")}}
+  }
+}
+```
+
+Use `count + ""` to convert numbers to strings.
+
+#### TextInput with on_return
+
+```splash
+input := TextInput{
+    width: Fill height: 34
+    empty_text: "Add a new task"
+    on_return: |text| add_todo(text)
+}
+```
+
+Combine with a Button for both mouse and keyboard flow:
+```splash
+Button{text: "Add" width: 64 height: 34 on_click: || add_todo(ui.input.text())}
+```
+
+#### Styling Reference
+
+| Property | Example | Effect |
+|----------|---------|--------|
+| `draw_bg.color` | `#x1e1e2e` | Background color (hex) |
+| `draw_bg.border_radius` | `10.0` | Rounded corners |
+| `draw_text.color` | `#xddd` | Text color |
+| `draw_text.text_style.font_size` | `14` | Font size (float) |
+| `padding` | `Inset{top:8 bottom:8 left:12 right:12}` | Inner padding |
+| `spacing` | `10` | Gap between children in flow |
+| `align` | `Align{x:0.5 y:0.5}` | Center alignment |
+| `new_batch` | `true` | Batch rendering for perf |
+| `empty_text` | `"Type here..."` | Placeholder for TextInput |
+
 ### Available But Not Interactive via Synthetic Clicks
 
 | Widget | Limitation |

@@ -216,18 +216,9 @@ RoundedView{
 - Parenthesized `if` conditions — use `if cond { ... }` syntax
 - `on_click` on a `View` or non-button widget — only button types (`Button`, `ButtonFlat`, `ButtonFlatter`) have `on_click`
 
-## Standard Apps
+## Standard App Patterns (AGENTS.md)
 
-Pass `standard_app: "<name>"` to `launch_makepad_app` for built-in templates:
-
-| App | Description |
-|-----|-------------|
-| `counter` | Increment/decrement/reset counter |
-| `notes` | Quick notes with add, delete, clear-all (5 slots) |
-| `todo` | Task list with add, toggle, delete, clear-completed (5 slots) |
-| `ai-chat` | AI Chat with background sub-agent session. Start/Send/Read buttons interact with a sub-agent. |
-
-**Note:** There is no timer standard app — `set_interval()` is not available in this Makepad build.
+Full app patterns (todo, notes, counter, ai-chat) are documented in the Splash DSL Guide section of `AGENTS.md`. See `AGENTS.md` for struct arrays, component templates, pre-allocated fixed slots, counter patterns, and styling reference.
 
 ## Example: Pre-Allocated Dynamic List (since `on_render` is blocked)
 
@@ -367,8 +358,9 @@ pi SDK that the splash app communicates with through you (the pi agent) as relay
 ### Flow (One Conversation Round)
 
 1. **Launch the app:**
+   Use the ai-chat pattern from AGENTS.md as the splash_body, and include `launch_app_with_agent` or:
    ```
-   launch_makepad_app(app_id="ai-chat-1", standard_app="ai-chat")
+   launch_makepad_app(app_id="ai-chat-1", splash_body="...ai-chat splash from AGENTS.md...")
    ```
 
 2. **Start background session:**
@@ -442,7 +434,7 @@ Splash content widgets (the inner View created by evaluating the body) have `par
 
 ## Tools
 
-- `launch_makepad_app(app_id, splash_body, standard_app?)` — Launch/replace a mini-app
+- `launch_makepad_app(app_id, splash_body)` — Launch/replace a mini-app
 - `close_makepad_app(app_id)` — Close the running app
 - `list_makepad_apps()` — List the running app and any error
 - `check_debug_app(app_id?, retry_splash_body?, debug_command?, debug_params?, timeout_seconds?)` — Inspect the widget tree, check errors, retry with a fix, or simulate interactions
