@@ -2,7 +2,6 @@ import { Type } from "typebox";
 
 import { connectToHarness, sendToHarness, onMessage, getBufferedEvent, getAllBufferedEvents, clearEventBuffer } from "./doc-bridge.js";
 import { startHarness, stopHarness } from "./harness.js";
-import { STANDARD_APPS } from "./standard-apps.js";
 import { validateSplashBody } from "./validate-splash.js";
 import { registerAppSessionAssociation } from "./background-agent.js";
 import type { HarnessMessage, AppState, GetDocMessage } from "./types.js";
@@ -78,11 +77,6 @@ export function registerTools(pi: ExtensionAPI): void {
       splash_body: Type.String({
         description: "Makepad Splash body string (no Root/Window wrapping)",
       }),
-      standard_app: Type.Optional(
-        Type.String({
-          description: "Optional standard app key, such as 'todo'",
-        }),
-      ),
       agent_session_id: Type.Optional(
         Type.String({
           description: "Optional session ID from start_background_session. Associates this app with a background agent.",
@@ -107,11 +101,8 @@ export function registerTools(pi: ExtensionAPI): void {
         };
       }
 
-      const { app_id, standard_app } = params;
-      const splash_body =
-        typeof standard_app === "string" && STANDARD_APPS[standard_app]
-          ? STANDARD_APPS[standard_app].splashBody
-          : params.splash_body;
+      const { app_id } = params;
+      const splash_body = params.splash_body;
 
       const validationError = validateSplashBody(splash_body);
       if (validationError) {
