@@ -26,6 +26,9 @@ pub struct AgentSplash {
     /// Tracks the last known text of the __pi_response label
     #[rust]
     last_response: String,
+    /// Tracks the last known text of the __pi_data label
+    #[rust]
+    last_pi_data: String,
 }
 
 // The splash body is wrapped in: <PREFIX><body><SUFFIX>
@@ -33,7 +36,11 @@ pub struct AgentSplash {
 // __pi_response is a hidden label that splash apps can set text on
 // to send a response back to the pi extension.
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-const SPLASH_SUFFIX: &str = "  __pi_response := Label{text:\"\"}";
+// __pi_response is a hidden label that splash apps can set text on
+// to send a response back to the pi extension.
+// __pi_data is a hidden label that receives data sent by the pi agent
+// via the send_pi_response tool. Splash apps read it via ui.__pi_data.text().
+const SPLASH_SUFFIX: &str = "  __pi_response := Label{text:\"\"}  __pi_data := Label{text:\"\"}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -77,6 +84,15 @@ impl AgentSplash {
             vm.cx_mut().widget_tree_mark_dirty(widget_uid);
             true
         })
+    }
+
+    /// Set text on the __pi_data label (data received from pi agent).
+    fn set_pi_data_text(&mut self, cx: &mut Cx, data: &str) {
+        let pi_data_widget = self.widget(cx, &[id!(__pi_data)]);
+        if !pi_data_widget.is_empty() {
+            pi_data_widget.set_text(cx, data);
+            self.last_pi_data = data.to_string();
+        }
     }
 
     fn eval_body(&mut self, cx: &mut Cx) -> bool {
@@ -131,7 +147,18 @@ impl Widget for AgentSplash {
             }
         }
 
-
+        // Check for pi_response in the shared doc (data sent by pi agent
+        // via the send_pi_response tool). If present, sync it to the
+        // __pi_data label and clear the doc field.
+        if let Some(data) = read_pi_response_from_doc() {
+            let pi_data_widget = self.widget(cx, &[id!(__pi_data)]);
+            if !pi_data_widget.is_empty() {
+                if pi_data_widget.text() != data {
+                    pi_data_widget.set_text(cx, &data);
+                    self.last_pi_data = data;
+                }
+            }
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -146,6 +173,7 @@ impl Widget for AgentSplash {
         if self.body.as_ref() != v {
             self.body.set(v);
             self.last_response = String::new(); // reset response tracker
+            self.last_pi_data = String::new(); // reset pi_data tracker
             if !v.is_empty() {
                 self.render_ok = self.eval_body(cx);
                 if !self.render_ok {
@@ -180,6 +208,29 @@ fn write_doc_field(field: &str, value: String) {
     }
 }
 
+/// Read the `pi_response` field from the shared doc (sent by pi agent)
+/// and clear it (one-shot delivery). Returns the data if present, None otherwise.
+fn read_pi_response_from_doc() -> Option<String> {
+    if let Some(handle) = SHARED_DOC.get() {
+        handle.with_document(|doc| {
+            use autosurgeon::{hydrate, reconcile};
+            let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+            let data = agent.pi_response.clone();
+            if data.is_some() {
+                // Clear the doc field so it's not re-processed
+                let mut mut_agent = agent.clone();
+                mut_agent.pi_response = None;
+                let mut tx = doc.transaction();
+                let _ = reconcile(&mut tx, &mut_agent);
+                tx.commit();
+            }
+            data
+        })
+    } else {
+        None
+    }
+}
+
 /// Report an error to the pi extension by writing to the doc's `error_message` field.
 fn report_error(message: &str) {
     write_doc_field("error_message", message.to_string());
@@ -201,5 +252,14 @@ impl AgentSplashRef {
     pub fn send_response(&self, _cx: &mut Cx, data: &str) {
         write_doc_field("user_response", data.to_string());
         // response sent
+    }
+
+    /// Set data received from the pi agent on the __pi_data label.
+    /// Called by app.rs when sync_from_doc detects a new pi_response
+    /// in the shared CRDT document.
+    pub fn set_pi_data(&self, cx: &mut Cx, data: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_pi_data_text(cx, data);
+        }
     }
 }

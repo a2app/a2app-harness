@@ -99,8 +99,14 @@ export async function connectToHarness(): Promise<void> {
           }
 
           // Notify all registered handlers
+          // Each handler is individually wrapped so one error doesn't
+          // block subsequent handlers (important after extension reloads).
           for (const handler of messageHandlers) {
-            handler(msg);
+            try {
+              handler(msg);
+            } catch {
+              // Individual handler error — don't block other handlers
+            }
           }
         } catch (err) {
           // ignore parse errors

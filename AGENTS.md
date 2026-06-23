@@ -78,13 +78,23 @@ TypeScript extension. Key files:
 3. CRDT syncs to makepad-host over samod WS
 4. Makepad-host renders splash in AgentSplash widget on next Draw event
 
-### User Response (splash → pi)
+### User Response (splash → pi) — Automatic Agent Wake-Up
 1. Splash app calls `ui.__pi_response.set_text("data")` in any `on_click` handler
 2. AgentSplash detects the label text changed → writes `user_response` to CRDT doc
 3. AgentSplash also increments `user_response_version` before writing
 4. Harness bridge loop compares version number (not value) to detect changes
 5. Harness forwards `{"type":"user_response","app_id":"...","response":"..."}` to pi
-6. Pi extension buffers the event (per-type Map) and dispatches to `wait_for_response`
+6. Pi extension buffers the event (per-type Map) in `doc-bridge.ts`
+7. **Automatic wake-up**: The extension's `index.ts` `onMessage` handler detects
+   the `user_response` message and calls `pi.sendUserMessage(notification, {deliverAs: "followUp"})`
+   which injects a user message into the pi session, triggering a new agent turn.
+   **No polling, no timeouts, no blocking.**
+8. The agent wakes up and can use `inspect_makepad_doc` or other tools to check
+   the app state and take action.
+
+> **Fallback**: If `pi.sendUserMessage()` fails (e.g., session not ready), the
+> response remains buffered in `doc-bridge.ts` and can be retrieved via
+> `inspect_makepad_doc`.
 
 ### Shutdown
 1. pi sends `{"type":"exit"}` or pi exits

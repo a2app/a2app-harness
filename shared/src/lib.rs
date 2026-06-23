@@ -37,6 +37,11 @@ pub struct AgentDoc {
     /// Set by the makepad-host after processing a debug command,
     /// cleared by the harness after forwarding to pi.
     pub debug_response: Option<String>,
+    /// Optional payload sent by the pi agent to the splash app.
+    /// Written by the harness when pi sends a pi_response message,
+    /// consumed by the makepad host and synced to the __pi_data label.
+    /// This is a one-shot delivery — cleared after the host reads it.
+    pub pi_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]

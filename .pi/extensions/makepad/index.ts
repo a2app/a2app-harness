@@ -38,6 +38,36 @@ Tools:
 export default async function (pi: ExtensionAPI): Promise<void> {
   registerTools(pi);
 
+  // ── Splash Notification Handler ─────────────────────────────────
+  //
+  // When the splash app calls __pi_response.set_text("..."), the
+  // response flows through: CRDT doc → harness bridge → JSON WS.
+  // This handler detects the incoming user_response message and
+  // injects a user message into the pi session, which wakes up the
+  // agent automatically — no polling, no timeouts, no blocking.
+  //
+  // The agent receives the notification as a user message and can
+  // use inspect_makepad_doc (or other tools) to read the app state.
+  //
+  onMessage((msg: HarnessMessage) => {
+    if (msg.type === "user_response") {
+      const notification = `[Makepad App: ${msg.app_id}]
+${msg.response}`;
+      // Defer to next tick to escape the WebSocket callback context
+      setTimeout(() => {
+        try {
+          pi.sendUserMessage(notification);
+        } catch {
+          try {
+            pi.sendUserMessage(notification, { deliverAs: "followUp" });
+          } catch (e) {
+            console.error("[makepad] sendUserMessage failed:", e);
+          }
+        }
+      }, 0);
+    }
+  });
+
   pi.on("session_start", async (_event: any, ctx: any) => {
     extensionDir = ctx.extensionPath ?? _dirname ?? "";
     ctx.ui.setStatus("makepad", "Makepad: idle (start on first use)");

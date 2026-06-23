@@ -44,6 +44,7 @@ export interface DocStateMessage {
   type: "doc_state";
   app_id: string | null;
   user_response: string | null;
+  pi_response: string | null;
   error_message: string | null;
   status: string | null;
 }

@@ -68,6 +68,8 @@ export function registerTools(pi: ExtensionAPI): void {
       "AFTER launching, use check_debug_app with debug_command=widget_snapshot to verify the app rendered correctly and discover widget coordinates.",
       "Container must always have height:Fit.",
       "To send data from splash to pi, use ui.__pi_response.set_text('...') inside on_click handlers.",
+      "When the splash app calls __pi_response.set_text(), the agent is AUTOMATICALLY woken up (no polling needed).",
+      "After being woken, use inspect_makepad_doc to read the app's response and take action.",
       "Always check list_makepad_apps or check_debug_app for errors if app doesn't render.",
     ],
     parameters: Type.Object({
@@ -186,6 +188,59 @@ export function registerTools(pi: ExtensionAPI): void {
         ],
         details: { app_id, launched: launchResult.ok },
         isError: !launchResult.ok,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "send_pi_response",
+    label: "Send Pi Response",
+    description: "Send data FROM the pi agent TO the running splash app. The splash app can read this via ui.__pi_data.text().",
+    promptSnippet: "Send data from pi to the running Splash mini-app",
+    promptGuidelines: [
+      "The splash app reads incoming data via ui.__pi_data.text() inside on_click handlers.",
+      "This is a one-shot delivery — the data is written to the shared doc, consumed by the app on the next Signal, and cleared.",
+      "Call this AFTER the app is running and BEFORE the user clicks the button that reads __pi_data.",
+      "For multi-turn conversations, each response requires a new send_pi_response call + fresh click.",
+    ],
+    parameters: Type.Object({
+      app_id: Type.String({
+        description: "App ID to send data to",
+      }),
+      data: Type.String({
+        description: "The data to send to the splash app",
+      }),
+    }),
+    async execute(
+      _id: string,
+      params: any,
+      _signal: AbortSignal,
+      onUpdate: any,
+    ) {
+      try {
+        await ensureConnected();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to connect: ${err}` }],
+          details: { error: String(err) },
+          isError: true,
+        };
+      }
+
+      sendToHarness({
+        type: "pi_response",
+        app_id: params.app_id,
+        data: params.data,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `pi_response '${params.data.slice(0, 100)}' sent to app '${params.app_id}'.`,
+          },
+        ],
+        details: { app_id: params.app_id, sent: true },
       };
     },
   });
@@ -578,11 +633,15 @@ export function registerTools(pi: ExtensionAPI): void {
       "Also checks the local event buffer for any user_response that arrived between tool calls.",
       "Clears the buffer after reading.",
       "",
+      "NOTE: The agent is AUTOMATICALLY woken up when the splash calls __pi_response.set_text().",
+      "      You do NOT need to poll or use wait_for_response — just wait for the notification.",
+      "",
       "USE CASES:",
-      "  - Check if a splash app has sent a response via __pi_response.set_text()",
+      "  - Check what response the splash app sent (user_response field)",
       "  - Check for render errors (error_message field)",
       "  - See what app is currently running",
       "  - Use AFTER a click to confirm the response was captured in the doc",
+      "  - Check if the agent sent data back (pi_response field — cleared after reading)",
     ],
     parameters: Type.Object({}),
     async execute(
