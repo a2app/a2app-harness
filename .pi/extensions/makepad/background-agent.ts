@@ -238,6 +238,8 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
     async execute(_id: string, params: any) {
       try {
         const { sendToHarness } = await import("./doc-bridge.js");
+        const { ensureConnected } = await import("./tools.js");
+        await ensureConnected();
         sendToHarness({ type: "send_pi_response", app_id: params.app_id, data: params.data });
         return {
           content: [{ type: "text", text: `Sent ${params.data.length} chars to app '${params.app_id}'.` }],
@@ -564,10 +566,10 @@ function handleAutoMessage(data: string, appId: string): void {
     (async () => {
       try {
         // Look up or auto-create session for this app
-        let sid = appSessionMap.get(appId);
+        let sid: string | null | undefined = appSessionMap.get(appId);
         if (!sid) {
           console.log("[bg-agent] No session for app", appId, "— auto-creating default session");
-          sid = await initSession(appId, null);
+          sid = await initSession(appId, undefined);
           if (!sid) return;
         }
 
