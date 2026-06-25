@@ -119,39 +119,47 @@ async fn background_main() {
     let mut last_debug_cmd: Option<String> = None;
     let mut last_pi_response: Option<String> = None;
 
-    while let Some(_change) = changes.next().await {
-        let (should_exit, should_signal) = {
-            let (current_id, current_cmd, pi_resp, exit) = doc_handle.with_document(|doc| {
-                use autosurgeon::hydrate;
-                let agent: AgentDoc = hydrate(doc).unwrap_or_default();
-                (
-                    agent.pending_app.as_ref().map(|a| a.id.clone()),
-                    agent.debug_command.as_ref().map(|c| c.command.clone()),
-                    agent.pi_response.clone(),
-                    agent.should_exit,
-                )
-            });
-
-            // Only signal when a NEW value appears (is_some guards).
-            // Transitions to None (host clearing the field) are ignored.
-            let signal = exit
-                || (current_id.is_some() && current_id != last_pending_id)
-                || (current_cmd.is_some() && current_cmd != last_debug_cmd)
-                || (pi_resp.is_some() && pi_resp != last_pi_response);
-
-            // Always update trackers so we don't re-signal for stale values
-            if current_id != last_pending_id {
-                last_pending_id = current_id;
+    // Use a poll-based approach: check the doc every 500ms AND listen for changes.
+    // This ensures we don't miss remote changes that the change listener might skip.
+    loop {
+        // Wait for a change OR timeout every 500ms
+        {
+            use tokio::time::timeout;
+            match timeout(Duration::from_millis(500), changes.next()).await {
+                Ok(Some(_change)) => {} // Got a change notification
+                Ok(None) => break,      // Stream ended
+                Err(_) => {}            // Timeout — poll
             }
-            if current_cmd != last_debug_cmd {
-                last_debug_cmd = current_cmd;
-            }
-            if pi_resp != last_pi_response {
-                last_pi_response = pi_resp;
-            }
-
-            (exit, signal)
         };
+        
+        let (current_id, current_cmd, pi_resp, should_exit) = doc_handle.with_document(|doc| {
+            use autosurgeon::hydrate;
+            let agent: AgentDoc = hydrate(doc).unwrap_or_default();
+            (
+                agent.pending_app.as_ref().map(|a| a.id.clone()),
+                agent.debug_command.as_ref().map(|c| c.command.clone()),
+                agent.pi_response.clone(),
+                agent.should_exit,
+            )
+        });
+
+        // Only signal when a NEW value appears (is_some guards).
+        // Transitions to None (host clearing the field) are ignored.
+        let should_signal = should_exit
+            || (current_id.is_some() && current_id != last_pending_id)
+            || (current_cmd.is_some() && current_cmd != last_debug_cmd)
+            || (pi_resp.is_some() && pi_resp != last_pi_response);
+
+        // Always update trackers so we don't re-signal for stale values
+        if current_id != last_pending_id {
+            last_pending_id = current_id;
+        }
+        if current_cmd != last_debug_cmd {
+            last_debug_cmd = current_cmd;
+        }
+        if pi_resp != last_pi_response {
+            last_pi_response = pi_resp;
+        }
 
         if should_signal {
             SignalToUI::set_ui_signal();
