@@ -483,39 +483,39 @@ impl AppMain for MakepadHostApp {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        // ── Pre-dispatch pending type_text ──────────────────────────
-        // Must happen BEFORE self.ui.handle_event() so that AgentSplash
-        // sees __pi_type_text during the same event cycle.
-        if matches!(event, Event::Signal | Event::Draw(_)) {
-            self.dispatch_pending_type_text(cx);
-            self.dispatch_pending_click(cx);
-        }
-
-        // ── Apply deferred UI updates before rendering ────────────
-        // sync_from_doc runs on Signal and stores pending updates in
-        // self.pending_update. We apply them on the next Draw (before
-        // the UI renders) so that widget tree mutations (splash body
-        // eval, set_text) happen during the render phase. We also apply
-        // at the end of Signal handling to ensure close/clear operations
-        // take effect even if no Draw event follows immediately.
-        if matches!(event, Event::Draw(_)) {
-            self.apply_pending_updates(cx);
-        }
-
-        self.ui.handle_event(cx, event, &mut Scope::empty());
-
-        match event {
-            Event::Startup => {
-                self.sync_from_doc(cx);
+        // Wrap the entire handler in catch_unwind to prevent any panic from
+        // propagating through the #[no_unwind] macOS NSTimer callback
+        // (received_timer), which would abort with panic_cannot_unwind.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // ── Pre-dispatch pending type_text ──────────────────────
+            if matches!(event, Event::Signal | Event::Draw(_)) {
+                self.dispatch_pending_type_text(cx);
+                self.dispatch_pending_click(cx);
             }
-            Event::Signal => {
-                self.sync_from_doc(cx);
-                self.process_debug_commands(cx);
-                // Apply pending updates at end of Signal too, so that
-                // close/clear operations render even without a Draw event
+
+            // ── Apply deferred UI updates before rendering ────────
+            if matches!(event, Event::Draw(_)) {
                 self.apply_pending_updates(cx);
             }
-            _ => {}
+
+            self.ui.handle_event(cx, event, &mut Scope::empty());
+
+            match event {
+                Event::Startup => {
+                    self.sync_from_doc(cx);
+                }
+                Event::Signal => {
+                    self.sync_from_doc(cx);
+                    self.process_debug_commands(cx);
+                }
+                _ => {}
+            }
+        }));
+        
+        if let Err(e) = result {
+            eprintln!("[app] handle_event panicked: {:?}", e);
+            // Log the panic but don't re-panick — the NSTimer callback is
+            // #[no_unwind] and re-panicking would abort the process.
         }
     }
 }
