@@ -510,7 +510,27 @@ ButtonFlat{text:"Show" on_click:||{ui.display.set_text("Current: " + toggled)}}
 
 #### 4.7.1 Struct Arrays & Array Operations
 
-The Splash VM supports arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()`. Read fields via `array[index].field`, update with `array[index] += {field: val}`:
+The Splash VM supports arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()`. Read fields via `array[index].field`, update with `array[index] += {field: val}`.
+
+**⚠️ `for i in items` iterates over VALUES, not indices.** This is a critical gotcha — `for i in items` behaves like a for-each loop, so `i` is the element value (string), not an integer index. Using `items[i]` will silently mis-index (treating a string as an index, which falls through to the first element):
+
+```splash
+// ❌ WRONG — i is the string value, not an index
+for i in items { out = out + items[i] }  // always returns items[0]
+
+// ✅ CORRECT — use while loop with explicit index
+let idx = 0
+while idx < items.len() {
+    out = out + items[idx]
+    idx = idx + 1
+}
+
+// ✅ ALSO CORRECT — direct indexing when you know the position
+items[0]  // works
+items[1]  // works
+```
+
+**Note:** `while` loops in the Splash VM are functional but can cause debug system timeouts with rapid successive clicks. After using `while` in an `on_click`, allow 10+ seconds for the debug system to recover.
 
 ```splash
 let items = [
@@ -711,10 +731,14 @@ All patterns verified end-to-end via extension tools.
 | `type_text` → click Submit | ✅ | "hello world" typed, submitted → doc: `"got:hello world"` |
 | `send_pi_response` → splash reads data | ✅ | "Data from pi agent!" appears in __pi_data and __ai_text |
 | Dynamic list via `set_text()` | ✅ | 2 items added → doc: `"1. Buy groceries\\n2. Write tests"` |
+| Array push + indexing (while loop) | ✅ | 3 pushes → items[0..2] → doc: `"Alpha, Beta, Gamma"` |
 | Coordinate shift after layout change | ✅ | Buttons shifted +19px after 2nd list item added |
 | Container padding clipping | ❌ | RoundedView{padding:16} → buttons overflow padded area → unhittable |
 | Sub-agent `ai:ask:` auto-handler (pre-created session) | ✅ | Type text → click Send → `__ai_text` shows AI response (2026-06-24) |
-| `send_pi_response` to splash via `__ai_text` | ✅ | 
+| Sub-agent via `launch_app_with_agent` (system_prompt) | ✅ | "What is 2+2?" → AI: "**2 + 2 = 4**" in `__ai_text` (2026-06-29) |
+| `send_pi_response` → splash reads `__pi_data` | ✅ | "Greetings from pi!" → label shows "Got: Greetings from pi!" |
+| Splash → Pi communication (`__pi_response.set_text`) | ✅ | Click "Send to Pi" → doc: `"hello from splash"` |
+| Two-way comms (pi→splash + splash→pi) | ✅ | Full round-trip verified in single session |
 
 ---
 
@@ -740,6 +764,8 @@ All patterns verified end-to-end via extension tools.
 | Auto-handler runs with cached extension code | Extension compiled dist is loaded at pi startup; recompiling dist only takes effect on next pi session |
 | `start_background_session` stores system_prompt as metadata but doesn't pass to model | Use `ai:init:protocol` from the splash app to set the system prompt, or use `launch_app_with_agent` tool |
 | `createAgentSession` has no `systemPrompt` parameter | System prompt must be seeded via conversation (`session.prompt("[SYSTEM CONTEXT] " + prompt)`) |
+| `for i in items` iterates over values (not indices) in Splash VM | Use `while idx < items.len()` with `items[idx]` for correct indexing |
+| `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
 
 ### Recovery from Debug Freeze
 
