@@ -357,12 +357,10 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
         // Associate app_id with session_id for the auto-handler
         appSessionMap.set(params.app_id, sessionId);
 
-        // Seed the system prompt as the first message.
-        // createAgentSession does not support a systemPrompt parameter,
-        // so we send it as a context-setting message.
+        // Seed the system prompt as the first message and WAIT for it.
+        // Using fire-and-forget causes race conditions with the first ai:ask.
         if (systemPrompt) {
-          session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false })
-            .catch((err: any) => console.error("[bg-agent] Failed to seed system prompt:", err));
+          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false });
         }
 
         return {
@@ -566,50 +564,35 @@ function handleAutoMessage(data: string, appId: string): void {
   }
 
   // ── ai:ask:<message> ───────────────────────────────────────────────
-  // Send a message to the sub-agent session associated with this app.
-  // Uses a 100ms timer to send accumulated streaming text so the
-  // makepad-host has time to process each update (raw delta events
-  // fire too fast for the CRDT polling cycle to catch individually).
+  // Each delta is sent immediately. The makepad-host uses an mpsc channel
+  // to deliver deltas individually (like AgentEvent::TextDelta) so rapid
+  // sends don't coalesce — each one triggers a separate render update.
   if (data.startsWith("ai:ask:")) {
-    const message = data.slice(7); // remove "ai:ask:"
+    const message = data.slice(7);
     if (!message) return;
 
     (async () => {
       try {
-        // Look up or auto-create session for this app
         let sid: string | null | undefined = appSessionMap.get(appId);
         if (!sid) {
-          console.log("[bg-agent] No session for app", appId, "— auto-creating default session");
           sid = await initSession(appId, undefined);
           if (!sid) return;
         }
 
         const stored = sessions.get(sid);
-        if (!stored) {
-          console.error("[bg-agent] Session not found:", sid, "for app:", appId);
-          return;
-        }
+        if (!stored) return;
 
         let response = "";
         const unsub = stored.session.subscribe((event: any) => {
           if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
             response += event.assistantMessageEvent.delta;
+            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: response });
           }
         });
 
-        // Send streaming updates every 100ms so the host can catch intermediate states
-        const timer = setInterval(() => {
-          if (response) {
-            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: response });
-          }
-        }, 100);
-
         await stored.session.prompt(message, { expandPromptTemplates: false });
-        clearInterval(timer);
         unsub();
 
-        // Send final response via the existing pi_response channel.
-        // The harness clears streaming_text when it writes pi_response.
         sendToHarness({ type: "send_streaming_end", app_id: appId, final_text: response || "[No response]" });
       } catch (err) {
         console.error("[bg-agent] Error processing message:", err);

@@ -797,6 +797,9 @@ All patterns verified end-to-end via extension tools.
 | Standalone `ScrollBars`/`ScrollBar` as child widget crashes the host | The Splash VM's generic `draw_walk` doesn't know about `begin()`/`end()` protocol → NaN propagation → assertion failure. Only `ScrollBars{...}` as a standalone child widget crashes. |
 | `View{scroll_bars: ScrollBars{...}}` — scroll_bars as View PROPERTY works | ✅ The View manages scroll internally. Use: `View{width:Fill height:300 scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true scroll_bar_y: ScrollBar{drag_scrolling:true}} ...}` |
 | Streaming responses work but token batching may occur | Deltas are sent immediately from the sub-agent, but the makepad-host polls doc changes every 500ms. Rapid deltas within 500ms are batched into one UI update. Visible as small bursts of text rather than single-token updates. |
+| **Streaming not reliably working (follow-up)** | Despite channel-based delivery (mpsc from background thread → UI), deltas from DeepSeek V4 Flash via pi SDK `session.subscribe` appear to fire all at once after `prompt()` completes, not incrementally during generation. The mpsc channel infrastructure is in place and working — the bottleneck is the pi SDK's delta delivery timing. To fix: either use a provider that streams individual deltas, or add artificial delay between sends in the extension. |
+| `createAgentSession` inherits parent system prompt | Sub-agents always inherit the parent agent's AGENTS.md. The `[SYSTEM CONTEXT]` seeding adds context on top but doesn't replace the inherited prompt. Workaround: include explicit instructions to ignore coding-agent behavior. |
+| Programmatic auto-scroll via `ScrollEvent` has no effect | `scroll_bars` only respond to touch/mouse gesture events, not programmatic `ScrollEvent` dispatch. Manual scrolling still works. |
 
 ### Recovery from Debug Freeze
 

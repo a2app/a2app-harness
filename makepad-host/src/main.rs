@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -6,6 +6,7 @@ use makepad_widgets::makepad_platform::thread::SignalToUI;
 use samod::{ConnDirection, DocHandle, Repo};
 use shared::AgentDoc;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
 mod agent_splash;
 mod app;
@@ -14,6 +15,11 @@ mod app;
 /// read/written by the Makepad main thread (for send_response)
 /// and the background thread (for the change listener).
 pub static SHARED_DOC: OnceLock<DocHandle> = OnceLock::new();
+
+/// Streaming channel: background thread sends deltas, UI thread receives them.
+/// This bypasses CRDT polling and delivers each delta as a separate event,
+/// exactly like AgentEvent::TextDelta in the aichat example.
+pub static STREAMING_RX: OnceLock<Mutex<mpsc::UnboundedReceiver<String>>> = OnceLock::new();
 
 const SAMOD_WS_PORT: u16 = 2342;
 const CONNECT_RETRY_MS: u64 = 500;
@@ -122,6 +128,14 @@ async fn background_main() {
 
     // Use a poll-based approach: check the doc every 500ms AND listen for changes.
     // This ensures we don't miss remote changes that the change listener might skip.
+    //
+    // Streaming deltas: instead of relying on Signal coalescing (which batches
+    // rapid CRDT changes), we send each delta through a lock-free mpsc channel.
+    // The UI thread reads from this channel in AgentSplash.handle_event, exactly
+    // like how AgentEvent::TextDelta works in the aichat example.
+    let (delta_tx, delta_rx) = mpsc::unbounded_channel::<String>();
+    STREAMING_RX.set(Mutex::new(delta_rx)).ok();
+
     loop {
         // Wait for a change OR timeout every 500ms
         {
@@ -164,16 +178,19 @@ async fn background_main() {
             last_pi_response = pi_resp;
         }
         if streaming != last_streaming_text {
+            // Send delta through the channel so the UI thread can process it
+            // immediately, without waiting for Signal coalescing.
+            if let Some(ref text) = streaming {
+                // Don't send the very first empty/blank text
+                if !text.is_empty() {
+                    let _ = delta_tx.send(text.clone());
+                }
+            }
             last_streaming_text = streaming;
         }
 
         if should_signal {
             SignalToUI::set_ui_signal();
-            // Yield briefly so the UI thread can process this signal and read
-            // the intermediate doc state BEFORE we check for the next change.
-            // Without this, rapid deltas (e.g. from sub-agent streaming) all
-            // coalesce into a single signal and only the final state is seen.
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         if should_exit {
