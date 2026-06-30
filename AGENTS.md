@@ -339,6 +339,23 @@ send_btn := ButtonFlat{text:"Send" on_click:||{
 
 **Note:** The system prompt is seeded via conversation context (first message) because `createAgentSession` in the pi SDK does not expose a `systemPrompt` parameter directly. The first prompt sent is `[SYSTEM CONTEXT] <system_prompt>`.
 
+#### Blank-Slate Sessions (No Inherited Context)
+
+Sub-agent sessions created via `ai:init:`, `launch_app_with_agent`, `start_background_session`, or the `ai:ask:` auto-fallback DO NOT inherit the main agent's system prompt, AGENTS.md, skills, or any other context. This is enforced by `getBlankSlateResourceLoader()` in `background-agent.ts`:
+
+| Override | Effect |
+|----------|--------|
+| `noContextFiles: true` | No AGENTS.md/CLAUDE.md from cwd or agent dir |
+| `noSkills: true` | No skill prompts injected |
+| `noPromptTemplates: true` | No file-based prompt templates |
+| `noThemes: true` | No theme-driven prompts |
+| `noExtensions: true` | No extension hooks |
+| `systemPromptOverride: () => ""` | System prompt forced to empty string |
+| `agentsFilesOverride: () => ({ agentsFiles: [] })` | Explicitly empty context files |
+| `cwd / agentDir: <tmpdir>` | Isolated temp directory — no project config leaks |
+
+Result: the sub-agent has **no knowledge** it is a coding agent. It is a blank AI assistant. The splash app controls its personality entirely via `ai:init:<prompt>`. If no init is sent, the auto-fallback uses a minimal default ("You are a helpful background AI assistant. Be concise and accurate.").
+
 ### Auto-Handler (Extension Side)
 
 The extension registers an `onMessage` handler at startup (via `startAutoBackgroundHandler()` in `index.js`) that intercepts all `user_response` messages from the harness. When the response starts with `ai:`, it dispatches to `handleAutoMessage()` which supports:
@@ -790,15 +807,14 @@ All patterns verified end-to-end via extension tools.
 | Sub-agent session dispose warning | Call `stop_background_session` when done |
 | `ai:init:` needs extension restart to pick up new code | Restart pi after recompiling `background-agent.ts` → `dist/background-agent.js` |
 | Auto-handler runs with cached extension code | Extension compiled dist is loaded at pi startup; recompiling dist only takes effect on next pi session |
-| `start_background_session` stores system_prompt as metadata but doesn't pass to model | Use `ai:init:protocol` from the splash app to set the system prompt, or use `launch_app_with_agent` tool |
-| `createAgentSession` has no `systemPrompt` parameter | System prompt must be seeded via conversation (`session.prompt("[SYSTEM CONTEXT] " + prompt)`) |
+| `createAgentSession` has no `systemPrompt` parameter | **FIXED**: Sub-agent sessions now use a blank-slate `ResourceLoader` with `noContextFiles`, `noSkills`, `noExtensions`, and `systemPromptOverride: () => ""`. The splash app's system prompt (via `ai:init:<prompt>`) is seeded as `[SYSTEM CONTEXT] <prompt>` on an otherwise empty session. See Section 3.1. |
 | `for i in items` iterates over values (not indices) in Splash VM | Use `while idx < items.len()` with `items[idx]` for correct indexing |
 | `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
-| Standalone `ScrollBars`/`ScrollBar` as child widget crashes the host | The Splash VM's generic `draw_walk` doesn't know about `begin()`/`end()` protocol → NaN propagation → assertion failure. Only `ScrollBars{...}` as a standalone child widget crashes. |
+| Standalone `ScrollBars`/`ScrollBar` as child widget (historically) | **No longer reproducible** (tested 2026-07-01 on clean build). The Splash VM now handles ScrollBars gracefully — renders as zero-size when used standalone. The fix was likely in the Makepad upstream update between git revisions. The `catch_unwind` wrapper in `app.rs` (commit b965536) provides defense-in-depth against any future panics. |
 | `View{scroll_bars: ScrollBars{...}}` — scroll_bars as View PROPERTY works | ✅ The View manages scroll internally. Use: `View{width:Fill height:300 scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true scroll_bar_y: ScrollBar{drag_scrolling:true}} ...}` |
 | Streaming responses work but token batching may occur | Deltas are sent immediately from the sub-agent, but the makepad-host polls doc changes every 500ms. Rapid deltas within 500ms are batched into one UI update. Visible as small bursts of text rather than single-token updates. |
 | **Streaming not reliably working (follow-up)** | Despite channel-based delivery (mpsc from background thread → UI), deltas from DeepSeek V4 Flash via pi SDK `session.subscribe` appear to fire all at once after `prompt()` completes, not incrementally during generation. The mpsc channel infrastructure is in place and working — the bottleneck is the pi SDK's delta delivery timing. To fix: either use a provider that streams individual deltas, or add artificial delay between sends in the extension. |
-| `createAgentSession` inherits parent system prompt | Sub-agents always inherit the parent agent's AGENTS.md. The `[SYSTEM CONTEXT]` seeding adds context on top but doesn't replace the inherited prompt. Workaround: include explicit instructions to ignore coding-agent behavior. |
+| `createAgentSession` inherits parent system prompt (historical) | **FIXED (2026-07-01)**: `getBlankSlateResourceLoader()` creates an isolated `DefaultResourceLoader` pointing at a temp directory with all context/skills/prompts/extensions disabled. The sub-agent no longer inherits the main agent's AGENTS.md, SYSTEM.md, skills, or any other context. See Section 3.1 for implementation details. |
 | Programmatic auto-scroll via `ScrollEvent` has no effect | `scroll_bars` only respond to touch/mouse gesture events, not programmatic `ScrollEvent` dispatch. Manual scrolling still works. |
 
 ### Recovery from Debug Freeze

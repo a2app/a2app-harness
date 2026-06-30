@@ -2,6 +2,56 @@ import { Type } from "typebox";
 import type { AgentSession, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getModel } from "@earendil-works/pi-ai";
 import { onMessage, sendToHarness } from "./doc-bridge.js";
+import { tmpdir } from "node:os";
+import { mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+
+// ── Blank-Slate Resource Loader ─────────────────────────────────────────
+//
+// Sub-agent sessions created via ai:init: or launch_app_with_agent must
+// NOT inherit the main agent's system prompt, AGENTS.md, skills, or any
+// other context. The splash app provides its own system prompt via
+// ai:init:<prompt>, and the session should otherwise be blank.
+//
+// createAgentSession() defaults to DefaultResourceLoader which loads
+// AGENTS.md from cwd → ancestors → ~/.pi/agent, plus SYSTEM.md, skills,
+// prompt templates, extensions, etc. We override all of these to produce
+// a completely blank slate.
+
+let _blankLoader: any = null;
+
+async function getBlankSlateResourceLoader(): Promise<any> {
+  if (_blankLoader) return _blankLoader;
+
+  const { DefaultResourceLoader, SettingsManager } =
+    await import("@earendil-works/pi-coding-agent");
+
+  // Use a temporary empty directory as agentDir so no config files leak in.
+  const blankDir = join(tmpdir(), "pi-blank-agent-" + process.pid);
+  if (!existsSync(blankDir)) {
+    mkdirSync(blankDir, { recursive: true });
+  }
+
+  const settingsManager = SettingsManager.create(blankDir, blankDir);
+
+  _blankLoader = new DefaultResourceLoader({
+    cwd: blankDir,
+    agentDir: blankDir,
+    settingsManager,
+    noContextFiles: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noExtensions: true,
+    // Force system prompt to empty — never inherit the main agent's prompt
+    systemPromptOverride: () => "",
+    // Force agents files (AGENTS.md, CLAUDE.md, etc.) to empty
+    agentsFilesOverride: () => ({ agentsFiles: [] }),
+  });
+  await _blankLoader.reload();
+
+  return _blankLoader;
+}
 
 // ── Session Store ─────────────────────────────────────────────────────────
 // Active background agent sessions, persisted across tool calls within the
@@ -81,12 +131,17 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
           params.system_prompt ||
           "You are a helpful background AI assistant. Be concise and accurate.";
 
+        // Use blank-slate resource loader so sub-agent doesn't inherit
+        // main agent's system prompt, AGENTS.md, or skills.
+        const resourceLoader = await getBlankSlateResourceLoader();
+
         const { session } = await createAgentSession({
           model,
           thinkingLevel: params.thinking_level || "off",
           authStorage,
           modelRegistry,
           sessionManager: SessionManager.inMemory(),
+          resourceLoader,
           tools: [],
         });
 
@@ -333,6 +388,7 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
           await import("@earendil-works/pi-coding-agent");
         const authStorage = AuthStorage.create();
         const modelRegistry = ModelRegistry.create(authStorage, process.env.HOME + "/.pi/agent/models.json");
+        const resourceLoader = await getBlankSlateResourceLoader();
 
         const systemPrompt = params.system_prompt ||
           "You are a background AI assistant powering a native UI app. Be concise.";
@@ -343,6 +399,7 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
           authStorage,
           modelRegistry,
           sessionManager: SessionManager.inMemory(),
+          resourceLoader,
           tools: [],
         });
 
@@ -447,6 +504,7 @@ async function initSession(appId: string, initialMessage?: string): Promise<stri
     const authStorage = AuthStorage.create();
     const modelsPath = process.env.HOME + "/.pi/agent/models.json";
     const modelRegistry = ModelRegistry.create(authStorage, modelsPath);
+    const resourceLoader = await getBlankSlateResourceLoader();
 
     const { session } = await createAgentSession({
       model,
@@ -454,6 +512,7 @@ async function initSession(appId: string, initialMessage?: string): Promise<stri
       authStorage,
       modelRegistry,
       sessionManager: SessionManager.inMemory(),
+      resourceLoader,
       tools: [],
     });
 
@@ -506,7 +565,9 @@ function handleAutoMessage(data: string, appId: string): void {
           sessions.delete(existingSid);
         }
 
-        // Create new session with the app-provided system prompt
+        // Create new session with the app-provided system prompt.
+        // Use a blank-slate resource loader so the sub-agent does NOT
+        // inherit the main agent's system prompt, AGENTS.md, or skills.
         const { AuthStorage, ModelRegistry, SessionManager, createAgentSession } =
           await import("@earendil-works/pi-coding-agent");
         const { getModel } = await import("@earendil-works/pi-ai");
@@ -519,6 +580,7 @@ function handleAutoMessage(data: string, appId: string): void {
 
         const authStorage = AuthStorage.create();
         const modelRegistry = ModelRegistry.create(authStorage, process.env.HOME + "/.pi/agent/models.json");
+        const resourceLoader = await getBlankSlateResourceLoader();
 
         const { session } = await createAgentSession({
           model,
@@ -526,6 +588,7 @@ function handleAutoMessage(data: string, appId: string): void {
           authStorage,
           modelRegistry,
           sessionManager: SessionManager.inMemory(),
+          resourceLoader,
           tools: [],
         });
 
