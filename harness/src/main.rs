@@ -545,9 +545,9 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                 doc_handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
-                    // Accumulate deltas. First delta implicitly starts streaming.
-                    let current = agent.streaming_text.unwrap_or_default();
-                    agent.streaming_text = Some(current + &delta);
+                    // The extension sends the full accumulated text each time
+                    // (via a 100ms timer), so we SET rather than APPEND.
+                    agent.streaming_text = Some(delta);
                     agent.extension_requests = true;
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);

@@ -41,7 +41,7 @@ pub struct AgentSplash {
 // __pi_data is a hidden label that receives data from the pi extension
 // via the shared CRDT doc's pi_response field.
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\"}\n  __pi_data := Label{text:\" \"}";
+const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:20 width:Fill}\n  __pi_response := Label{text:\"\"}\n  __pi_data := Label{text:\" \"}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -120,8 +120,8 @@ impl AgentSplash {
 
 
     /// Read streaming_text from the shared doc and live-update __ai_text.
-    /// Does NOT clear the doc field — deltas accumulate until the final
-    /// pi_response arrives and supersedes it.
+    /// Also updates the splash body's `log` widget so the scroll view shows
+    /// streaming progress in-place.
     fn sync_streaming_text(&mut self, cx: &mut Cx) {
         let incoming = SHARED_DOC.get().and_then(|handle| {
             handle.with_document(|doc| {
@@ -133,10 +133,42 @@ impl AgentSplash {
 
         if let Some(text) = incoming {
             if text != self.last_streaming_text {
+                let previous = self.last_streaming_text.clone();
                 self.last_streaming_text = text.clone();
+                
+                // Update hidden __ai_text
                 let output_widget = self.widget(cx, &[id!(__ai_text)]);
                 if !output_widget.is_empty() {
                     output_widget.set_text(cx, &text);
+                }
+                
+                // Update the log widget: replace previous streaming line (if any)
+                // with the new accumulated streaming text.
+                let log_widget = self.widget(cx, &[id!(log)]);
+                if !log_widget.is_empty() {
+                    let current = log_widget.text();
+                    let current = if current == " " { "" } else { current.as_str() };
+                    if previous.is_empty() {
+                        // First streaming delta: append a new line
+                        let new_text = if current.is_empty() {
+                            format!("AI: {}", text)
+                        } else {
+                            format!("{}\nAI: {}", current, text)
+                        };
+                        log_widget.set_text(cx, &new_text);
+                    } else {
+                        // Subsequent deltas: replace the last line (which was the
+                        // previous streaming text)
+                        if let Some(last_newline) = current.rfind('\n') {
+                            let prefix = &current[..last_newline];
+                            log_widget.set_text(cx, &format!("{}\nAI: {}", prefix, text));
+                        } else if current.starts_with("AI: ") {
+                            // Only the streaming line exists
+                            log_widget.set_text(cx, &format!("AI: {}", text));
+                        }
+                        // If current doesn't start with "AI: " and has no newline,
+                        // the log doesn't have a streaming entry — skip update
+                    }
                 }
                 self.redraw(cx);
             }
@@ -170,13 +202,26 @@ impl AgentSplash {
                 if !output_widget.is_empty() {
                     output_widget.set_text(cx, &data);
                 }
-                // Append to the splash body's `log` widget (if it exists)
-                // so the scrollable conversation history auto-updates.
+                // Append to the splash body's `log` widget (if it exists).
+                // If a streaming line already exists (from sync_streaming_text),
+                // replace it instead of appending a duplicate.
                 let log_widget = self.widget(cx, &[id!(log)]);
                 if !log_widget.is_empty() {
                     let current = log_widget.text();
                     let current = if current == " " { "" } else { current.as_str() };
-                    let new_text = if current.is_empty() {
+                    let new_text = if let Some(last_nl) = current.rfind('\n') {
+                        let last_line = &current[last_nl + 1..];
+                        if last_line.starts_with("AI: ") {
+                            // Replace streaming line with final response
+                            format!("{}AI: {}", &current[..last_nl + 1], data)
+                        } else {
+                            // No streaming line — append normally
+                            format!("{}\nAI: {}", current, data)
+                        }
+                    } else if current.starts_with("AI: ") {
+                        // Only a streaming line exists — replace it
+                        format!("AI: {}", data)
+                    } else if current.is_empty() {
                         format!("AI: {}", data)
                     } else {
                         format!("{}\nAI: {}", current, data)

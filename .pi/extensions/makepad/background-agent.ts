@@ -357,6 +357,14 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
         // Associate app_id with session_id for the auto-handler
         appSessionMap.set(params.app_id, sessionId);
 
+        // Seed the system prompt as the first message.
+        // createAgentSession does not support a systemPrompt parameter,
+        // so we send it as a context-setting message.
+        if (systemPrompt) {
+          session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false })
+            .catch((err: any) => console.error("[bg-agent] Failed to seed system prompt:", err));
+        }
+
         return {
           content: [{
             type: "text",
@@ -559,8 +567,9 @@ function handleAutoMessage(data: string, appId: string): void {
 
   // ── ai:ask:<message> ───────────────────────────────────────────────
   // Send a message to the sub-agent session associated with this app.
-  // Streams deltas live to the harness so the splash app shows
-  // token-by-token output in __ai_text.
+  // Uses a 100ms timer to send accumulated streaming text so the
+  // makepad-host has time to process each update (raw delta events
+  // fire too fast for the CRDT polling cycle to catch individually).
   if (data.startsWith("ai:ask:")) {
     const message = data.slice(7); // remove "ai:ask:"
     if (!message) return;
@@ -584,14 +593,19 @@ function handleAutoMessage(data: string, appId: string): void {
         let response = "";
         const unsub = stored.session.subscribe((event: any) => {
           if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-            const delta = event.assistantMessageEvent.delta;
-            response += delta;
-            // Stream each delta to the harness for live display
-            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta });
+            response += event.assistantMessageEvent.delta;
           }
         });
 
+        // Send streaming updates every 100ms so the host can catch intermediate states
+        const timer = setInterval(() => {
+          if (response) {
+            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: response });
+          }
+        }, 100);
+
         await stored.session.prompt(message, { expandPromptTemplates: false });
+        clearInterval(timer);
         unsub();
 
         // Send final response via the existing pi_response channel.
