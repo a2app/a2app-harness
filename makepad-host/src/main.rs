@@ -169,6 +169,11 @@ async fn background_main() {
 
         if should_signal {
             SignalToUI::set_ui_signal();
+            // Yield briefly so the UI thread can process this signal and read
+            // the intermediate doc state BEFORE we check for the next change.
+            // Without this, rapid deltas (e.g. from sub-agent streaming) all
+            // coalesce into a single signal and only the final state is seen.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         if should_exit {

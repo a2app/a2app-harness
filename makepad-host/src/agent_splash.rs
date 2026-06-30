@@ -41,7 +41,7 @@ pub struct AgentSplash {
 // __pi_data is a hidden label that receives data from the pi extension
 // via the shared CRDT doc's pi_response field.
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:34 width:Fill}\n  __pi_response := Label{text:\"\"}\n  __pi_data := Label{text:\" \"}";
+const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\"}\n  __pi_data := Label{text:\" \"}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -144,8 +144,8 @@ impl AgentSplash {
     }
 
     /// Read pi_response from the shared doc and set it on the __pi_data label.
-    /// Clears the doc field after reading (one-shot delivery).
-    /// Uses a scoped value to avoid nested with_document() calls.
+    /// Also appends to the splash body's `log` widget so the scroll view
+    /// auto-updates without requiring a user click.
     fn sync_pi_data_to_splash(&mut self, cx: &mut Cx) {
         // Step 1: Read pi_response from doc (outside any widget operations)
         let incoming = SHARED_DOC.get().and_then(|handle| {
@@ -169,6 +169,19 @@ impl AgentSplash {
                 let output_widget = self.widget(cx, &[id!(__ai_text)]);
                 if !output_widget.is_empty() {
                     output_widget.set_text(cx, &data);
+                }
+                // Append to the splash body's `log` widget (if it exists)
+                // so the scrollable conversation history auto-updates.
+                let log_widget = self.widget(cx, &[id!(log)]);
+                if !log_widget.is_empty() {
+                    let current = log_widget.text();
+                    let current = if current == " " { "" } else { current.as_str() };
+                    let new_text = if current.is_empty() {
+                        format!("AI: {}", data)
+                    } else {
+                        format!("{}\nAI: {}", current, data)
+                    };
+                    log_widget.set_text(cx, &new_text);
                 }
                 self.redraw(cx);
                 
@@ -206,12 +219,14 @@ impl Widget for AgentSplash {
             }
         }
 
+        // Check for streaming text deltas (live sub-agent output).
+        // Must run BEFORE sync_pi_data_to_splash so streaming text is
+        // displayed before being potentially overwritten by the final response.
+        self.sync_streaming_text(cx);
+
         // Check if pi sent new data to the splash app.
         // Runs on every event to avoid missing updates when Signal is coalesced.
         self.sync_pi_data_to_splash(cx);
-
-        // Check for streaming text deltas (live sub-agent output)
-        self.sync_streaming_text(cx);
 
 
     }

@@ -794,8 +794,8 @@ All patterns verified end-to-end via extension tools.
 | `createAgentSession` has no `systemPrompt` parameter | System prompt must be seeded via conversation (`session.prompt("[SYSTEM CONTEXT] " + prompt)`) |
 | `for i in items` iterates over values (not indices) in Splash VM | Use `while idx < items.len()` with `items[idx]` for correct indexing |
 | `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
-| `ScrollBars` / `ScrollBar` crashes the host | **Do NOT use.** The Splash VM's generic `draw_walk` doesn't know about `begin()`/`end()` protocol → NaN propagation → assertion failure. Use `TextInput` for scrollable text or auto-growing `Label{height:Fit}`. |
-| `ScrollBars{Label{...}}` is semantically wrong (ScrollBars isn't a container) | Even correct usage like `ScrollBars{scroll_view: id(...)}` may crash due to the draw protocol issue. Completely unavailable in Splash. |
+| Standalone `ScrollBars`/`ScrollBar` as child widget crashes the host | The Splash VM's generic `draw_walk` doesn't know about `begin()`/`end()` protocol → NaN propagation → assertion failure. Only `ScrollBars{...}` as a standalone child widget crashes. |
+| `View{scroll_bars: ScrollBars{...}}` — scroll_bars as View PROPERTY works | ✅ The View manages scroll internally. Use: `View{width:Fill height:300 scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true scroll_bar_y: ScrollBar{drag_scrolling:true}} ...}` |
 | Streaming responses work but token batching may occur | Deltas are sent immediately from the sub-agent, but the makepad-host polls doc changes every 500ms. Rapid deltas within 500ms are batched into one UI update. Visible as small bursts of text rather than single-token updates. |
 
 ### Recovery from Debug Freeze

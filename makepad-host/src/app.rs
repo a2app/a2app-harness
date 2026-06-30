@@ -48,8 +48,9 @@ script_mod! {
                     }
 
                     source := TextInput {
-                        width: Fill height: 140
+                        width: Fill height: 0
                         is_read_only: true is_multiline: true
+                        visible: false
                     }
                 }
             }
