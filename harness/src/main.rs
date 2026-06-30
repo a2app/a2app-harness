@@ -35,6 +35,10 @@ enum PiToHarnessMsg {
     Debug { app_id: String, command: String, params: String },
     #[serde(rename = "send_pi_response")]
     SendPiResponse { app_id: String, data: String },
+    #[serde(rename = "send_streaming_delta")]
+    SendStreamingDelta { app_id: String, delta: String },
+    #[serde(rename = "send_streaming_end")]
+    SendStreamingEnd { app_id: String, final_text: String },
     #[serde(rename = "get_doc")]
     GetDoc,
     #[serde(rename = "exit")]
@@ -292,7 +296,7 @@ async fn background_main(headless: bool) {
             continue;
         }
 
-        let (has_response, version, app_id, status, error_message, debug_response, exit) = doc_handle.with_document(|doc| {
+        let (has_response, version, app_id, status, error_message, debug_response, _streaming_text, exit) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
@@ -300,7 +304,7 @@ async fn background_main(headless: bool) {
                 shared::AppStatus::Pending => "Pending".to_string(),
                 shared::AppStatus::Launched => "Launched".to_string(),
             });
-            (agent.user_response.clone(), agent.user_response_version, app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.should_exit)
+            (agent.user_response.clone(), agent.user_response_version, app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.streaming_text, agent.should_exit)
         });
 
         // Push user_response to pi if version changed
@@ -535,6 +539,38 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     let _ = fwd_tx.send(json);
                 });
             }
+            PiToHarnessMsg::SendStreamingDelta { app_id, delta } => {
+                eprintln!("[harness] pi: streaming delta to app '{app_id}': {} chars", delta.len());
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    // Accumulate deltas. First delta implicitly starts streaming.
+                    let current = agent.streaming_text.unwrap_or_default();
+                    agent.streaming_text = Some(current + &delta);
+                    agent.extension_requests = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+            }
+
+            PiToHarnessMsg::SendStreamingEnd { app_id, final_text } => {
+                eprintln!("[harness] pi: streaming end to app '{app_id}': {} chars", final_text.len());
+
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                    // Move final text to pi_response and clear streaming
+                    agent.pi_response = Some(final_text.clone());
+                    agent.streaming_text = None;
+                    agent.extension_requests = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+            }
+
             PiToHarnessMsg::SendPiResponse { app_id, data } => {
                 eprintln!("[harness] pi: send_pi_response to app '{app_id}': {} chars", data.len());
 
@@ -542,6 +578,8 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     use autosurgeon::{hydrate, reconcile};
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
                     agent.pi_response = Some(data.clone());
+                    // Clear streaming state if a pi_response arrives (it supersedes streaming)
+                    agent.streaming_text = None;
                     agent.extension_requests = true;
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);

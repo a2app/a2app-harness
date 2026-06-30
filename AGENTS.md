@@ -51,6 +51,7 @@ Env vars (set by harness): `MAKEPAD_HOST_DOC_ID`, `MAKEPAD_HOST_WS_URL`, `MAKEPA
 
 TypeScript extension. Key files:
 - `tools.ts` — `launch_makepad_app`, `close_makepad_app`, `list_makepad_apps`, `check_debug_app`, `inspect_makepad_doc`, `wait_for_response`
+- `background-agent.ts` — sub-agent sessions, auto-handler, streaming delta dispatch
 - `doc-bridge.ts` — WebSocket client, event buffer
 - `harness.ts` — spawns/manages the harness binary
 - `validate-splash.ts` — splash body pre-validation
@@ -65,6 +66,8 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 {"type": "clear", "app_id": "todo-1"}
 {"type": "debug", "app_id": "todo-1", "command": "widget_snapshot", "params": "{}"}
 {"type": "send_pi_response", "app_id": "todo-1", "data": "..."}
+{"type": "send_streaming_delta", "app_id": "todo-1", "delta": "hel"}
+{"type": "send_streaming_end", "app_id": "todo-1", "final_text": "hello world"}
 {"type": "get_doc"}
 {"type": "exit"}
 ```
@@ -103,6 +106,17 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 5. AgentSplash reads `pi_response`, writes it to `__ai_text` widget (TextInput) and `__pi_data` label
 6. Splash app reads response via `ui.__ai_text.text()` or `ui.__pi_data.text()`
 
+#### Streaming Response (ai:ask → live deltas → splash)
+1. Splash calls `ui.__pi_response.set_text("ai:ask:message")` → AgentSplash writes `user_response`
+2. Harness forwards `user_response` to pi → extension auto-handler matches `ai:ask:` prefix
+3. Auto-handler subscribes to sub-agent `text_delta` events, sends each as `{"type":"send_streaming_delta","app_id":"...","delta":"..."}` over JSON WS
+4. Harness appends each delta to `streaming_text` CRDT field
+5. CRDT syncs to makepad-host → background thread detects `streaming_text` change → signals UI
+6. AgentSplash.sync_streaming_text() reads `streaming_text`, sets `__ai_text` with accumulated text
+7. On sub-agent completion, auto-handler sends `{"type":"send_streaming_end","app_id":"...","final_text":"..."}`
+8. Harness copies `streaming_text` → `pi_response`, clears `streaming_text`, sets `extension_requests = true`
+9. Final text arrives via normal `pi_response` channel → `__ai_text` gets final content, `__pi_data` updates
+
 #### Shutdown
 1. pi sends `{"type":"exit"}` or pi exits
 2. Harness sets `should_exit = true` in the doc
@@ -124,6 +138,10 @@ pub struct AgentDoc {
     pub debug_command: Option<DebugCommand>,
     pub debug_response: Option<String>,
     pub pi_response: Option<String>,       // pi sends data to splash
+    /// Accumulated streaming text from sub-agent deltas.
+    /// Appended by harness on each send_streaming_delta, read by
+    /// makepad-host for live display. Cleared when pi_response arrives.
+    pub streaming_text: Option<String>,
 }
 ```
 
@@ -333,12 +351,22 @@ The extension registers an `onMessage` handler at startup (via `startAutoBackgro
 
 If no session exists when `ai:ask:` arrives, one is auto-created with a default prompt.
 
-### Auto-Display via `__ai_text`
+### Auto-Display via `__ai_text` (with Streaming)
 
 The AgentSplash injects a `__ai_text := TextInput{height:34 width:Fill}` widget that
-auto-displays the sub-agent's response — no manual reading needed. When `pi_response`
-is written to the CRDT doc, the background sync thread signals the UI, and the
-AgentSplash calls `__ai_text.set_text(response)` automatically.
+auto-displays the sub-agent's response — no manual reading needed.
+
+**Streaming (live token-by-token):** When the auto-handler processes an `ai:ask:` message,
+it subscribes to `text_delta` events from the sub-agent session and sends each delta
+to the harness as a `send_streaming_delta` message. The harness accumulates deltas in
+a new `streaming_text` CRDT field. The makepad-host background thread detects changes
+and signals the UI, where `AgentSplash.sync_streaming_text()` live-updates `__ai_text`
+with the accumulating text. When the response completes, the final text flows through
+the existing `pi_response` channel (which also clears `streaming_text`).
+
+**Result:** the `__ai_text` widget shows text appearing token-by-token as the model
+generates, rather than waiting for the full response. The splash app can also read
+the final response via `ui.__pi_data.text()` (only updated on completion).
 
 ### Injected Widgets
 
@@ -766,6 +794,9 @@ All patterns verified end-to-end via extension tools.
 | `createAgentSession` has no `systemPrompt` parameter | System prompt must be seeded via conversation (`session.prompt("[SYSTEM CONTEXT] " + prompt)`) |
 | `for i in items` iterates over values (not indices) in Splash VM | Use `while idx < items.len()` with `items[idx]` for correct indexing |
 | `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
+| `ScrollBars` / `ScrollBar` crashes the host | **Do NOT use.** The Splash VM's generic `draw_walk` doesn't know about `begin()`/`end()` protocol → NaN propagation → assertion failure. Use `TextInput` for scrollable text or auto-growing `Label{height:Fit}`. |
+| `ScrollBars{Label{...}}` is semantically wrong (ScrollBars isn't a container) | Even correct usage like `ScrollBars{scroll_view: id(...)}` may crash due to the draw protocol issue. Completely unavailable in Splash. |
+| Streaming responses work but token batching may occur | Deltas are sent immediately from the sub-agent, but the makepad-host polls doc changes every 500ms. Rapid deltas within 500ms are batched into one UI update. Visible as small bursts of text rather than single-token updates. |
 
 ### Recovery from Debug Freeze
 

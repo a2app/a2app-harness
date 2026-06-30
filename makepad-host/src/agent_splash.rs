@@ -29,6 +29,9 @@ pub struct AgentSplash {
     /// Tracks the last known text of the __pi_data label (data from pi)
     #[rust]
     last_pi_data: String,
+    /// Tracks the last known streaming_text for live update display
+    #[rust]
+    last_streaming_text: String,
 }
 
 // The splash body is wrapped in: <PREFIX><body><SUFFIX>
@@ -116,6 +119,30 @@ impl AgentSplash {
     }
 
 
+    /// Read streaming_text from the shared doc and live-update __ai_text.
+    /// Does NOT clear the doc field — deltas accumulate until the final
+    /// pi_response arrives and supersedes it.
+    fn sync_streaming_text(&mut self, cx: &mut Cx) {
+        let incoming = SHARED_DOC.get().and_then(|handle| {
+            handle.with_document(|doc| {
+                use autosurgeon::hydrate;
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.streaming_text.clone()
+            })
+        });
+
+        if let Some(text) = incoming {
+            if text != self.last_streaming_text {
+                self.last_streaming_text = text.clone();
+                let output_widget = self.widget(cx, &[id!(__ai_text)]);
+                if !output_widget.is_empty() {
+                    output_widget.set_text(cx, &text);
+                }
+                self.redraw(cx);
+            }
+        }
+    }
+
     /// Read pi_response from the shared doc and set it on the __pi_data label.
     /// Clears the doc field after reading (one-shot delivery).
     /// Uses a scoped value to avoid nested with_document() calls.
@@ -182,6 +209,9 @@ impl Widget for AgentSplash {
         // Check if pi sent new data to the splash app.
         // Runs on every event to avoid missing updates when Signal is coalesced.
         self.sync_pi_data_to_splash(cx);
+
+        // Check for streaming text deltas (live sub-agent output)
+        self.sync_streaming_text(cx);
 
 
     }

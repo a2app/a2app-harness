@@ -559,6 +559,8 @@ function handleAutoMessage(data: string, appId: string): void {
 
   // ── ai:ask:<message> ───────────────────────────────────────────────
   // Send a message to the sub-agent session associated with this app.
+  // Streams deltas live to the harness so the splash app shows
+  // token-by-token output in __ai_text.
   if (data.startsWith("ai:ask:")) {
     const message = data.slice(7); // remove "ai:ask:"
     if (!message) return;
@@ -582,14 +584,19 @@ function handleAutoMessage(data: string, appId: string): void {
         let response = "";
         const unsub = stored.session.subscribe((event: any) => {
           if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-            response += event.assistantMessageEvent.delta;
+            const delta = event.assistantMessageEvent.delta;
+            response += delta;
+            // Stream each delta to the harness for live display
+            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta });
           }
         });
 
         await stored.session.prompt(message, { expandPromptTemplates: false });
         unsub();
 
-        sendToHarness({ type: "send_pi_response", app_id: appId, data: response || "[No response]" });
+        // Send final response via the existing pi_response channel.
+        // The harness clears streaming_text when it writes pi_response.
+        sendToHarness({ type: "send_streaming_end", app_id: appId, final_text: response || "[No response]" });
       } catch (err) {
         console.error("[bg-agent] Error processing message:", err);
       }

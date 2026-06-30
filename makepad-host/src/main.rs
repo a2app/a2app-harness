@@ -118,6 +118,7 @@ async fn background_main() {
     let mut last_pending_id: Option<String> = None;
     let mut last_debug_cmd: Option<String> = None;
     let mut last_pi_response: Option<String> = None;
+    let mut last_streaming_text: Option<String> = None;
 
     // Use a poll-based approach: check the doc every 500ms AND listen for changes.
     // This ensures we don't miss remote changes that the change listener might skip.
@@ -132,13 +133,14 @@ async fn background_main() {
             }
         };
         
-        let (current_id, current_cmd, pi_resp, should_exit) = doc_handle.with_document(|doc| {
+        let (current_id, current_cmd, pi_resp, streaming, should_exit) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             (
                 agent.pending_app.as_ref().map(|a| a.id.clone()),
                 agent.debug_command.as_ref().map(|c| c.command.clone()),
                 agent.pi_response.clone(),
+                agent.streaming_text.clone(),
                 agent.should_exit,
             )
         });
@@ -148,7 +150,8 @@ async fn background_main() {
         let should_signal = should_exit
             || (current_id.is_some() && current_id != last_pending_id)
             || (current_cmd.is_some() && current_cmd != last_debug_cmd)
-            || (pi_resp.is_some() && pi_resp != last_pi_response);
+            || (pi_resp.is_some() && pi_resp != last_pi_response)
+            || (streaming.is_some() && streaming != last_streaming_text);
 
         // Always update trackers so we don't re-signal for stale values
         if current_id != last_pending_id {
@@ -159,6 +162,9 @@ async fn background_main() {
         }
         if pi_resp != last_pi_response {
             last_pi_response = pi_resp;
+        }
+        if streaming != last_streaming_text {
+            last_streaming_text = streaming;
         }
 
         if should_signal {

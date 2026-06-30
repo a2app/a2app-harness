@@ -68,3 +68,15 @@ export interface SendPiResponseMessage {
   app_id: string;
   data: string;
 }
+
+export interface SendStreamingDeltaMessage {
+  type: "send_streaming_delta";
+  app_id: string;
+  delta: string;
+}
+
+export interface SendStreamingEndMessage {
+  type: "send_streaming_end";
+  app_id: string;
+  final_text: string;
+}
