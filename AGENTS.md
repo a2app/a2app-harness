@@ -816,6 +816,7 @@ All patterns verified end-to-end via extension tools.
 | **Streaming not reliably working (follow-up)** | Despite channel-based delivery (mpsc from background thread → UI), deltas from DeepSeek V4 Flash via pi SDK `session.subscribe` appear to fire all at once after `prompt()` completes, not incrementally during generation. The mpsc channel infrastructure is in place and working — the bottleneck is the pi SDK's delta delivery timing. To fix: either use a provider that streams individual deltas, or add artificial delay between sends in the extension. |
 | `createAgentSession` inherits parent system prompt (historical) | **FIXED (2026-07-01)**: `getBlankSlateResourceLoader()` creates an isolated `DefaultResourceLoader` pointing at a temp directory with all context/skills/prompts/extensions disabled. The sub-agent no longer inherits the main agent's AGENTS.md, SYSTEM.md, skills, or any other context. See Section 3.1 for implementation details. |
 | Programmatic auto-scroll via `ScrollEvent` has no effect | `scroll_bars` only respond to touch/mouse gesture events, not programmatic `ScrollEvent` dispatch. Manual scrolling still works. |
+| **Makepad-host crash: `dy.is_nan()` in `turtle.rs:2342` during streaming** | **FIXED (2026-07-02)**: The `SPLASH_PREFIX` in `agent_splash.rs` was missing `width:Fill` on the outer wrapper View. This caused `View{height:Fit flow:Down <body> __ai_text{width:Fill height:0}}` — a parent with no explicit width containing children with `width: Fill`. During sub-agent streaming responses, text written to `__ai_text` triggered a re-layout that produced NaN in `turtle.total_resolved_length_to()` → `move_align_list(dy=NaN)`. Fix: added `width: Fill` to `SPLASH_PREFIX`. See Section 11 for full analysis. |
 
 ### Recovery from Debug Freeze
 
@@ -904,3 +905,71 @@ All core patterns were tested end-to-end. The following findings correct earlier
 | Container padding clipping | ❌ RoundedView{padding:16} → unhittable buttons |
 | Sub-agent auto-handler (`ai:ask:` with pre-created session) | ✅ Type text → click Send → `__ai_text` displays AI response |
 | `send_pi_response` → `__ai_text` auto-display | ✅ "Test message from pi to splash app" appeared in `__ai_text` and `__pi_data` within seconds |
+
+## 11. Crash Analysis: `dy.is_nan()` in `move_align_list` (2026-07-02)
+
+### Symptom
+
+```
+thread 'main' panicked at makepad/draw/src/turtle.rs:2342:9:
+assertion failed: !dy.is_nan().0M
+```
+
+Stack trace: `received_timer` → `call_draw_event` → `handle_event` → `draw_walk` → `View::draw_walk` → `AgentSplash::draw_walk` → `View::draw_walk` → `draw_bg.end()` → `end_turtle` → `end_turtle_with_guard` → `move_align_list(..., dy=NaN, ...)`
+
+### Trigger
+
+Launching a splash app via `launch_app_with_agent`, then clicking a button that sends an `ai:ask:` message. When the sub-agent streams its response back and text is written to the injected `__ai_text` widget, the Makepad layout engine recalculates positions and hits the NaN assertion.
+
+### Root Cause
+
+The `SPLASH_PREFIX` in `makepad-host/src/agent_splash.rs` wrapped every splash body in an outer View **without `width: Fill`**:
+
+```rust
+// BEFORE (broken):
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
+```
+
+This produced the following widget hierarchy:
+```
+View{height:Fit flow:Down          ← NO width! width computed from children
+  <user's RoundedView{width:Fill ...}>
+  __ai_text := TextInput{width:Fill height:0 visible:false}
+  __pi_response := Label{...}
+  __pi_data := Label{...}
+}
+```
+
+When `sync_pi_data_to_splash()` or `sync_streaming_text()` called `set_text()` on `__ai_text`, Makepad's layout engine attempted to resolve `width: Fill` on a child whose parent had no explicit width. This circular dependency (`Fill` depends on parent width, parent width depends on child) produced `NaN` in `turtle.total_resolved_length_to()`, which flowed through `end_turtle_with_guard` → `move_align_list(dy=NaN)` → assertion failure.
+
+**Why it was intermittent:** The crash only occurred when text was actively written to `__ai_text` during streaming deltas while a Draw event was in flight. The timing of the streaming relative to the draw cycle determined whether the NaN would manifest.
+
+**Secondary finding:** `visible:false` on `__ai_text` (a TextInput) is not respected — every snapshot shows it as `visible: true` with full width. This means the injected TextInput always participates in layout.
+
+### Fix
+
+Added `width: Fill` to the outer wrapper View so children with `width: Fill` resolve correctly:
+
+```rust
+// AFTER (fixed):
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
+```
+
+This gives the outer View a resolved width from the parent (the `splash_holder` in the window), so all `width: Fill` children compute their widths from a known value — no circular dependency.
+
+### Verification
+
+1. Launched `file-summarizer` app with `launch_app_with_agent` and a large system prompt
+2. Typed a filename into the TextInput
+3. Clicked "Summarize" button → `__pi_response` set to `ai:ask:summarize shared/src/lib.rs`
+4. Sub-agent began streaming response → text written to `__ai_text` via CRDT
+5. **No crash** — app survived the full streaming flow
+
+### Code Change
+
+**File:** `makepad-host/src/agent_splash.rs`, line 44
+
+```diff
+-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
++const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
+```
