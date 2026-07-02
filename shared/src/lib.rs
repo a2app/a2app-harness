@@ -41,6 +41,11 @@ pub struct AgentDoc {
     /// Written by the harness when pi sends a send_pi_response message,
     /// read and cleared by the makepad-host's AgentSplash.
     pub pi_response: Option<String>,
+    /// Streaming text accumulated from sub-agent deltas.
+    /// Written by the harness as deltas arrive from the pi extension.
+    /// Read by the makepad-host's AgentSplash for live display.
+    /// Cleared when the final pi_response is written.
+    pub streaming_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]

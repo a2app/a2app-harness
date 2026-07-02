@@ -1,6 +1,7 @@
 use makepad_widgets::*;
 
 use crate::SHARED_DOC;
+use crate::STREAMING_RX;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -29,6 +30,9 @@ pub struct AgentSplash {
     /// Tracks the last known text of the __pi_data label (data from pi)
     #[rust]
     last_pi_data: String,
+    /// Tracks the last known streaming_text for live update display
+    #[rust]
+    last_streaming_text: String,
 }
 
 // The splash body is wrapped in: <PREFIX><body><SUFFIX>
@@ -38,7 +42,7 @@ pub struct AgentSplash {
 // __pi_data is a hidden label that receives data from the pi extension
 // via the shared CRDT doc's pi_response field.
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:34 width:Fill}\n  __pi_response := Label{text:\"\"}\n  __pi_data := Label{text:\" \"}";
+const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
     flow: Down spacing: 8
@@ -116,9 +120,64 @@ impl AgentSplash {
     }
 
 
+    /// Read streaming_text from the shared doc and live-update __ai_text.
+    /// Also updates the splash body's `log` widget so the scroll view shows
+    /// streaming progress in-place.
+    fn sync_streaming_text(&mut self, cx: &mut Cx) {
+        let incoming = SHARED_DOC.get().and_then(|handle| {
+            handle.with_document(|doc| {
+                use autosurgeon::hydrate;
+                let agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.streaming_text.clone()
+            })
+        });
+
+        if let Some(text) = incoming {
+            if text != self.last_streaming_text {
+                let previous = self.last_streaming_text.clone();
+                self.last_streaming_text = text.clone();
+                
+                // Update hidden __ai_text
+                let output_widget = self.widget(cx, &[id!(__ai_text)]);
+                if !output_widget.is_empty() {
+                    output_widget.set_text(cx, &text);
+                }
+                
+                // Update the log widget: replace previous streaming line (if any)
+                // with the new accumulated streaming text.
+                let log_widget = self.widget(cx, &[id!(log)]);
+                if !log_widget.is_empty() {
+                    let current = log_widget.text();
+                    let current = if current == " " { "" } else { current.as_str() };
+                    if previous.is_empty() {
+                        // First streaming delta: append a new line
+                        let new_text = if current.is_empty() {
+                            format!("🤖 {}", text)
+                        } else {
+                            format!("{}\n🤖 {}", current, text)
+                        };
+                        log_widget.set_text(cx, &new_text);
+                    } else {
+                        // Subsequent deltas: replace the last line (which was the
+                        // previous streaming text)
+                        if let Some(last_newline) = current.rfind('\n') {
+                            let prefix = &current[..last_newline];
+                            log_widget.set_text(cx, &format!("{}\n🤖 {}", prefix, text));
+                        } else if current.starts_with("🤖 ") {
+                            log_widget.set_text(cx, &format!("🤖 {}", text));
+                        }
+                        // If current doesn't start with "AI: " and has no newline,
+                        // the log doesn't have a streaming entry — skip update
+                    }
+                }
+                self.redraw(cx);
+            }
+        }
+    }
+
     /// Read pi_response from the shared doc and set it on the __pi_data label.
-    /// Clears the doc field after reading (one-shot delivery).
-    /// Uses a scoped value to avoid nested with_document() calls.
+    /// Also appends to the splash body's `log` widget so the scroll view
+    /// auto-updates without requiring a user click.
     fn sync_pi_data_to_splash(&mut self, cx: &mut Cx) {
         // Step 1: Read pi_response from doc (outside any widget operations)
         let incoming = SHARED_DOC.get().and_then(|handle| {
@@ -142,6 +201,27 @@ impl AgentSplash {
                 let output_widget = self.widget(cx, &[id!(__ai_text)]);
                 if !output_widget.is_empty() {
                     output_widget.set_text(cx, &data);
+                }
+                // Append to the splash body's `log` widget (if it exists).
+                // If a streaming line already exists (from sync_streaming_text),
+                // replace it instead of appending a duplicate.
+                let log_widget = self.widget(cx, &[id!(log)]);
+                if !log_widget.is_empty() {
+                    let current = log_widget.text();
+                    let current = if current == " " { "" } else { current.as_str() };
+                    let new_text = if let Some(last_nl) = current.rfind('\n') {
+                        let last_line = &current[last_nl + 1..];
+                        if last_line.starts_with("🤖 ") {
+                            format!("{}🤖 {}\n", &current[..last_nl + 1], data)
+                        } else {
+                            format!("{}\n🤖 {}\n", current, data)
+                        }
+                    } else if current.starts_with("🤖 ") || current.is_empty() {
+                        format!("🤖 {}\n", data)
+                    } else {
+                        format!("{}\n🤖 {}\n", current, data)
+                    };
+                    log_widget.set_text(cx, &new_text);
                 }
                 self.redraw(cx);
                 
@@ -178,6 +258,47 @@ impl Widget for AgentSplash {
                 write_doc_field("user_response", new_response.clone());
             }
         }
+
+        // Drain the streaming channel — each delta is processed individually,
+        // just like AgentEvent::TextDelta in the aichat example.
+        if let Some(rx) = STREAMING_RX.get() {
+            if let Ok(mut rx) = rx.lock() {
+                while let Ok(delta) = rx.try_recv() {
+                    if delta != self.last_streaming_text {
+                        self.last_streaming_text = delta.clone();
+                        // Update hidden __ai_text
+                        let output_widget = self.widget(cx, &[id!(__ai_text)]);
+                        if !output_widget.is_empty() {
+                            output_widget.set_text(cx, &delta);
+                        }
+                        // Update the log widget (scroll view)
+                        let log_widget = self.widget(cx, &[id!(log)]);
+                        if !log_widget.is_empty() {
+                            let current = log_widget.text();
+                            let current = if current == " " { "" } else { current.as_str() };
+                            if let Some(last_nl) = current.rfind('\n') {
+                                let last_line = &current[last_nl + 1..];
+                                if last_line.starts_with("🤖 ") {
+                                    log_widget.set_text(cx, &format!("{}🤖 {}", &current[..last_nl + 1], delta));
+                                } else {
+                                    log_widget.set_text(cx, &format!("{}\n🤖 {}", current, delta));
+                                }
+                            } else if current.starts_with("🤖 ") || current.is_empty() {
+                                log_widget.set_text(cx, &format!("🤖 {}", delta));
+                            } else {
+                                log_widget.set_text(cx, &format!("{}\n🤖 {}", current, delta));
+                            }
+                        }
+                        self.redraw(cx);
+                    }
+                }
+            }
+        }
+
+        // Check for streaming text deltas (live sub-agent output) — CRDT fallback.
+        // Must run BEFORE sync_pi_data_to_splash so streaming text is
+        // displayed before being potentially overwritten by the final response.
+        self.sync_streaming_text(cx);
 
         // Check if pi sent new data to the splash app.
         // Runs on every event to avoid missing updates when Signal is coalesced.

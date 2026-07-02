@@ -51,6 +51,7 @@ Env vars (set by harness): `MAKEPAD_HOST_DOC_ID`, `MAKEPAD_HOST_WS_URL`, `MAKEPA
 
 TypeScript extension. Key files:
 - `tools.ts` — `launch_makepad_app`, `close_makepad_app`, `list_makepad_apps`, `check_debug_app`, `inspect_makepad_doc`, `wait_for_response`
+- `background-agent.ts` — sub-agent sessions, auto-handler, streaming delta dispatch
 - `doc-bridge.ts` — WebSocket client, event buffer
 - `harness.ts` — spawns/manages the harness binary
 - `validate-splash.ts` — splash body pre-validation
@@ -65,6 +66,8 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 {"type": "clear", "app_id": "todo-1"}
 {"type": "debug", "app_id": "todo-1", "command": "widget_snapshot", "params": "{}"}
 {"type": "send_pi_response", "app_id": "todo-1", "data": "..."}
+{"type": "send_streaming_delta", "app_id": "todo-1", "delta": "hel"}
+{"type": "send_streaming_end", "app_id": "todo-1", "final_text": "hello world"}
 {"type": "get_doc"}
 {"type": "exit"}
 ```
@@ -103,6 +106,17 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 5. AgentSplash reads `pi_response`, writes it to `__ai_text` widget (TextInput) and `__pi_data` label
 6. Splash app reads response via `ui.__ai_text.text()` or `ui.__pi_data.text()`
 
+#### Streaming Response (ai:ask → live deltas → splash)
+1. Splash calls `ui.__pi_response.set_text("ai:ask:message")` → AgentSplash writes `user_response`
+2. Harness forwards `user_response` to pi → extension auto-handler matches `ai:ask:` prefix
+3. Auto-handler subscribes to sub-agent `text_delta` events, sends each as `{"type":"send_streaming_delta","app_id":"...","delta":"..."}` over JSON WS
+4. Harness appends each delta to `streaming_text` CRDT field
+5. CRDT syncs to makepad-host → background thread detects `streaming_text` change → signals UI
+6. AgentSplash.sync_streaming_text() reads `streaming_text`, sets `__ai_text` with accumulated text
+7. On sub-agent completion, auto-handler sends `{"type":"send_streaming_end","app_id":"...","final_text":"..."}`
+8. Harness copies `streaming_text` → `pi_response`, clears `streaming_text`, sets `extension_requests = true`
+9. Final text arrives via normal `pi_response` channel → `__ai_text` gets final content, `__pi_data` updates
+
 #### Shutdown
 1. pi sends `{"type":"exit"}` or pi exits
 2. Harness sets `should_exit = true` in the doc
@@ -124,6 +138,10 @@ pub struct AgentDoc {
     pub debug_command: Option<DebugCommand>,
     pub debug_response: Option<String>,
     pub pi_response: Option<String>,       // pi sends data to splash
+    /// Accumulated streaming text from sub-agent deltas.
+    /// Appended by harness on each send_streaming_delta, read by
+    /// makepad-host for live display. Cleared when pi_response arrives.
+    pub streaming_text: Option<String>,
 }
 ```
 
@@ -321,6 +339,23 @@ send_btn := ButtonFlat{text:"Send" on_click:||{
 
 **Note:** The system prompt is seeded via conversation context (first message) because `createAgentSession` in the pi SDK does not expose a `systemPrompt` parameter directly. The first prompt sent is `[SYSTEM CONTEXT] <system_prompt>`.
 
+#### Blank-Slate Sessions (No Inherited Context)
+
+Sub-agent sessions created via `ai:init:`, `launch_app_with_agent`, `start_background_session`, or the `ai:ask:` auto-fallback DO NOT inherit the main agent's system prompt, AGENTS.md, skills, or any other context. This is enforced by `getBlankSlateResourceLoader()` in `background-agent.ts`:
+
+| Override | Effect |
+|----------|--------|
+| `noContextFiles: true` | No AGENTS.md/CLAUDE.md from cwd or agent dir |
+| `noSkills: true` | No skill prompts injected |
+| `noPromptTemplates: true` | No file-based prompt templates |
+| `noThemes: true` | No theme-driven prompts |
+| `noExtensions: true` | No extension hooks |
+| `systemPromptOverride: () => ""` | System prompt forced to empty string |
+| `agentsFilesOverride: () => ({ agentsFiles: [] })` | Explicitly empty context files |
+| `cwd / agentDir: <tmpdir>` | Isolated temp directory — no project config leaks |
+
+Result: the sub-agent has **no knowledge** it is a coding agent. It is a blank AI assistant. The splash app controls its personality entirely via `ai:init:<prompt>`. If no init is sent, the auto-fallback uses a minimal default ("You are a helpful background AI assistant. Be concise and accurate.").
+
 ### Auto-Handler (Extension Side)
 
 The extension registers an `onMessage` handler at startup (via `startAutoBackgroundHandler()` in `index.js`) that intercepts all `user_response` messages from the harness. When the response starts with `ai:`, it dispatches to `handleAutoMessage()` which supports:
@@ -333,12 +368,22 @@ The extension registers an `onMessage` handler at startup (via `startAutoBackgro
 
 If no session exists when `ai:ask:` arrives, one is auto-created with a default prompt.
 
-### Auto-Display via `__ai_text`
+### Auto-Display via `__ai_text` (with Streaming)
 
 The AgentSplash injects a `__ai_text := TextInput{height:34 width:Fill}` widget that
-auto-displays the sub-agent's response — no manual reading needed. When `pi_response`
-is written to the CRDT doc, the background sync thread signals the UI, and the
-AgentSplash calls `__ai_text.set_text(response)` automatically.
+auto-displays the sub-agent's response — no manual reading needed.
+
+**Streaming (live token-by-token):** When the auto-handler processes an `ai:ask:` message,
+it subscribes to `text_delta` events from the sub-agent session and sends each delta
+to the harness as a `send_streaming_delta` message. The harness accumulates deltas in
+a new `streaming_text` CRDT field. The makepad-host background thread detects changes
+and signals the UI, where `AgentSplash.sync_streaming_text()` live-updates `__ai_text`
+with the accumulating text. When the response completes, the final text flows through
+the existing `pi_response` channel (which also clears `streaming_text`).
+
+**Result:** the `__ai_text` widget shows text appearing token-by-token as the model
+generates, rather than waiting for the full response. The splash app can also read
+the final response via `ui.__pi_data.text()` (only updated on completion).
 
 ### Injected Widgets
 
@@ -510,7 +555,27 @@ ButtonFlat{text:"Show" on_click:||{ui.display.set_text("Current: " + toggled)}}
 
 #### 4.7.1 Struct Arrays & Array Operations
 
-The Splash VM supports arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()`. Read fields via `array[index].field`, update with `array[index] += {field: val}`:
+The Splash VM supports arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()`. Read fields via `array[index].field`, update with `array[index] += {field: val}`.
+
+**⚠️ `for i in items` iterates over VALUES, not indices.** This is a critical gotcha — `for i in items` behaves like a for-each loop, so `i` is the element value (string), not an integer index. Using `items[i]` will silently mis-index (treating a string as an index, which falls through to the first element):
+
+```splash
+// ❌ WRONG — i is the string value, not an index
+for i in items { out = out + items[i] }  // always returns items[0]
+
+// ✅ CORRECT — use while loop with explicit index
+let idx = 0
+while idx < items.len() {
+    out = out + items[idx]
+    idx = idx + 1
+}
+
+// ✅ ALSO CORRECT — direct indexing when you know the position
+items[0]  // works
+items[1]  // works
+```
+
+**Note:** `while` loops in the Splash VM are functional but can cause debug system timeouts with rapid successive clicks. After using `while` in an `on_click`, allow 10+ seconds for the debug system to recover.
 
 ```splash
 let items = [
@@ -711,10 +776,14 @@ All patterns verified end-to-end via extension tools.
 | `type_text` → click Submit | ✅ | "hello world" typed, submitted → doc: `"got:hello world"` |
 | `send_pi_response` → splash reads data | ✅ | "Data from pi agent!" appears in __pi_data and __ai_text |
 | Dynamic list via `set_text()` | ✅ | 2 items added → doc: `"1. Buy groceries\\n2. Write tests"` |
+| Array push + indexing (while loop) | ✅ | 3 pushes → items[0..2] → doc: `"Alpha, Beta, Gamma"` |
 | Coordinate shift after layout change | ✅ | Buttons shifted +19px after 2nd list item added |
 | Container padding clipping | ❌ | RoundedView{padding:16} → buttons overflow padded area → unhittable |
 | Sub-agent `ai:ask:` auto-handler (pre-created session) | ✅ | Type text → click Send → `__ai_text` shows AI response (2026-06-24) |
-| `send_pi_response` to splash via `__ai_text` | ✅ | 
+| Sub-agent via `launch_app_with_agent` (system_prompt) | ✅ | "What is 2+2?" → AI: "**2 + 2 = 4**" in `__ai_text` (2026-06-29) |
+| `send_pi_response` → splash reads `__pi_data` | ✅ | "Greetings from pi!" → label shows "Got: Greetings from pi!" |
+| Splash → Pi communication (`__pi_response.set_text`) | ✅ | Click "Send to Pi" → doc: `"hello from splash"` |
+| Two-way comms (pi→splash + splash→pi) | ✅ | Full round-trip verified in single session |
 
 ---
 
@@ -738,8 +807,15 @@ All patterns verified end-to-end via extension tools.
 | Sub-agent session dispose warning | Call `stop_background_session` when done |
 | `ai:init:` needs extension restart to pick up new code | Restart pi after recompiling `background-agent.ts` → `dist/background-agent.js` |
 | Auto-handler runs with cached extension code | Extension compiled dist is loaded at pi startup; recompiling dist only takes effect on next pi session |
-| `start_background_session` stores system_prompt as metadata but doesn't pass to model | Use `ai:init:protocol` from the splash app to set the system prompt, or use `launch_app_with_agent` tool |
-| `createAgentSession` has no `systemPrompt` parameter | System prompt must be seeded via conversation (`session.prompt("[SYSTEM CONTEXT] " + prompt)`) |
+| `createAgentSession` has no `systemPrompt` parameter | **FIXED**: Sub-agent sessions now use a blank-slate `ResourceLoader` with `noContextFiles`, `noSkills`, `noExtensions`, and `systemPromptOverride: () => ""`. The splash app's system prompt (via `ai:init:<prompt>`) is seeded as `[SYSTEM CONTEXT] <prompt>` on an otherwise empty session. See Section 3.1. |
+| `for i in items` iterates over values (not indices) in Splash VM | Use `while idx < items.len()` with `items[idx]` for correct indexing |
+| `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
+| Standalone `ScrollBars`/`ScrollBar` as child widget (historically) | **No longer reproducible** (tested 2026-07-01 on clean build). The Splash VM now handles ScrollBars gracefully — renders as zero-size when used standalone. The fix was likely in the Makepad upstream update between git revisions. The `catch_unwind` wrapper in `app.rs` (commit b965536) provides defense-in-depth against any future panics. |
+| `View{scroll_bars: ScrollBars{...}}` — scroll_bars as View PROPERTY works | ✅ The View manages scroll internally. Use: `View{width:Fill height:300 scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true scroll_bar_y: ScrollBar{drag_scrolling:true}} ...}` |
+| Streaming responses work but token batching may occur | Deltas are sent immediately from the sub-agent, but the makepad-host polls doc changes every 500ms. Rapid deltas within 500ms are batched into one UI update. Visible as small bursts of text rather than single-token updates. |
+| **Streaming not reliably working (follow-up)** | Despite channel-based delivery (mpsc from background thread → UI), deltas from DeepSeek V4 Flash via pi SDK `session.subscribe` appear to fire all at once after `prompt()` completes, not incrementally during generation. The mpsc channel infrastructure is in place and working — the bottleneck is the pi SDK's delta delivery timing. To fix: either use a provider that streams individual deltas, or add artificial delay between sends in the extension. |
+| `createAgentSession` inherits parent system prompt (historical) | **FIXED (2026-07-01)**: `getBlankSlateResourceLoader()` creates an isolated `DefaultResourceLoader` pointing at a temp directory with all context/skills/prompts/extensions disabled. The sub-agent no longer inherits the main agent's AGENTS.md, SYSTEM.md, skills, or any other context. See Section 3.1 for implementation details. |
+| Programmatic auto-scroll via `ScrollEvent` has no effect | `scroll_bars` only respond to touch/mouse gesture events, not programmatic `ScrollEvent` dispatch. Manual scrolling still works. |
 
 ### Recovery from Debug Freeze
 
