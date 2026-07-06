@@ -265,7 +265,7 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
         });
 
         await Promise.race([
-          stored.session.prompt(params.message, { expandPromptTemplates: false }),
+          stored.session.prompt(params.message, { expandPromptTemplates: false, streamingBehavior: "steer" }),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error(`Timed out after ${maxWait / 1000}s`)), maxWait),
           ),
@@ -456,7 +456,7 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
               _seedResp += event.assistantMessageEvent.delta;
             }
           });
-          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false });
+          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false, streamingBehavior: "steer" });
           _seedUnsub();
         }
 
@@ -597,7 +597,7 @@ async function initSession(appId: string, initialMessage?: string): Promise<stri
       const stored = sessions.get(sessionId);
       if (stored) stored.accumulated = "";
 
-      await session.prompt(initialMessage, { expandPromptTemplates: false });
+      await session.prompt(initialMessage, { expandPromptTemplates: false, streamingBehavior: "steer" });
 
       // Read accumulated text from the subscription
       const finalText = stored ? stored.accumulated : "";
@@ -671,7 +671,7 @@ function handleAutoMessage(data: string, appId: string): void {
               _initResp += event.assistantMessageEvent.delta;
             }
           });
-          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false });
+          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false, streamingBehavior: "steer" });
           _unsub();
         }
 
@@ -745,7 +745,7 @@ function handleAutoMessage(data: string, appId: string): void {
           }
         });
 
-        await stored.session.prompt(message, { expandPromptTemplates: false });
+        await stored.session.prompt(message, { expandPromptTemplates: false, streamingBehavior: "steer" });
 
         // Flush any remaining batch and unsubscribe
         if (batchTimer) clearTimeout(batchTimer);

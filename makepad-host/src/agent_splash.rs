@@ -149,6 +149,10 @@ impl AgentSplash {
                     }
                 }
 
+                // Try to render runsplash code during streaming.
+                // set_text has built-in error recovery: if eval_body fails, it
+                // restores the previous valid body, so failed partial parses
+                // are silently ignored and the last valid UI persists.
                 let runsplash_marker_start = "```runsplash";
                 let runsplash_marker_end = "```";
                 let mut rendered_code: Option<String> = None;
@@ -179,7 +183,6 @@ impl AgentSplash {
                         let current_body = run_splash.text();
                         if runsplash_code != current_body {
                             run_splash.set_text(cx, &runsplash_code);
-                            self.redraw(cx);
                         }
                     }
                 }

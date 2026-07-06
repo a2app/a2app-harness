@@ -519,8 +519,8 @@ No display widget needed in the splash body.
 
 ### 3.4 Inline Runsplash Rendering (Current Working Implementation)
 
-As of the latest session, runsplash code can be rendered **inline** inside the chat app
-via a nested AgentSplash widget injected into every splash body's `SPLASH_SUFFIX`.
+Runsplash code can be rendered **inline** inside the chat app via a nested AgentSplash
+widget injected into every splash body's `SPLASH_SUFFIX`.
 
 **How it works:**
 1. `SPLASH_SUFFIX` includes `__run_splash := AgentSplash{width:Fill height:Fit is_root:false}`
@@ -529,27 +529,39 @@ via a nested AgentSplash widget injected into every splash body's `SPLASH_SUFFIX
    the accumulated text and calls `run_splash.set_text(cx, &runsplash_code)`
 4. The nested AgentSplash evaluates the runsplash code and renders it **inline**
    below the chat app (preserving the chat state)
-5. Log shows "⚙ Generating..." during streaming, "✅ Done" on completion
-6. `set_text()` saves the previous body and restores it on eval failure (silently
-   keeps the last valid UI when partial code doesn't parse)
+5. `set_text()` has built-in error recovery: if `eval_body` fails, it restores the
+   previous valid body, so incomplete partial code silently keeps the last working UI
+6. Log shows "⚙ Generating..." during streaming, "✅ Done" on completion
+7. On completion, `sync_pi_data_to_splash()` also runs the runsplash code through
+   the nested AgentSplash, replacing any partial rendering with the final result
 
 **Known Problems:**
-1. **NaN crash on content growth** — When the nested AgentSplash's content grows from
-   partial (label + "0") to full (with buttons), the parent View's stale layout produces
-   NaN. The crash is in `move_align_list` (turtle.rs:2342). The `catch_unwind` approach
-   doesn't help because the NaN persists in the layout state.
+1. **AI generates incorrect naming syntax** — The AI often uses `id: disp` instead of
+   `disp := Label{...}` to name widgets. This causes buttons to render but click
+   handlers referencing `ui.disp` to silently fail. **Workaround:** Improve the system
+   prompt with explicit examples of the `:=` naming syntax.
 2. **Second prompt error** — Sending a second `ai:ask:` while the first is still
-   streaming produces "Agent is already processing". Fixed by adding
-   `streamingBehavior: "steer"` to `session.prompt()` in background-agent.js.
+   streaming. Fixed by adding `streamingBehavior: "steer"` to `session.prompt()`.
 3. **Nested children invisible in debug tools** — `widget_snapshot` and `widget_dump`
    only show the nested AgentSplash widget itself, not its rendered children (buttons,
    labels). The children are in the VM's widget tree, separate from the main tree.
-4. **Counter buttons overflow Fit height by ~4px** — The nested counter UI needs
-   ~258px but gets only 251px, clipping the bottom of the buttons.
+4. **Buttons overflow Fit height by a few pixels** — The nested counter UI needs slightly
+   more height than the parent allocates, clipping button bottoms.
+5. **AI generates invalid DSL syntax** — The AI frequently uses commas between
+   properties (`width: Fill, height: Fit`), triple curly braces, or CSS-style
+   properties. The system prompt must rigorously teach the exact `name:value` format.
 
-**Suggested fix (unproven):** Don't render partial code during streaming at all — only
-render on completion when the closing \`\`\` arrives. Use "⚙ Generating..." as a
-placeholder during streaming. This avoids the layout growth issue entirely.
+**Recommended approach for the next session:**
+1. Create a system prompt that teaches Splash DSL syntax using ONLY valid examples
+   (no explanation, just correct code)
+2. Test with a simple prompt like "counter" and check the generated code
+3. Iterate: fix the prompt for each syntax error the AI makes
+4. Common pitfalls to address:
+   - `name := Widget{}` not `id: name` for naming
+   - Property format: `width:Fill` (no spaces after colon, no commas)
+   - `on_click:||{ code }` with double pipes
+   - `let`/`fn` at the top, before widgets
+   - String concat with `+`, number to string with `"" + n`
 
 ---
 
@@ -1185,3 +1197,52 @@ This section documents approaches that were tried but did not work, to avoid rep
 - Giving the nested AgentSplash `height:Fit` doesn't fix it because Fit is computed from content, but the parent already decided the height
 
 **Hypothesis for fix (unproven):** Don't render partial code during streaming at all. Only render on completion (when the closing ``` arrives). Use a simple "⚙ Generating..." status during streaming. This avoids the layout growth issue entirely.
+
+---
+
+## 13. Next Steps: AI Splash Code Generation
+
+The inline runsplash rendering works (code is extracted, `set_text()` evaluates and renders, error recovery restores on failure). The bottleneck is teaching the AI to generate **correct Splash DSL syntax**.
+
+### Objective
+Enable the "Splash Generator" app (`splash-gen`) to produce working interactive UIs from natural language. The AI generates code inside ````runsplash` blocks, extracted and rendered inline via the nested `__run_splash` AgentSplash.
+
+### Protocol
+- User types: "a counter with + and - buttons"
+- AI responds with: ````runsplash\nlet count = 0\nRoundedView{...}\n````
+- `sync_streaming_text()` extracts the block, calls `run_splash.set_text()`
+- Nested AgentSplash renders inline, error recovery on partial code
+
+### Known AI Syntax Bugs (fix via prompt engineering)
+
+| Bug | Example (WRONG) | Correct Syntax |
+|-----|-----------------|----------------|
+| Commas between properties | `width: Fill, height: Fit` | `width:Fill height:Fit` |
+| Wrong naming syntax | `id: disp` / `name: disp` | `disp := Label{...}` |
+| Wrong click syntax | `clicked: {count++}` | `on_click:||{count+=1}` |
+| Spaces after colon | `width: Fill` | `width:Fill` |
+| CSS-style properties | `bg: #x333` / `color: #x333` | `draw_bg.color:` `draw_text.color:` |
+| Number to string | `set_text(count)` | `set_text("" + count)` |
+| Triple braces in on_click | `on_click:||{{ code }}` | `on_click:||{ code }` |
+| Missing container height | No `height:Fit` | Every container needs `height:Fit` |
+| Widgets not available | `Divider`, `ProgressBar` | `Hr{height:1}`, `Slider{is_read_only:true}` |
+
+### Prompt Engineering Strategy
+
+1. **Start minimal**: One complete working example (counter). Ask AI to adapt.
+2. **Iterate on failures**: For each syntax error, add the CORRECT pattern to the prompt. Show working code, not rules.
+3. **Test systematically**: Send "counter with +/-" and check:
+   - Does it render? (`__run_splash` height > 0 in snapshot)
+   - Are widgets named correctly? (`disp := Label{...}` not `id: disp`)
+   - Do `on_click` handlers use `||{...}` syntax?
+   - Number-to-string uses `"" + count`?
+4. **Then harder cases**: todo list, toggle, text input + button
+5. **Final goal**: AI generates ANY pattern from Section 4.7 correctly
+
+### Testing Checklist
+
+1. `widget_snapshot` — check `__run_splash` height > 0 (rendered)
+2. Read `__run_splash` body text to inspect generated code
+3. Click generated buttons (orphan coordinates from snapshot)
+4. `inspect_makepad_doc` for `user_response` from generated buttons
+5. If buttons don't respond: naming syntax (`:=` vs `id:`) is likely wrong
