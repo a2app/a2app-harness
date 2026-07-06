@@ -566,6 +566,10 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
                     // Move final text to pi_response and clear streaming
                     agent.pi_response = Some(final_text.clone());
+                    // Also set user_response so wait_for_response fires
+                    // (bridge loop checks user_response_version changes)
+                    agent.user_response = Some(final_text.clone());
+                    agent.user_response_version += 1;
                     agent.streaming_text = None;
                     agent.extension_requests = true;
                     let mut tx = doc.transaction();

@@ -36,7 +36,7 @@ pub struct AgentSplash {
 
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
 const SPLASH_SUFFIX: &str = "  __run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}
-  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
+  __ai_text := Label{text:\" \" height:0 width:Fill}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
 
 impl AgentSplash {
     fn self_id(&self) -> usize {
@@ -149,7 +149,8 @@ impl AgentSplash {
                     }
                 }
 
-                // Try to render runsplash code during streaming.
+                // Try to render runsplash code during streaming so the UI
+                // builds up progressively as the AI generates it.
                 // set_text has built-in error recovery: if eval_body fails, it
                 // restores the previous valid body, so failed partial parses
                 // are silently ignored and the last valid UI persists.
@@ -183,6 +184,11 @@ impl AgentSplash {
                         let current_body = run_splash.text();
                         if runsplash_code != current_body {
                             run_splash.set_text(cx, &runsplash_code);
+                            // Force full tree re-layout by marking root dirty.
+                            // The nested AgentSplash grows when set_text replaces
+                            // its inner View; the parent must recalculate layout
+                            // or the stale cached dimensions produce NaN.
+                            cx.widget_tree_mark_dirty(self.widget_uid());
                         }
                     }
                 }
