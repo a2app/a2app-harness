@@ -111,17 +111,41 @@ impl AgentSplash {
                     output_widget.set_text(cx, &text);
                 }
 
-                let first_runsplash = text.contains("```runsplash") && !previous.contains("```runsplash");
+                // Update log widget for all streaming (non-runsplash chat)
+                let is_runsplash = text.contains("```runsplash");
+                let first_runsplash = is_runsplash && !previous.contains("```runsplash");
                 let log_widget = self.widget(cx, &[id!(log)]);
-                if !log_widget.is_empty() && first_runsplash {
+                if !log_widget.is_empty() {
                     let current = log_widget.text();
                     let current = if current == " " { "" } else { current.as_str() };
-                    if current.is_empty() {
-                        log_widget.set_text(cx, "⚙ Generating...");
-                    } else if let Some(ai_marker) = current.rfind("\n🤖 ") {
-                        log_widget.set_text(cx, &format!("{}\n⚙ Generating...", &current[..ai_marker]));
-                    } else {
-                        log_widget.set_text(cx, &format!("{}\n⚙ Generating...", current));
+                    if first_runsplash {
+                        // First runsplash block: show generating status
+                        if current.is_empty() {
+                            log_widget.set_text(cx, "⚙ Generating...");
+                        } else if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                            log_widget.set_text(cx, &format!("{}\n⚙ Generating...", &current[..ai_marker]));
+                        } else {
+                            log_widget.set_text(cx, &format!("{}\n⚙ Generating...", current));
+                        }
+                    } else if !is_runsplash {
+                        // Normal chat: update with 🤖 prefix (replace last line)
+                        if previous.is_empty() {
+                            // First streaming delta: append a new line
+                            let new_text = if current.is_empty() {
+                                format!("🤖 {}", text)
+                            } else {
+                                format!("{}\n🤖 {}", current, text)
+                            };
+                            log_widget.set_text(cx, &new_text);
+                        } else {
+                            // Subsequent deltas: replace the last "🤖 " line
+                            if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                                let prefix = &current[..ai_marker];
+                                log_widget.set_text(cx, &format!("{}\n🤖 {}", prefix, text));
+                            } else if current.starts_with("🤖 ") {
+                                log_widget.set_text(cx, &format!("🤖 {}", text));
+                            }
+                        }
                     }
                 }
 
@@ -233,6 +257,9 @@ impl AgentSplash {
                 }
                 self.redraw(cx);
 
+                // Reset streaming tracker so the next prompt starts fresh
+                self.last_streaming_text = String::new();
+
                 if let Some(handle) = SHARED_DOC.get() {
                     handle.with_document(|doc| {
                         use autosurgeon::{hydrate, reconcile};
@@ -290,9 +317,14 @@ impl Widget for AgentSplash {
             }
         }
 
+        // Sync CRDT state on Signal events (when data changes).
+        // Also fallback on Draw events while streaming is active, since
+        // rapid CRDT writes can be coalesced into a single Signal.
         if matches!(event, Event::Signal) && self.is_root {
             self.sync_streaming_text(cx);
             self.sync_pi_data_to_splash(cx);
+        } else if !self.last_streaming_text.is_empty() && matches!(event, Event::Draw(_)) && self.is_root {
+            self.sync_streaming_text(cx);
         }
     }
 

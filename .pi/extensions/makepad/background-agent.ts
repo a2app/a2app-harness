@@ -719,7 +719,18 @@ function handleAutoMessage(data: string, appId: string): void {
         if (!stored) return;
 
         // ── Use per-prompt subscription for streaming (proven pattern) ──
+        // Batch deltas with a 50ms timer to avoid flooding the CRDT with
+        // individual writes on every text_delta event from the AI model.
         let response = "";
+        let batchAccumulated = "";
+        let batchTimer: ReturnType<typeof setTimeout> | null = null;
+        const flushBatch = () => {
+          if (batchAccumulated) {
+            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: batchAccumulated });
+            batchAccumulated = "";
+          }
+          batchTimer = null;
+        };
         const unsub = stored.session.subscribe((event: any) => {
           if (
             event.type === "message_update" &&
@@ -727,15 +738,18 @@ function handleAutoMessage(data: string, appId: string): void {
           ) {
             const delta = event.assistantMessageEvent.delta;
             response += delta;
-            sendToHarness({
-              type: "send_streaming_delta",
-              app_id: appId,
-              delta: delta,
-            });
+            batchAccumulated += delta;
+            if (!batchTimer) {
+              batchTimer = setTimeout(flushBatch, 50);
+            }
           }
         });
 
         await stored.session.prompt(message, { expandPromptTemplates: false });
+
+        // Flush any remaining batch and unsubscribe
+        if (batchTimer) clearTimeout(batchTimer);
+        if (batchAccumulated) flushBatch();
         unsub();
 
         sendToHarness({
