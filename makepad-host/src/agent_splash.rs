@@ -36,7 +36,7 @@ pub struct AgentSplash {
 
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
 const SPLASH_SUFFIX: &str = "  __run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}
-  __ai_text := Label{text:\" \" height:0 width:Fill}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
+  __pi_status := Label{text:\" \" height:Fit width:Fill}\n  __ai_text := Label{text:\" \" height:0 width:Fill}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
 
 impl AgentSplash {
     fn self_id(&self) -> usize {
@@ -111,9 +111,21 @@ impl AgentSplash {
                     output_widget.set_text(cx, &text);
                 }
 
-                // Update log widget for all streaming (non-runsplash chat)
+                // Update status: "⚙ Generating..." when first runsplash marker appears,
+                // "✅ Done" when a complete code block (with closing ```) is extracted.
                 let is_runsplash = text.contains("```runsplash");
                 let first_runsplash = is_runsplash && !previous.contains("```runsplash");
+                let has_closing_marker = text.contains("```runsplash") && text[text.find("```runsplash").unwrap() + 12..].contains("```");
+                let status_widget = self.widget(cx, &[id!(__pi_status)]);
+                if !status_widget.is_empty() {
+                    if has_closing_marker {
+                        status_widget.set_text(cx, "✅ Done");
+                    } else if first_runsplash {
+                        status_widget.set_text(cx, "⚙ Generating...");
+                    }
+                }
+
+                // Update log widget for all streaming (non-runsplash chat)
                 let log_widget = self.widget(cx, &[id!(log)]);
                 if !log_widget.is_empty() {
                     let current = log_widget.text();
@@ -229,6 +241,13 @@ impl AgentSplash {
                         if runsplash_code != current_body {
                             run_splash.set_text(cx, &runsplash_code);
                         }
+                    }
+                    // Show completion status for runsplash generation
+                    let status_widget = self.widget(cx, &[id!(__pi_status)]);
+                    if !status_widget.is_empty() {
+                        status_widget.set_text(cx, "✅ Done");
+                        cx.widget_tree_mark_dirty(self.widget_uid());
+                        self.redraw(cx);
                     }
                 }
 
