@@ -158,16 +158,15 @@ impl AgentSplash {
                         };
                         log_widget.set_text(cx, &new_text);
                     } else {
-                        // Subsequent deltas: replace the last line (which was the
-                        // previous streaming text)
-                        if let Some(last_newline) = current.rfind('\n') {
-                            let prefix = &current[..last_newline];
+                        // Subsequent deltas: find the "\n🤖 " marker (not just any newline)
+                        // to correctly handle AI text that contains internal newlines.
+                        if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                            let prefix = &current[..ai_marker];
                             log_widget.set_text(cx, &format!("{}\n🤖 {}", prefix, text));
                         } else if current.starts_with("🤖 ") {
                             log_widget.set_text(cx, &format!("🤖 {}", text));
                         }
-                        // If current doesn't start with "AI: " and has no newline,
-                        // the log doesn't have a streaming entry — skip update
+                        // If current doesn't contain "🤖 " — skip update
                     }
                 }
                 self.redraw(cx);
@@ -209,13 +208,11 @@ impl AgentSplash {
                 if !log_widget.is_empty() {
                     let current = log_widget.text();
                     let current = if current == " " { "" } else { current.as_str() };
-                    let new_text = if let Some(last_nl) = current.rfind('\n') {
-                        let last_line = &current[last_nl + 1..];
-                        if last_line.starts_with("🤖 ") {
-                            format!("{}🤖 {}\n", &current[..last_nl + 1], data)
-                        } else {
-                            format!("{}\n🤖 {}\n", current, data)
-                        }
+                    // Find the "\n🤖 " marker (not just any newline) to handle
+                    // AI text that contains internal newlines.
+                    let new_text = if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                        // AI response line exists — replace it
+                        format!("{}🤖 {}\n", &current[..ai_marker + 1], data)
                     } else if current.starts_with("🤖 ") || current.is_empty() {
                         format!("🤖 {}\n", data)
                     } else {
@@ -276,13 +273,8 @@ impl Widget for AgentSplash {
                         if !log_widget.is_empty() {
                             let current = log_widget.text();
                             let current = if current == " " { "" } else { current.as_str() };
-                            if let Some(last_nl) = current.rfind('\n') {
-                                let last_line = &current[last_nl + 1..];
-                                if last_line.starts_with("🤖 ") {
-                                    log_widget.set_text(cx, &format!("{}🤖 {}", &current[..last_nl + 1], delta));
-                                } else {
-                                    log_widget.set_text(cx, &format!("{}\n🤖 {}", current, delta));
-                                }
+                            if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                                log_widget.set_text(cx, &format!("{}🤖 {}", &current[..ai_marker + 1], delta));
                             } else if current.starts_with("🤖 ") || current.is_empty() {
                                 log_widget.set_text(cx, &format!("🤖 {}", delta));
                             } else {
@@ -295,16 +287,12 @@ impl Widget for AgentSplash {
             }
         }
 
-        // Check for streaming text deltas (live sub-agent output) — CRDT fallback.
-        // Must run BEFORE sync_pi_data_to_splash so streaming text is
-        // displayed before being potentially overwritten by the final response.
-        self.sync_streaming_text(cx);
-
-        // Check if pi sent new data to the splash app.
-        // Runs on every event to avoid missing updates when Signal is coalesced.
-        self.sync_pi_data_to_splash(cx);
-
-
+        // Only sync CRDT state on Signal events (when data actually changed)
+        // to avoid reading+hyrating the doc on every Draw/Mouse event at 60fps.
+        if matches!(event, Event::Signal) {
+            self.sync_streaming_text(cx);
+            self.sync_pi_data_to_splash(cx);
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {

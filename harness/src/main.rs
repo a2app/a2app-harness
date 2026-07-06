@@ -468,6 +468,10 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     // Clear stale state
                     agent.user_response = None;
                     agent.error_message = None;
+                    agent.pi_response = None;
+                    agent.streaming_text = None;
+                    agent.debug_command = None;
+                    agent.debug_response = None;
                     agent.pending_app = Some(shared::PendingApp {
                         id: app_id.clone(),
                         splash_body: splash_body.clone(),
@@ -539,15 +543,14 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                     let _ = fwd_tx.send(json);
                 });
             }
-            PiToHarnessMsg::SendStreamingDelta { app_id, delta } => {
-                eprintln!("[harness] pi: streaming delta to app '{app_id}': {} chars", delta.len());
-
+            PiToHarnessMsg::SendStreamingDelta { app_id: _, delta } => {
                 doc_handle.with_document(|doc| {
                     use autosurgeon::{hydrate, reconcile};
                     let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
-                    // The extension sends the full accumulated text each time
-                    // (via a 100ms timer), so we SET rather than APPEND.
-                    agent.streaming_text = Some(delta);
+                    // The extension sends individual deltas (just new chars),
+                    // so we APPEND each to the running streaming_text.
+                    let existing = agent.streaming_text.unwrap_or_default();
+                    agent.streaming_text = Some(existing + &delta);
                     agent.extension_requests = true;
                     let mut tx = doc.transaction();
                     let _ = reconcile(&mut tx, &agent);
