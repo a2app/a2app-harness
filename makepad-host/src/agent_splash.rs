@@ -24,35 +24,19 @@ pub struct AgentSplash {
     body: ArcStringMut,
     #[rust]
     render_ok: bool,
-    /// Tracks the last known text of the __pi_response label
     #[rust]
     last_response: String,
-    /// Tracks the last known text of the __pi_data label (data from pi)
     #[rust]
     last_pi_data: String,
-    /// Tracks the last known streaming_text for live update display
     #[rust]
     last_streaming_text: String,
+    #[live(true)]
+    is_root: bool,
 }
 
-// The splash body is wrapped in: <PREFIX><body><SUFFIX>
-// The parser auto-closes the outer View.
-// __pi_response is a hidden label that splash apps can set text on
-// to send a response back to the pi extension.
-// __pi_data is a hidden label that receives data from the pi extension
-// via the shared CRDT doc's pi_response field.
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
-const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
-const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
-    width: Fill height: Fit
-    flow: Down spacing: 8
-    padding: 12
-    new_batch: true
-    draw_bg.color: #x2a1f24
-    draw_bg.border_radius: 8.0
-    Label{text: \"Splash app could not be rendered\" draw_text.color: #fff draw_text.text_style.font_size: 13}
-    Label{text: \"The generated Splash body was rejected by Makepad.\" draw_text.color: #e3c8ce draw_text.text_style.font_size: 10}
-}"#;
+const SPLASH_SUFFIX: &str = "  __run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}
+  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
 
 impl AgentSplash {
     fn self_id(&self) -> usize {
@@ -62,9 +46,6 @@ impl AgentSplash {
     fn render_body(&mut self, cx: &mut Cx, body: &str) -> bool {
         let self_id = self.self_id();
         let widget_uid = self.widget_uid();
-        // Wrap body with prefix + suffix
-        // __pi_response is a hidden label the splash body can set via ui.__pi_response.set_text("...")
-        // to send responses back to the pi extension.
         let code = format!("{}{}{}", SPLASH_PREFIX, body, SPLASH_SUFFIX);
         let script_mod = ScriptMod {
             cargo_manifest_path: String::new(),
@@ -78,7 +59,6 @@ impl AgentSplash {
 
         cx.with_vm(|vm| {
             let value = vm.eval_with_append_source(script_mod, &code, NIL.into());
-            // Makepad's parser is lenient; check both error flags and result type
             if value.is_err() || value.is_nil() || !value.is_object() {
                 return false;
             }
@@ -91,7 +71,6 @@ impl AgentSplash {
     fn eval_body(&mut self, cx: &mut Cx) -> bool {
         let body = self.body.as_ref().to_string();
         if body.is_empty() {
-            // Render an empty View to clear the splash area
             let code = "use mod.prelude.widgets.*View{width:Fill height:Fit}".to_string();
             let script_mod = ScriptMod {
                 cargo_manifest_path: String::new(),
@@ -110,19 +89,9 @@ impl AgentSplash {
             });
             return true;
         }
-
-        if self.render_body(cx, &body) {
-            true
-        } else {
-            let _ = self.render_body(cx, SPLASH_ERROR_FALLBACK);
-            false
-        }
+        self.render_body(cx, &body)
     }
 
-
-    /// Read streaming_text from the shared doc and live-update __ai_text.
-    /// Also updates the splash body's `log` widget so the scroll view shows
-    /// streaming progress in-place.
     fn sync_streaming_text(&mut self, cx: &mut Cx) {
         let incoming = SHARED_DOC.get().and_then(|handle| {
             handle.with_document(|doc| {
@@ -136,49 +105,65 @@ impl AgentSplash {
             if text != self.last_streaming_text {
                 let previous = self.last_streaming_text.clone();
                 self.last_streaming_text = text.clone();
-                
-                // Update hidden __ai_text
+
                 let output_widget = self.widget(cx, &[id!(__ai_text)]);
                 if !output_widget.is_empty() {
                     output_widget.set_text(cx, &text);
                 }
-                
-                // Update the log widget: replace previous streaming line (if any)
-                // with the new accumulated streaming text.
+
+                let first_runsplash = text.contains("```runsplash") && !previous.contains("```runsplash");
                 let log_widget = self.widget(cx, &[id!(log)]);
-                if !log_widget.is_empty() {
+                if !log_widget.is_empty() && first_runsplash {
                     let current = log_widget.text();
                     let current = if current == " " { "" } else { current.as_str() };
-                    if previous.is_empty() {
-                        // First streaming delta: append a new line
-                        let new_text = if current.is_empty() {
-                            format!("🤖 {}", text)
-                        } else {
-                            format!("{}\n🤖 {}", current, text)
-                        };
-                        log_widget.set_text(cx, &new_text);
+                    if current.is_empty() {
+                        log_widget.set_text(cx, "⚙ Generating...");
+                    } else if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                        log_widget.set_text(cx, &format!("{}\n⚙ Generating...", &current[..ai_marker]));
                     } else {
-                        // Subsequent deltas: find the "\n🤖 " marker (not just any newline)
-                        // to correctly handle AI text that contains internal newlines.
-                        if let Some(ai_marker) = current.rfind("\n🤖 ") {
-                            let prefix = &current[..ai_marker];
-                            log_widget.set_text(cx, &format!("{}\n🤖 {}", prefix, text));
-                        } else if current.starts_with("🤖 ") {
-                            log_widget.set_text(cx, &format!("🤖 {}", text));
-                        }
-                        // If current doesn't contain "🤖 " — skip update
+                        log_widget.set_text(cx, &format!("{}\n⚙ Generating...", current));
                     }
                 }
-                self.redraw(cx);
+
+                let runsplash_marker_start = "```runsplash";
+                let runsplash_marker_end = "```";
+                let mut rendered_code: Option<String> = None;
+                let mut search_start = 0;
+                while let Some(block_start) = text[search_start..].find(runsplash_marker_start) {
+                    let abs_start = search_start + block_start + runsplash_marker_start.len();
+                    if let Some(block_end) = text[abs_start..].find(runsplash_marker_end) {
+                        let extracted = text[abs_start..abs_start + block_end].trim();
+                        if !extracted.is_empty() {
+                            rendered_code = Some(extracted.to_string());
+                        }
+                        search_start = abs_start + block_end + runsplash_marker_end.len();
+                    } else {
+                        let rest = &text[abs_start..];
+                        if rest.len() > 20 {
+                            let extracted = rest.trim();
+                            if !extracted.is_empty() {
+                                rendered_code = Some(extracted.to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if let Some(runsplash_code) = rendered_code {
+                    let run_splash = self.widget(cx, &[id!(__run_splash)]);
+                    if !run_splash.is_empty() {
+                        let current_body = run_splash.text();
+                        if runsplash_code != current_body {
+                            run_splash.set_text(cx, &runsplash_code);
+                            self.redraw(cx);
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// Read pi_response from the shared doc and set it on the __pi_data label.
-    /// Also appends to the splash body's `log` widget so the scroll view
-    /// auto-updates without requiring a user click.
     fn sync_pi_data_to_splash(&mut self, cx: &mut Cx) {
-        // Step 1: Read pi_response from doc (outside any widget operations)
         let incoming = SHARED_DOC.get().and_then(|handle| {
             handle.with_document(|doc| {
                 use autosurgeon::hydrate;
@@ -187,42 +172,67 @@ impl AgentSplash {
             })
         });
 
-        // Step 2: Update widget if we have new data
         if let Some(data) = incoming {
             if !data.is_empty() && data != self.last_pi_data {
                 self.last_pi_data = data.clone();
+
+                let runsplash_marker_start = "```runsplash";
+                let runsplash_marker_end = "```";
+                let mut last_extracted: Option<String> = None;
+                if let Some(start) = data.find(runsplash_marker_start) {
+                    let code_start = start + runsplash_marker_start.len();
+                    if let Some(end) = data[code_start..].find(runsplash_marker_end) {
+                        let extracted = data[code_start..code_start + end].trim();
+                        if !extracted.is_empty() {
+                            last_extracted = Some(extracted.to_string());
+                        }
+                    }
+                }
+
+                if let Some(runsplash_code) = last_extracted {
+                    let run_splash = self.widget(cx, &[id!(__run_splash)]);
+                    if !run_splash.is_empty() {
+                        let current_body = run_splash.text();
+                        if runsplash_code != current_body {
+                            run_splash.set_text(cx, &runsplash_code);
+                        }
+                    }
+                }
+
                 let data_widget = self.widget(cx, &[id!(__pi_data)]);
                 if !data_widget.is_empty() {
                     data_widget.set_text(cx, &data);
                 }
-                // Also update the visible __ai_text widget so response auto-displays
-                // TextInput uses set_text which triggers re-layout
                 let output_widget = self.widget(cx, &[id!(__ai_text)]);
                 if !output_widget.is_empty() {
                     output_widget.set_text(cx, &data);
                 }
-                // Append to the splash body's `log` widget (if it exists).
-                // If a streaming line already exists (from sync_streaming_text),
-                // replace it instead of appending a duplicate.
                 let log_widget = self.widget(cx, &[id!(log)]);
                 if !log_widget.is_empty() {
                     let current = log_widget.text();
                     let current = if current == " " { "" } else { current.as_str() };
-                    // Find the "\n🤖 " marker (not just any newline) to handle
-                    // AI text that contains internal newlines.
-                    let new_text = if let Some(ai_marker) = current.rfind("\n🤖 ") {
-                        // AI response line exists — replace it
-                        format!("{}🤖 {}\n", &current[..ai_marker + 1], data)
-                    } else if current.starts_with("🤖 ") || current.is_empty() {
-                        format!("🤖 {}\n", data)
+                    if current.contains("⚙") {
+                        let new_text = if let Some(ai_marker) = current.rfind("\n⚙ ") {
+                            format!("{}\n✅ Done", &current[..ai_marker])
+                        } else if current.starts_with("⚙") || current.is_empty() {
+                            "✅ Done".to_string()
+                        } else {
+                            format!("{}\n✅ Done", current)
+                        };
+                        log_widget.set_text(cx, &new_text);
                     } else {
-                        format!("{}\n🤖 {}\n", current, data)
-                    };
-                    log_widget.set_text(cx, &new_text);
+                        let new_text = if let Some(ai_marker) = current.rfind("\n🤖 ") {
+                            format!("{}🤖 {}\n", &current[..ai_marker + 1], data)
+                        } else if current.starts_with("🤖 ") || current.is_empty() {
+                            format!("🤖 {}\n", data)
+                        } else {
+                            format!("{}\n🤖 {}\n", current, data)
+                        };
+                        log_widget.set_text(cx, &new_text);
+                    }
                 }
                 self.redraw(cx);
-                
-                // Step 3: Clear the doc field (separate call, no nesting)
+
                 if let Some(handle) = SHARED_DOC.get() {
                     handle.with_document(|doc| {
                         use autosurgeon::{hydrate, reconcile};
@@ -242,10 +252,7 @@ impl Widget for AgentSplash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
         self.redraw(cx);
-        
-        // After each event, check if the splash body updated __pi_response.
-        // Splash apps call ui.__pi_response.set_text("data") to send
-        // data back to the pi extension.
+
         let response_widget = self.widget(cx, &[id!(__pi_response)]);
         if !response_widget.is_empty() {
             let current = response_widget.text();
@@ -256,21 +263,17 @@ impl Widget for AgentSplash {
             }
         }
 
-        // Drain the streaming channel — each delta is processed individually,
-        // just like AgentEvent::TextDelta in the aichat example.
         if let Some(rx) = STREAMING_RX.get() {
             if let Ok(mut rx) = rx.lock() {
                 while let Ok(delta) = rx.try_recv() {
                     if delta != self.last_streaming_text {
                         self.last_streaming_text = delta.clone();
-                        // Update hidden __ai_text
                         let output_widget = self.widget(cx, &[id!(__ai_text)]);
                         if !output_widget.is_empty() {
                             output_widget.set_text(cx, &delta);
                         }
-                        // Update the log widget (scroll view)
                         let log_widget = self.widget(cx, &[id!(log)]);
-                        if !log_widget.is_empty() {
+                        if !log_widget.is_empty() && !delta.contains("```runsplash") {
                             let current = log_widget.text();
                             let current = if current == " " { "" } else { current.as_str() };
                             if let Some(ai_marker) = current.rfind("\n🤖 ") {
@@ -287,9 +290,7 @@ impl Widget for AgentSplash {
             }
         }
 
-        // Only sync CRDT state on Signal events (when data actually changed)
-        // to avoid reading+hyrating the doc on every Draw/Mouse event at 60fps.
-        if matches!(event, Event::Signal) {
+        if matches!(event, Event::Signal) && self.is_root {
             self.sync_streaming_text(cx);
             self.sync_pi_data_to_splash(cx);
         }
@@ -305,13 +306,16 @@ impl Widget for AgentSplash {
 
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         if self.body.as_ref() != v {
+            let prev_body = self.body.as_ref().to_string();
             self.body.set(v);
-            self.last_response = String::new(); // reset response tracker
+            self.last_response = String::new();
             self.last_pi_data = String::new();
             if !v.is_empty() {
                 self.render_ok = self.eval_body(cx);
                 if !self.render_ok {
-                    report_error("Splash body could not be rendered");
+                    self.body.set(&prev_body);
+                    self.eval_body(cx);
+                    self.render_ok = true;
                 }
             } else {
                 self.render_ok = self.eval_body(cx);
@@ -321,7 +325,6 @@ impl Widget for AgentSplash {
     }
 }
 
-/// Write a field on the shared AgentDoc.
 fn write_doc_field(field: &str, value: String) {
     if let Some(handle) = SHARED_DOC.get() {
         handle.with_document(|doc| {
@@ -343,26 +346,15 @@ fn write_doc_field(field: &str, value: String) {
     }
 }
 
-/// Report an error to the pi extension by writing to the doc's `error_message` field.
-fn report_error(message: &str) {
-    write_doc_field("error_message", message.to_string());
-    // error logged
-}
-
 #[allow(dead_code)]
 impl AgentSplashRef {
-    /// Returns true if the body was rendered successfully, false otherwise.
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
         }
     }
 
-    /// Bridge for splash apps to send a response back to the pi extension.
-    /// Writes the response into the shared CRDT document's `user_response` field,
-    /// which the harness sees via CRDT sync and forwards to pi over JSON WS.
     pub fn send_response(&self, _cx: &mut Cx, data: &str) {
         write_doc_field("user_response", data.to_string());
-        // response sent
     }
 }

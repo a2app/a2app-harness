@@ -517,6 +517,40 @@ ButtonFlat{text:"Send" on_click:||{
 The response auto-appears in the `__ai_text` TextInput at the bottom of the layout.
 No display widget needed in the splash body.
 
+### 3.4 Inline Runsplash Rendering (Current Working Implementation)
+
+As of the latest session, runsplash code can be rendered **inline** inside the chat app
+via a nested AgentSplash widget injected into every splash body's `SPLASH_SUFFIX`.
+
+**How it works:**
+1. `SPLASH_SUFFIX` includes `__run_splash := AgentSplash{width:Fill height:Fit is_root:false}`
+2. The nested AgentSplash has `is_root:false`, so it does NOT sync from the CRDT doc
+3. During streaming, `sync_streaming_text()` extracts `\`\`\`runsplash` blocks from
+   the accumulated text and calls `run_splash.set_text(cx, &runsplash_code)`
+4. The nested AgentSplash evaluates the runsplash code and renders it **inline**
+   below the chat app (preserving the chat state)
+5. Log shows "⚙ Generating..." during streaming, "✅ Done" on completion
+6. `set_text()` saves the previous body and restores it on eval failure (silently
+   keeps the last valid UI when partial code doesn't parse)
+
+**Known Problems:**
+1. **NaN crash on content growth** — When the nested AgentSplash's content grows from
+   partial (label + "0") to full (with buttons), the parent View's stale layout produces
+   NaN. The crash is in `move_align_list` (turtle.rs:2342). The `catch_unwind` approach
+   doesn't help because the NaN persists in the layout state.
+2. **Second prompt error** — Sending a second `ai:ask:` while the first is still
+   streaming produces "Agent is already processing". Fixed by adding
+   `streamingBehavior: "steer"` to `session.prompt()` in background-agent.js.
+3. **Nested children invisible in debug tools** — `widget_snapshot` and `widget_dump`
+   only show the nested AgentSplash widget itself, not its rendered children (buttons,
+   labels). The children are in the VM's widget tree, separate from the main tree.
+4. **Counter buttons overflow Fit height by ~4px** — The nested counter UI needs
+   ~258px but gets only 251px, clipping the bottom of the buttons.
+
+**Suggested fix (unproven):** Don't render partial code during streaming at all — only
+render on completion when the closing \`\`\` arrives. Use "⚙ Generating..." as a
+placeholder during streaming. This avoids the layout growth issue entirely.
+
 ---
 
 ## 4. Splash DSL Guide (General Reference)
@@ -1054,3 +1088,100 @@ This gives the outer View a resolved width from the parent (the `splash_holder` 
 -const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
 +const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
 ```
+
+---
+
+## 12. Lessons Learned (2026-07-06 Session)
+
+This section documents approaches that were tried but did not work, to avoid repeating the same dead ends.
+
+### 12.1 Nested AgentSplash causes NaN layout crashes
+
+**Attempted:** Adding `__run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}` to SPLASH_SUFFIX so that runsplash code could be rendered inline via a nested AgentSplash, preserving the chat app body.
+
+**Result: FAILED** — consistently produces `assertion failed: !dy.is_nan()` in `turtle.rs:2342` (`move_align_list`). The crash happens during `draw_walk` (rendering), not during `set_text` (evaluation). The nested AgentSplash's `width:Fill` creates a circular layout dependency with the parent View's `height:Fit`, and when the nested content grows after `set_text`, the parent's stale layout produces NaN.
+
+**`catch_unwind` around `draw_walk` does NOT fix it:** The NaN value persists in the turtle/layout state even after the panic is caught. The next draw cycle in the parent View (KeyboardView) encounters the same NaN and crashes again.
+
+### 12.2 Partial runsplash code evaluation during streaming is unreliable
+
+**Attempted:** Extracting runsplash code from the accumulated streaming text BEFORE the closing ``` arrives, and trying to evaluate the partial code progressively.
+
+**Result: FAILED** — Partial Splash code almost never parses because the DSL requires complete syntax (balanced braces, complete property names, etc.). The only time it works is when the code inside the block happens to be syntactically complete before the closing ``` (e.g., when the AI finishes the closing `}` before writing the closing ```). Most of the time, eval fails and the body is restored to the previous state.
+
+**Practical limit:** The "Generating..." status message in the log is about as much feedback as you can show during streaming. The rendered UI only reliably appears when the complete `\`\`\`` closing marker arrives.
+
+### 12.3 Inline rendering via body replacement loses chat state
+
+**Attempted:** When runsplash code is detected in `sync_pi_data_to_splash`, calling `self.set_text(cx, &runsplash_code)` to replace the entire splash body.
+
+**Result: Works but destructive** — The chat app is replaced entirely. All `let` variables (messages array, counters) are lost because the Splash VM re-evaluates from scratch. The user can see the rendered UI but the chat context is gone.
+
+### 12.4 Version counters add complexity without clear win
+
+**Attempted:** Adding `pi_response_version` and `streaming_text_version` fields to `AgentDoc` to avoid full-doc hydration on every frame. The sync functions first read just the version counter (cheap), and only do full `hydrate` if the version changed.
+
+**Result: NOT RECOMMENDED** — The performance improvement was marginal (the `hydrate` call was already fast enough). The version counters added complexity to the `shared::AgentDoc` struct, required changes in the harness, and introduced new failure modes (version mismatches, forgotten increments). The original approach of reading and hydrating the full doc on each Signal is simpler and more reliable.
+
+### 12.5 AI system prompt must be short
+
+**Attempted:** Including the entire Splash DSL reference guide (all widgets, properties, examples) in the system prompt.
+
+**Result: Counterproductive** — Long prompts overwhelm the model and produce worse results (missing buttons, wrong syntax). A short prompt with exactly one working counter example consistently produces better code.
+
+### 12.6 `streamingBehavior: 'steer'` fixes second-prompt error
+
+**Attempted:** Sending a second `ai:ask:` message while the first was still streaming produced `"Agent is already processing"` error.
+
+**Result: WORKED** — Adding `streamingBehavior: "steer"` to the `session.prompt()` call in `background-agent.js` correctly cancels the in-progress generation and starts fresh with the new message. No crash, no error.
+
+### 12.7 `wait_for_response` hang fix
+
+**Attempted:** `wait_for_response` never fired for `ai:ask:` responses because the auto-handler only set `pi_response`, not `user_response`.
+
+**Result: WORKED** — Adding `agent.user_response = Some(final_text)` + `agent.user_response_version += 1` to the `SendStreamingEnd` handler in the harness causes the bridge loop to forward the response to the extension, which triggers `wait_for_response`.
+
+### 12.8 Error fallback should not be shown inline
+
+**Attempted:** When `eval_body` fails (e.g., partial code during streaming), rendering `SPLASH_ERROR_FALLBACK` (dark red box with "Splash app could not be rendered") inside the nested AgentSplash.
+
+**Result: BAD UX** — The error fallback covers up any partially-rendered content and looks broken. Better to silently restore the previous valid body (as `set_text` now does by saving `prev_body` and re-evaluating it on failure).
+
+### 12.9 `draw_walk` must not panic
+
+**Attempted:** Letting the nested AgentSplash's `draw_walk` panic propagate up to `catch_unwind` in the host's `handle_event`.
+
+**Result: NOT ENOUGH** — The approach of wrapping individual widget `draw_walk` calls with `catch_unwind` does NOT prevent subsequent crashes because the NaN state persists in Makepad's turtle/layout system. The parent View encounters the same NaN on the next draw cycle. The only reliable fix is to prevent NaN from entering the layout in the first place (avoid `width:Fill` / `height:Fill` combinations that create circular dependencies).
+
+### 12.10 NaN crash persists even with SPLASH_PREFIX `width:Fill` fix
+
+**Attempted:** The `dy.is_nan()` crash in `move_align_list` (turtle.rs:2342) keeps happening on every draw event even after adding `width:Fill` to SPLASH_PREFIX. The crash is 100% reproducible with any app that uses the SPLASH_SUFFIX widgets (`__ai_text`, `__pi_response`, `__pi_data`).
+
+**Root cause not found** — The crash might be from the `__ai_text := TextInput{text:" " height:0 width:Fill visible:false}` widget. A TextInput with `height:0` and `width:Fill` inside a `height:Fit flow:Down` parent View might create a layout conflict. The text " " (space) has font height > 0, conflicting with `height:0`.
+
+**Clean rebuild sometimes fixes it** — Running `cargo clean && cargo build` resolved the crash for one session, suggesting stale incremental build artifacts can cause the NaN.
+
+### 12.11 `set_text` body restoration prevents error display
+
+**Attempted:** When `eval_body` fails (partial/incomplete Splash code), the original code rendered `SPLASH_ERROR_FALLBACK` (dark red box). Changed `set_text` to save `prev_body` before eval and restore on failure.
+
+**Result: WORKS** — The previous valid body is re-evaluated and displayed on eval failure. No more red error boxes. The user only sees the last working UI, with partial/failed states silently skipped.
+
+### 12.12 `eval_body` must not render error fallback
+
+**Attempted:** `eval_body` called `render_body(cx, SPLASH_ERROR_FALLBACK)` on failure, which rendered a dark red error box over the entire splash area.
+
+**Result: Changed to just return false** — The caller (`set_text`) handles restoration. The error fallback constant is now dead code.
+
+### 12.13 Partial inline render succeeds, full render crashes with NaN
+
+**Observed behavior:** During streaming, the inline `__run_splash` AgentSplash successfully renders partial code (e.g., just the counter label and "0" display). But when the next streaming delta adds more content (buttons, layout), the re-evaluation triggers a NaN crash in `move_align_list`.
+
+**Root cause:** The nested AgentSplash starts with empty content (0 height). Partial code evaluates successfully and renders at the computed height. The parent View's layout is computed with this height. When `set_text` is called again with more complete code (taller content), the nested AgentSplash grows, but the parent View's layout is stale. This creates a circular dependency: the nested widget needs more space than allocated, producing NaN.
+
+**Failed workarounds:**
+- `catch_unwind` around `set_text` doesn't help because the NaN happens in the subsequent `draw_walk`, not in `set_text`
+- `self.redraw(cx)` after `set_text` doesn't trigger a full re-layout — the parent View reuses its cached child positions
+- Giving the nested AgentSplash `height:Fit` doesn't fix it because Fit is computed from content, but the parent already decided the height
+
+**Hypothesis for fix (unproven):** Don't render partial code during streaming at all. Only render on completion (when the closing ``` arrives). Use a simple "⚙ Generating..." status during streaming. This avoids the layout growth issue entirely.
