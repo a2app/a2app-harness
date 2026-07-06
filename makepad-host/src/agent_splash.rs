@@ -41,7 +41,7 @@ pub struct AgentSplash {
 // to send a response back to the pi extension.
 // __pi_data is a hidden label that receives data from the pi extension
 // via the shared CRDT doc's pi_response field.
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
 const SPLASH_SUFFIX: &str = "  __ai_text := TextInput{text:\" \" height:0 width:Fill visible:false}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
 const SPLASH_ERROR_FALLBACK: &str = r#"RoundedView{
     width: Fill height: Fit
