@@ -1246,3 +1246,232 @@ Enable the "Splash Generator" app (`splash-gen`) to produce working interactive 
 3. Click generated buttons (orphan coordinates from snapshot)
 4. `inspect_makepad_doc` for `user_response` from generated buttons
 5. If buttons don't respond: naming syntax (`:=` vs `id:`) is likely wrong
+
+---
+
+## 14. Crash Reference & Deep Diagnosis
+
+### Crash 1: `dy.is_nan()` in `move_align_list` (turtle.rs:2342)
+
+**Symptom:**
+```
+assertion failed: !dy.is_nan() at draw/src/turtle.rs:2342:9
+```
+Stack: `draw_bg.end()` -> `end_turtle` -> `end_turtle_with_guard` -> `move_align_list(dy=NaN)`
+
+**Trigger:** Splash body with `padding:` on the root RoundedView AND buttons wrapped inside `View{flow:Right ...}`.
+
+---
+
+#### NaN Propagation Chain (line-by-line)
+
+**1. `end_turtle_with_guard` (turtle.rs:1630):**
+```rust
+let dy = turtle.total_resolved_length_to(finished_walk.deferred_before_count);
+self.move_align_list(align_list_start, align_list_end, dx, dy, false);
+```
+The `dy` passed to `move_align_list` is NaN.
+
+**2. `total_resolved_length_to` (turtle.rs:1159):**
+```rust
+fn total_resolved_length_to(&self, index: usize) -> f64 {
+    self.resolved_fills[..index].iter().sum()
+}
+```
+Sums resolved fill lengths. If any fill is NaN, the sum is NaN.
+
+**3. `resolve_fill` (turtle.rs:1199):**
+```rust
+let unresolved_length = self.unresolved_length_from(count);
+let length = unresolved_length * deferred_fill.weight / total_deferred_weight;
+```
+If `unresolved_length` is NaN, `length` becomes NaN regardless of weight.
+
+**4. `unresolved_length_from` (turtle.rs:1172):**
+```rust
+fn unresolved_length_from(&self, index: usize) -> f64 {
+    self.inner_unused_length() - self.total_resolved_length_to(index)
+}
+```
+Calls `inner_unused_length()`.
+
+**5. `inner_unused_length` (turtle.rs:1162):**
+```rust
+fn inner_unused_length(&self) -> f64 {
+    match self.layout.flow {
+        Flow::Right { wrap: false, .. } => self.unused_inner_width(),
+        Flow::Down => self.unused_inner_height(),
+        _ => panic!(),
+    }
+}
+```
+For the View{flow:Right} child (which has Flow::Right), this calls `unused_inner_width()`.
+
+**6. `unused_inner_width` (turtle.rs:732):**
+```rust
+pub fn unused_inner_width(&self) -> f64 {
+    self.inner_width() - self.inner_used_width().min(self.inner_width())
+}
+```
+If `inner_width()` is NaN (unresolved width for a shrink-to-fit container), then `NaN - anything.min(NaN)` = NaN.
+
+---
+
+#### Why `padding:` triggers it
+
+The `RoundedView{flow:Down height:Fit padding:16}` reduces the inner content width by 32px. The `View{flow:Right}` child inside it inherits this narrowed width. During the `View{flow:Right}`'s layout:
+
+1. The flow:Right turtle's `inner_width()` is set to the padded width (parent_width - 32)
+2. But the View itself is still sizing — its own height:Fit means height is NaN during width resolution
+3. Children (buttons) inside flow:Right have fixed widths (e.g., `width: 88`), not Fill
+4. Because no child uses `width:Fill`, `total_deferred_weight` is 0 in `resolve_fill`
+5. `0 / 0 = NaN` — the weight division produces NaN regardless of `unresolved_length`
+6. This NaN fill is pushed to `resolved_fills` and propagated through the sum
+
+Without `padding:16`, the outer RoundedView's inner width equals the full container width, the flow:Right View resolves its layout differently (the circular dependency doesn't trigger because width is known), and `end_turtle_with_guard` completes before the NaN can enter the fill resolution.
+
+**Why direct children (no View wrapper) fix it:** With `flow:Down` and buttons as direct orphans, there is NO nested `flow:Right` layout at all. Each button is laid out sequentially with fixed height. The parent height resolves deterministically as the sum of fixed-height children. No Fill resolution, no deferred weights, no division, no NaN.
+
+---
+
+#### `debug_assert` vs release builds
+
+The crash is a `debug_assert!(!dy.is_nan())` (turtle.rs:2342). This only fires in debug builds. In release builds, the NaN silently propagates through the rendering pipeline, potentially producing garbled output or GPU errors.
+
+**`catch_unwind` does NOT fix it:** Even if `catch_unwind` catches the panic, the NaN value persists in Makepad's layout state (the turtle's `resolved_fills` list). Every subsequent Draw event re-encounters the same NaN and crashes again.
+
+---
+
+### Crash 2: Null pointer in `first_rect_for_character_range` (macos_delegates.rs:738)
+
+**Symptom:**
+```
+null pointer dereference at macos_delegates.rs:738:37
+thread 'main' panicked with `panic_nounwind_fmt`
+```
+Stack (key frames):
+```
+ 4: first_rect_for_character_range (macos_delegates.rs:738)
+    let clearance = cw.ime_rect.size.y * 0.6;  // crash here
+...
+22: do_callback (macos_app.rs:687)
+23: do_callback (macos_window.rs:659)
+24: send_window_closed_event (macos_window.rs:844)
+25: window_will_close (macos_delegates.rs:181)
+```
+
+---
+
+#### The dangling pointer chain (line-by-line)
+
+**View initialization (macos_delegates.rs:438):**
+```rust
+extern "C" fn init_with_ptr(this: &Object, _sel: Sel, cx: *mut c_void) -> ObjcId {
+    (*this).set_ivar("macos_window_ptr", cx);  // cx = raw &MacosWindow
+```
+When the NSView is created, a raw pointer to the `MacosWindow` Rust struct is stored in the view's `macos_window_ptr` ivar. This pointer is NEVER cleared or updated.
+
+**The getter (macos_window.rs:937):**
+```rust
+pub fn get_cocoa_window(this: &Object) -> &mut MacosWindow {
+    let ptr: *mut c_void = *this.get_ivar("macos_window_ptr");
+    &mut *(ptr as *mut MacosWindow)  // dangling pointer -> UB
+}
+```
+Zero null-checking. If `macos_window_ptr` points to freed memory, this is undefined behavior.
+
+**The crash site (macos_delegates.rs:700-738):**
+```rust
+let cw = get_cocoa_window(this);   // line 700: gets dangling ref
+let view: ObjcId = this as *const _ as *mut _;
+let view_rect: NSRect = msg_send![view, frame];  // line 702: accesses view (ok, not cw)
+// ... several msg_send! calls that don't touch cw ...
+let clearance = cw.ime_rect.size.y * 0.6;  // line 738: FIRST access to cw -> crash
+```
+The crash is at line 738 because that's the FIRST time `cw` (the dangling `&MacosWindow`) is actually dereferenced. The `msg_send!` calls above use `view` (the ObjC NSView), not `cw`.
+
+---
+
+#### Why the pointer becomes dangling
+
+1. User clicks red close button on the Makepad Host window
+2. Cocoa calls `windowWillClose:` on the window delegate
+3. `send_window_closed_event(&mut self)` is called (macos_window.rs:844), where `self` is the `MacosWindow`
+4. This calls `do_callback`, which processes the `WindowClosed` event through the Makepad event loop
+5. **After** `windowWillClose:` returns (or during a nested runloop), the MacosWindow is deallocated by the Rust Drop implementation
+6. But the NSView's `macos_window_ptr` ivar still points to the now-freed memory
+7. During the window close sequence, the `__ai_text` widget (injected TextInput) loses focus
+8. The macOS IME system queries `firstRectForCharacterRange:` on the view to determine where to place the IME candidate window
+9. `get_cocoa_window(this)` reads the dangling `macos_window_ptr` and returns a reference to freed memory
+10. `cw.ime_rect.size.y` dereferences freed memory -> Rust compiler's UB null-check -> `panic_nounwind`
+
+**Key insight:** The `macos_window_ptr` ivar is set once at view creation and NEVER cleared when the MacosWindow is dropped. After drop, it's a classic use-after-free dangling pointer.
+
+---
+
+#### Why `panic_nounwind` can't be caught
+
+`panic_nounwind_fmt` is a special panic path the Rust compiler uses when it detects undefined behavior (null pointer dereference, out-of-bounds access) in contexts where unwinding is not allowed. Unlike a normal `panic!()` which can be caught with `catch_unwind`:
+
+- `panic_nounwind` calls `core::intrinsics::abort()` internally
+- `catch_unwind` has empty unwind tables for nounwind functions
+- The panic skips all cleanup and terminates the process immediately
+
+This crash is **uncatchable by design** — the compiler determined the code is in a state where recovery is unsafe.
+
+---
+
+#### Why `exit(0)` before event processing fixes it
+
+```rust
+// app.rs handle_event
+if matches!(event, Event::WindowClosed(_)) {
+    std::process::exit(0);  // exit BEFORE self.ui.handle_event()
+}
+```
+
+By calling `exit(0)` at the VERY TOP of `handle_event` for `WindowClosed` events:
+1. `self.ui.handle_event()` is NEVER called — the widget tree is never touched
+2. No TextInput loses focus — the IME system is never triggered
+3. No ObjC message dispatch to the NSView for IME queries
+4. `firstRectForCharacterRange:` is never called
+5. The process terminates before the dangling pointer can be dereferenced
+
+This is a pre-emptive kill rather than a recovery — we exit before the crash can happen.
+
+---
+
+### Triage flow for both crashes
+
+1. Tool times out or returns stale data -> host is likely dead
+2. Validate with `ps aux | grep makepad-host` or `inspect_makepad_doc` for `panic_backtrace`
+3. Harness detects host death via `child.try_wait()` in bridge loop -> sends `{"type":"host_died"}` to extension
+4. Extension calls `disposeAllSessions()` to clean up background agent sessions
+5. Extension updates status to "Makepad: host crashed"
+6. Check `panic_backtrace` in doc to determine which crash occurred
+7. Restart by launching a new app (spawns fresh harness + host)
+
+---
+
+## 15. Streaming Inline Rendering
+
+Generated Splash DSL code is rendered **inline** inside the generator app via the injected `__run_splash` AgentSplash (a nested AgentSplash with `is_root:false`).
+
+**Flow:**
+1. Sub-agent streams deltas -> auto-handler sends `send_streaming_delta` -> harness appends to CRDT `streaming_text`
+2. CRDT syncs to host -> `Event::Signal` fires
+3. `sync_streaming_text()` runs (agent_splash.rs, only on Signal):
+   - Writes accumulated text to `__ai_text` label
+   - Extracts Splash DSL code from the text (handles \`\`\`runsplash, \`\`\`splash, plain \`\`\`, or raw DSL with no backticks)
+   - Calls `__run_splash.set_text(cx, &code)` which evaluates and renders the code inline
+4. `set_text()` has error recovery: if `eval_body()` fails (partial/incomplete code during streaming), it restores the previous valid body and silently ignores the failure
+5. On streaming completion, `sync_pi_data_to_splash()` writes the final text to `__pi_data` and also re-evaluates through `__run_splash` for the final rendered result
+
+**Key constraint:** `sync_streaming_text()` and `sync_pi_data_to_splash()` only run on `Event::Signal` (not Draw/Mouse/Timer), to avoid 60fps CRDT doc reads. This means streaming updates appear at Signal frequency, not every frame.
+
+**Files:**
+- `agent_splash.rs` -- `sync_streaming_text()`, `sync_pi_data_to_splash()`, `SPLASH_SUFFIX` injection
+- `app.rs` -- `WindowClosed` guard, `catch_unwind` in `handle_event`
+- `harness/src/main.rs` -- `child.try_wait()` host death monitor, `panic_backtrace` forwarding
+- `.pi/extensions/makepad/dist/doc-bridge.js` -- `host_died` WebSocket handler -> `disposeAllSessions()`
+- `.pi/extensions/makepad/dist/index.js` -- status updates on welcome/host_died messages

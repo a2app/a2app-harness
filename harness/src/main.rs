@@ -59,7 +59,7 @@ enum HarnessToPiMsg {
     #[serde(rename = "debug_response")]
     DebugResponse { app_id: String, result: String },
     #[serde(rename = "doc_state")]
-    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String>, pi_response: Option<String> },
+    DocState { app_id: Option<String>, user_response: Option<String>, error_message: Option<String>, status: Option<String>, pi_response: Option<String>, panic_backtrace: Option<String> },
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────
@@ -285,6 +285,19 @@ async fn background_main(headless: bool) {
     let mut last_status_app_id: Option<String> = None;
 
     while let Some(_change) = doc_changes.next().await {
+        // ── Check if makepad-host process is still alive ──────────
+        if let Some(ref mut child) = makepad_child {
+            if let Ok(Some(_status)) = child.try_wait() {
+                eprintln!("[harness] makepad-host process exited — cleaning up sessions");
+                // Notify pi extension to clean up background sessions
+                let cleanup_msg = serde_json::json!({"type": "host_died"}).to_string();
+                let _ = bridge.lock().await.pi_tx.send(cleanup_msg);
+                // Signal exit so the bridge loop stops
+                // (don't set should_exit in doc — host is already dead)
+                break;
+            }
+        }
+
         // If pi sent an interactive command (click/type_text), clear tracking
         // so the resulting user_response is forwarded even if value hasn't changed.
         // IMPORTANT: skip this doc iteration entirely — the current doc still has
@@ -296,7 +309,7 @@ async fn background_main(headless: bool) {
             continue;
         }
 
-        let (has_response, version, app_id, status, error_message, debug_response, _streaming_text, exit) = doc_handle.with_document(|doc| {
+        let (has_response, version, app_id, status, error_message, debug_response, _streaming_text, exit, panic_bt) = doc_handle.with_document(|doc| {
             use autosurgeon::hydrate;
             let agent: AgentDoc = hydrate(doc).unwrap_or_default();
             let app_id = agent.pending_app.as_ref().map(|a| a.id.clone());
@@ -304,7 +317,7 @@ async fn background_main(headless: bool) {
                 shared::AppStatus::Pending => "Pending".to_string(),
                 shared::AppStatus::Launched => "Launched".to_string(),
             });
-            (agent.user_response.clone(), agent.user_response_version, app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.streaming_text, agent.should_exit)
+            (agent.user_response.clone(), agent.user_response_version, app_id, status, agent.error_message.clone(), agent.debug_response.clone(), agent.streaming_text, agent.should_exit, agent.panic_backtrace.clone())
         });
 
         // Push user_response to pi if version changed
@@ -372,6 +385,27 @@ async fn background_main(headless: bool) {
                 }
             }
             last_error_message = error_message;
+        }
+
+        // Forward panic_backtrace to pi if present (then clear it)
+        if let Some(ref bt) = panic_bt {
+            if let Some(ref id) = app_id {
+                let msg = HarnessToPiMsg::Error {
+                    app_id: id.clone(),
+                    message: format!("[PANIC] {}", bt),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                let _ = bridge.lock().await.pi_tx.send(json);
+            }
+            // Clear after forwarding
+            doc_handle.with_document(|doc| {
+                use autosurgeon::{hydrate, reconcile};
+                let mut agent: AgentDoc = hydrate(doc).unwrap_or_default();
+                agent.panic_backtrace = None;
+                let mut tx = doc.transaction();
+                let _ = reconcile(&mut tx, &agent);
+                tx.commit();
+            });
         }
 
         if exit {
@@ -538,6 +572,7 @@ async fn handle_pi_ws(ws: WebSocket, bridge: std::sync::Arc<tokio::sync::Mutex<B
                         error_message: agent.error_message,
                         status,
                         pi_response: agent.pi_response,
+                        panic_backtrace: agent.panic_backtrace,
                     };
                     let json = serde_json::to_string(&msg).unwrap_or_default();
                     let _ = fwd_tx.send(json);

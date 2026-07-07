@@ -46,6 +46,9 @@ pub struct AgentDoc {
     /// Read by the makepad-host's AgentSplash for live display.
     /// Cleared when the final pi_response is written.
     pub streaming_text: Option<String>,
+    /// When the makepad-host panics during handle_event, the panic backtrace
+    /// is captured and written here so the harness + pi can read it.
+    pub panic_backtrace: Option<String>,
 }
 
 #[derive(Debug, Clone, Reconcile, Hydrate, PartialEq)]

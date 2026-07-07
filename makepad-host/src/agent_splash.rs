@@ -36,7 +36,7 @@ pub struct AgentSplash {
 
 const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
 const SPLASH_SUFFIX: &str = "  __run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}
-  __pi_status := Label{text:\" \" height:Fit width:Fill}\n  __ai_text := Label{text:\" \" height:0 width:Fill}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
+  __pi_status := Label{text:\" \" height:Fit width:Fill}\n  __ai_text := Label{text:\" \" height:Fit width:Fill}\n  __pi_response := Label{text:\"\" visible:false}\n  __pi_data := Label{text:\" \" visible:false}";
 
 impl AgentSplash {
     fn self_id(&self) -> usize {
@@ -111,16 +111,20 @@ impl AgentSplash {
                     output_widget.set_text(cx, &text);
                 }
 
-                // Update status: "⚙ Generating..." when first runsplash marker appears,
+                // Update status: "⚙ Generating..." when first code marker appears,
                 // "✅ Done" when a complete code block (with closing ```) is extracted.
-                let is_runsplash = text.contains("```runsplash");
-                let first_runsplash = is_runsplash && !previous.contains("```runsplash");
-                let has_closing_marker = text.contains("```runsplash") && text[text.find("```runsplash").unwrap() + 12..].contains("```");
+                let has_any_marker = text.contains("```runsplash") || text.contains("```splash") || text.contains("\n```\n");
+                let had_any_marker = previous.contains("```runsplash") || previous.contains("```splash") || previous.contains("\n```\n");
+                let first_code_block = has_any_marker && !had_any_marker;
+                // Check if the text after any marker has a closing ```
+                let has_closing_marker = (text.contains("```runsplash") && text[text.find("```runsplash").unwrap() + 12..].contains("```"))
+                    || (text.contains("```splash") && text[text.find("```splash").unwrap() + 10..].contains("```"))
+                    || (text.contains("\n```\n") && text[text.rfind("\n```\n").unwrap() + 5..].trim().contains("```"));
                 let status_widget = self.widget(cx, &[id!(__pi_status)]);
                 if !status_widget.is_empty() {
                     if has_closing_marker {
                         status_widget.set_text(cx, "✅ Done");
-                    } else if first_runsplash {
+                    } else if first_code_block {
                         status_widget.set_text(cx, "⚙ Generating...");
                     }
                 }
@@ -130,8 +134,8 @@ impl AgentSplash {
                 if !log_widget.is_empty() {
                     let current = log_widget.text();
                     let current = if current == " " { "" } else { current.as_str() };
-                    if first_runsplash {
-                        // First runsplash block: show generating status
+                    if first_code_block {
+                        // First code block: show generating status
                         if current.is_empty() {
                             log_widget.set_text(cx, "⚙ Generating...");
                         } else if let Some(ai_marker) = current.rfind("\n🤖 ") {
@@ -139,7 +143,7 @@ impl AgentSplash {
                         } else {
                             log_widget.set_text(cx, &format!("{}\n⚙ Generating...", current));
                         }
-                    } else if !is_runsplash {
+                    } else if !has_any_marker {
                         // Normal chat: update with 🤖 prefix (replace last line)
                         if previous.is_empty() {
                             // First streaming delta: append a new line
@@ -161,32 +165,57 @@ impl AgentSplash {
                     }
                 }
 
-                // Try to render runsplash code during streaming so the UI
+                // Try to render generated Splash code during streaming so the UI
                 // builds up progressively as the AI generates it.
+                // Check for these marker patterns (in order of preference):
+                //   ```runsplash ... ```
+                //   ```splash ... ```
+                //   ``` ... ```  (plain backtick block)
                 // set_text has built-in error recovery: if eval_body fails, it
                 // restores the previous valid body, so failed partial parses
                 // are silently ignored and the last valid UI persists.
                 let runsplash_marker_start = "```runsplash";
+                let splash_marker_start = "```splash";
+                let plain_marker_start = "```";
                 let runsplash_marker_end = "```";
+                // Try to extract code from marker types (```runsplash, ```splash, ```)
                 let mut rendered_code: Option<String> = None;
-                let mut search_start = 0;
-                while let Some(block_start) = text[search_start..].find(runsplash_marker_start) {
-                    let abs_start = search_start + block_start + runsplash_marker_start.len();
-                    if let Some(block_end) = text[abs_start..].find(runsplash_marker_end) {
-                        let extracted = text[abs_start..abs_start + block_end].trim();
-                        if !extracted.is_empty() {
-                            rendered_code = Some(extracted.to_string());
-                        }
-                        search_start = abs_start + block_end + runsplash_marker_end.len();
-                    } else {
-                        let rest = &text[abs_start..];
-                        if rest.len() > 20 {
-                            let extracted = rest.trim();
-                            if !extracted.is_empty() {
-                                rendered_code = Some(extracted.to_string());
+                let marker_types = [runsplash_marker_start, splash_marker_start, plain_marker_start];
+                for &marker in &marker_types {
+                    if let Some(block_start) = text.find(marker) {
+                        let abs_start = block_start + marker.len();
+                        // Check if this is actually a plain ``` that overlaps with ```splash
+                        if marker == plain_marker_start {
+                            let rest_before = &text[..block_start];
+                            if rest_before.contains(splash_marker_start) || rest_before.contains(runsplash_marker_start) {
+                                continue;
                             }
                         }
-                        break;
+                        if let Some(block_end) = text[abs_start..].find(runsplash_marker_end) {
+                            let extracted = text[abs_start..abs_start + block_end].trim();
+                            if !extracted.is_empty() {
+                                rendered_code = Some(extracted.to_string());
+                                break;
+                            }
+                        } else {
+                            // No closing ``` yet — streaming in progress
+                            let rest = &text[abs_start..];
+                            if rest.len() > 15 {
+                                let extracted = rest.trim();
+                                if !extracted.is_empty() {
+                                    rendered_code = Some(extracted.to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                // If no marker found and text looks like Splash DSL (starts with let or RoundedView),
+                // try rendering the text directly as Splash code.
+                if rendered_code.is_none() {
+                    let trimmed = text.trim();
+                    if trimmed.len() > 20 && (trimmed.starts_with("let ") || trimmed.starts_with("fn ") || trimmed.starts_with("RoundedView")) {
+                        rendered_code = Some(trimmed.to_string());
                     }
                 }
 
