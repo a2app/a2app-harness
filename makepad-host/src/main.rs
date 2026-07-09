@@ -21,10 +21,47 @@ pub static SHARED_DOC: OnceLock<DocHandle> = OnceLock::new();
 /// exactly like AgentEvent::TextDelta in the aichat example.
 pub static STREAMING_RX: OnceLock<Mutex<mpsc::UnboundedReceiver<String>>> = OnceLock::new();
 
+/// The last panic backtrace captured by the panic hook.
+/// Cleared after the catch_unwind handler reads it.
+pub static LAST_PANIC_BACKTRACE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 const SAMOD_WS_PORT: u16 = 2342;
 const CONNECT_RETRY_MS: u64 = 500;
 
 fn main() {
+    // Install a panic hook to capture backtraces for the CRDT doc.
+    // Must be set before any thread spawns.
+    let orig_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Capture backtrace
+        let bt = std::backtrace::Backtrace::capture();
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let backtrace_str = format!(
+            "PANIC: {}\nlocation: {}\nbacktrace:\n{}",
+            msg, location, bt
+        );
+        // Store in global so catch_unwind handler can write to CRDT doc
+        if let Some(global) = LAST_PANIC_BACKTRACE.get() {
+            if let Ok(mut guard) = global.lock() {
+                *guard = Some(backtrace_str.clone());
+            }
+        }
+        // Also print to stderr
+        eprintln!("[panic hook] {}", backtrace_str);
+        // Call original hook to preserve default behavior
+        orig_hook(info);
+    }));
+
+    // Initialize the LAST_PANIC_BACKTRACE global
+    LAST_PANIC_BACKTRACE.set(Mutex::new(None)).ok();
+
     // Start the background tokio runtime on a separate thread.
     // This thread:
     //   - Connects to the harness's samod WS server

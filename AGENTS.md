@@ -107,15 +107,25 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 6. Splash app reads response via `ui.__ai_text.text()` or `ui.__pi_data.text()`
 
 #### Streaming Response (ai:ask → live deltas → splash)
-1. Splash calls `ui.__pi_response.set_text("ai:ask:message")` → AgentSplash writes `user_response`
-2. Harness forwards `user_response` to pi → extension auto-handler matches `ai:ask:` prefix
-3. Auto-handler subscribes to sub-agent `text_delta` events, sends each as `{"type":"send_streaming_delta","app_id":"...","delta":"..."}` over JSON WS
-4. Harness appends each delta to `streaming_text` CRDT field
-5. CRDT syncs to makepad-host → background thread detects `streaming_text` change → signals UI
-6. AgentSplash.sync_streaming_text() reads `streaming_text`, sets `__ai_text` with accumulated text
-7. On sub-agent completion, auto-handler sends `{"type":"send_streaming_end","app_id":"...","final_text":"..."}`
-8. Harness copies `streaming_text` → `pi_response`, clears `streaming_text`, sets `extension_requests = true`
-9. Final text arrives via normal `pi_response` channel → `__ai_text` gets final content, `__pi_data` updates
+1. Splash calls `ui.__pi_response.set_text("ai:ask:message")` → AgentSplash writes `user_response` + increment `user_response_version`
+2. Harness bridge loop detects version change → forwards `{"type":"user_response",...}` to pi over JSON WS
+3. Extension auto-handler matches `ai:ask:` prefix → finds session via `appSessionMap.get(appId)`
+4. Auto-handler creates a **per-prompt subscription** (same proven pattern as `send_background_message`) that:
+   - Captures each `text_delta` event from the pi SDK
+   - Sends it immediately as `{"type":"send_streaming_delta","app_id":"...","delta":"<raw new chars>"}` over JSON WS
+5. Harness receives `send_streaming_delta` → **APPENDS** the delta to `streaming_text` CRDT field:
+   ```rust
+   let existing = agent.streaming_text.unwrap_or_default();
+   agent.streaming_text = Some(existing + &delta);
+   ```
+6. CRDT syncs to makepad-host → `samod` fires a **Signal** event
+7. AgentSplash.handle_event() calls `sync_streaming_text()` (only on `Event::Signal`, not on 60fps Draw events):
+   - Reads `streaming_text` from doc → compares to `self.last_streaming_text`
+   - If changed: updates `__ai_text` TextInput and `log` Label with the full accumulated text
+   - The `log` widget update uses `rfind("\n🤖 ")` to correctly find the AI response boundary even when the response contains internal newlines (bullet lists, paragraphs)
+8. On sub-agent completion, auto-handler calls `unsub()` → sends `{"type":"send_streaming_end","app_id":"...","final_text":"..."}`
+9. Harness handles `send_streaming_end`: sets `pi_response = Some(final_text)`, clears `streaming_text = None`, sets `extension_requests = true`
+10. CRDT sync → Signal → `sync_pi_data_to_splash()` reads `pi_response`, writes final text to `__ai_text`, `__pi_data`, and `log` (replacing the "🤖 ..." line), then **clears** `pi_response` from the doc
 
 #### Shutdown
 1. pi sends `{"type":"exit"}` or pi exits
@@ -139,8 +149,10 @@ pub struct AgentDoc {
     pub debug_response: Option<String>,
     pub pi_response: Option<String>,       // pi sends data to splash
     /// Accumulated streaming text from sub-agent deltas.
-    /// Appended by harness on each send_streaming_delta, read by
-    /// makepad-host for live display. Cleared when pi_response arrives.
+    /// Harness APPENDS each delta on send_streaming_delta (raw new chars),
+    /// so this field grows over time. Read by makepad-host's
+    /// sync_streaming_text() for live display. Cleared by send_streaming_end
+    /// (which also sets pi_response with the final text).
     pub streaming_text: Option<String>,
 }
 ```
@@ -210,6 +222,45 @@ fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
 ```
 
 UI updates from doc changes are **deferred**: `sync_from_doc` on Signal stores `PendingUiUpdate`; `apply_pending_updates` applies on Draw (and end of Signal for close/clear). Early-return check (comparing `last_app_id`, `last_splash_body`, `last_error_msg`) prevents unnecessary updates on idle Signals — CPU stays at ~1.7%.
+
+### AgentSplash `handle_event` (Signal-Only Sync)
+
+AgentSplash follows a different event pattern from the host. Its `handle_event` is:
+
+```rust
+fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+    self.view.handle_event(cx, event, scope);
+    self.redraw(cx);
+
+    // Check __pi_response label for splash → pi communication
+    let response_widget = self.widget(cx, &[id!(__pi_response)]);
+    if !response_widget.is_empty() {
+        let current = response_widget.text();
+        if current != self.last_response && !current.is_empty() {
+            self.last_response = current;
+            write_doc_field("user_response", current.clone());
+        }
+    }
+
+    // Drain mpsc streaming channel (direct path, not CRDT)
+    if let Some(rx) = STREAMING_RX.get() {
+        while let Ok(delta) = rx.lock().try_recv() {
+            // update __ai_text and log widget
+        }
+    }
+
+    // CRDT sync — ONLY on Event::Signal to avoid 60fps doc reads
+    if matches!(event, Event::Signal) {
+        self.sync_streaming_text(cx);
+        self.sync_pi_data_to_splash(cx);
+    }
+}
+```
+
+Key differences from the host's handle_event:
+- **`sync_streaming_text` and `sync_pi_data_to_splash` only run on `Event::Signal`** — not on Draw, Mouse, or Timer events. This prevents reading+hyrating the CRDT doc at 60fps (which caused CPU spikes during streaming).
+- The `__pi_response` check runs on ALL events (not just Signal) so that splash → pi messages are not missed.
+- The STREAMING_RX mpsc channel (a secondary direct-delivery path) is drained on every event.
 
 ### Splash Subtree Orphan Issue
 
@@ -370,16 +421,40 @@ If no session exists when `ai:ask:` arrives, one is auto-created with a default 
 
 ### Auto-Display via `__ai_text` (with Streaming)
 
-The AgentSplash injects a `__ai_text := TextInput{height:34 width:Fill}` widget that
+The AgentSplash injects a `__ai_text := TextInput{text:" " height:0 width:Fill visible:false}` widget that
 auto-displays the sub-agent's response — no manual reading needed.
 
-**Streaming (live token-by-token):** When the auto-handler processes an `ai:ask:` message,
-it subscribes to `text_delta` events from the sub-agent session and sends each delta
-to the harness as a `send_streaming_delta` message. The harness accumulates deltas in
-a new `streaming_text` CRDT field. The makepad-host background thread detects changes
-and signals the UI, where `AgentSplash.sync_streaming_text()` live-updates `__ai_text`
-with the accumulating text. When the response completes, the final text flows through
-the existing `pi_response` channel (which also clears `streaming_text`).
+**Streaming architecture (per-prompt subscription):** When the auto-handler processes
+an `ai:ask:` message, it creates a **per-prompt subscription** (identical pattern to
+`send_background_message`):
+
+```typescript
+let response = "";
+const unsub = stored.session.subscribe((event: any) => {
+  if (event.type === "message_update" &&
+      event.assistantMessageEvent?.type === "text_delta") {
+    const delta = event.assistantMessageEvent.delta;
+    response += delta;
+    sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: delta });
+  }
+});
+await stored.session.prompt(message, { expandPromptTemplates: false });
+unsub();
+sendToHarness({ type: "send_streaming_end", app_id: appId, final_text: response });
+```
+
+Key characteristics:
+- **Individual deltas** are sent (raw new chars, NOT full accumulated text)
+- The harness **APPENDS** each delta to the CRDT `streaming_text` field
+- On completion, `send_streaming_end` sets `pi_response` (final text) and clears `streaming_text`
+- `sync_streaming_text()` is called **only on `Event::Signal`** (not on every Draw/Mouse event)
+  to avoid reading+hyrating the CRDT doc at 60fps
+- The `log` widget uses `rfind("\n🤖 ")` (not `rfind('\n')`) to correctly find the
+  AI response boundary when the response contains internal newlines
+
+**Also has a session-level subscription** (`setupSessionStreaming`) that silently
+accumulates deltas into `stored.accumulated` (does NOT send to harness). This is
+a fallback for `send_background_message` tool usage and future use.
 
 **Result:** the `__ai_text` widget shows text appearing token-by-token as the model
 generates, rather than waiting for the full response. The splash app can also read
@@ -442,11 +517,96 @@ ButtonFlat{text:"Send" on_click:||{
 The response auto-appears in the `__ai_text` TextInput at the bottom of the layout.
 No display widget needed in the splash body.
 
+### 3.4 Inline Runsplash Rendering (Current Working Implementation)
+
+Runsplash code can be rendered **inline** inside the chat app via a nested AgentSplash
+widget injected into every splash body's `SPLASH_SUFFIX`.
+
+**How it works:**
+1. `SPLASH_SUFFIX` includes `__run_splash := AgentSplash{width:Fill height:Fit is_root:false}`
+2. The nested AgentSplash has `is_root:false`, so it does NOT sync from the CRDT doc
+3. During streaming, `sync_streaming_text()` extracts `\`\`\`runsplash` blocks from
+   the accumulated text and calls `run_splash.set_text(cx, &runsplash_code)`
+4. The nested AgentSplash evaluates the runsplash code and renders it **inline**
+   below the chat app (preserving the chat state)
+5. `set_text()` has built-in error recovery: if `eval_body` fails, it restores the
+   previous valid body, so incomplete partial code silently keeps the last working UI
+6. Log shows "⚙ Generating..." during streaming, "✅ Done" on completion
+7. On completion, `sync_pi_data_to_splash()` also runs the runsplash code through
+   the nested AgentSplash, replacing any partial rendering with the final result
+
+**Known Problems:**
+1. **AI generates incorrect naming syntax** — The AI often uses `id: disp` instead of
+   `disp := Label{...}` to name widgets. This causes buttons to render but click
+   handlers referencing `ui.disp` to silently fail. **Workaround:** Improve the system
+   prompt with explicit examples of the `:=` naming syntax.
+2. **Second prompt error** — Sending a second `ai:ask:` while the first is still
+   streaming. Fixed by adding `streamingBehavior: "steer"` to `session.prompt()`.
+3. **Nested children invisible in debug tools** — `widget_snapshot` and `widget_dump`
+   only show the nested AgentSplash widget itself, not its rendered children (buttons,
+   labels). The children are in the VM's widget tree, separate from the main tree.
+4. **Buttons overflow Fit height by a few pixels** — The nested counter UI needs slightly
+   more height than the parent allocates, clipping button bottoms.
+5. **AI generates invalid DSL syntax** — The AI frequently uses commas between
+   properties (`width: Fill, height: Fit`), triple curly braces, or CSS-style
+   properties. The system prompt must rigorously teach the exact `name:value` format.
+
+**Recommended approach for the next session:**
+1. Create a system prompt that teaches Splash DSL syntax using ONLY valid examples
+   (no explanation, just correct code)
+2. Test with a simple prompt like "counter" and check the generated code
+3. Iterate: fix the prompt for each syntax error the AI makes
+4. Common pitfalls to address:
+   - `name := Widget{}` not `id: name` for naming
+   - Property format: `width:Fill` (no spaces after colon, no commas)
+   - `on_click:||{ code }` with double pipes
+   - `let`/`fn` at the top, before widgets
+   - String concat with `+`, number to string with `"" + n`
+
 ---
 
 ## 4. Splash DSL Guide (General Reference)
 
 This section covers general Makepad Splash DSL patterns that apply to ANY app body.
+
+> **⚠️ CRITICAL: The `dy.is_nan()` crash at `turtle.rs:2342`**
+>
+> This crash happens when using **`padding:Inset{...}`** on a `RoundedView` or `View` that
+> contains **nested `View{flow:Right}`** children (especially with fixed-width buttons).
+>
+> **Root cause:** `padding` reduces the inner content width. Inside, a `flow:Right` View
+> creates a nested layout system where `unused_inner_width()` produces `NaN` because no
+> child uses `width:Fill` → `total_deferred_weight` is 0 → `0/0 = NaN` fill → propagates
+> through `move_align_list` → crashes.
+>
+> **Fix: NEVER use `RoundedView{padding:...}` as the root container.** Use a plain
+> `View` (or no wrapper at all) and apply padding only via inner `View` children.
+> Or better yet, **omit `padding` entirely** and use `spacing` between children with
+> direct orphans (no `View{flow:Right}` wrapper for buttons).
+>
+> ```splash
+> // ✅ SAFE — direct orphans, no padding, no flow:Right wrapper
+> RoundedView{width:Fill height:Fit flow:Down spacing:12 show_bg:true ...
+>   display := Label{...}
+>   ButtonFlat{text:"-" on_click:||{...}}  // direct children, no wrapping
+>   ButtonFlat{text:"Send" on_click:||{...}}
+> }
+>
+> // ❌ CRASH — padding + flow:Right wrapper = dy.is_nan()
+> RoundedView{width:Fill height:Fit padding:16 flow:Down ...
+>   View{flow:Right spacing:12  // <-- nested layout with reduced inner width = NaN
+>     ButtonFlat{text:"-" ...}
+>     ButtonFlat{text:"+" ...}
+>   }
+> }
+> ```
+>
+> **If you NEED horizontal button rows:**
+> 1. Use `flow:Right` directly on the root (if no other layout needed), OR
+> 2. Omit `padding` on the outer container, OR
+> 3. Use `spacing` between orphan buttons in `flow:Down` (each on its own line)
+>
+> See §14.1 for the full NaN propagation trace.
 
 ### 4.1 Key Rules
 
@@ -784,6 +944,11 @@ All patterns verified end-to-end via extension tools.
 | `send_pi_response` → splash reads `__pi_data` | ✅ | "Greetings from pi!" → label shows "Got: Greetings from pi!" |
 | Splash → Pi communication (`__pi_response.set_text`) | ✅ | Click "Send to Pi" → doc: `"hello from splash"` |
 | Two-way comms (pi→splash + splash→pi) | ✅ | Full round-trip verified in single session |
+| Per-prompt streaming (individual deltas) | ✅ | `send_streaming_delta` sends raw new chars; harness APPENDS to CRDT (2026-07-06) |
+| Log widget no duplicate lines | ✅ | `rfind("\n🤖 ")` correctly handles AI text with internal newlines (2026-07-06) |
+| Signal-only CRDT sync (no CPU jank) | ✅ | Doc read+hyrdate only on `Event::Signal`, not 60fps Draw events (2026-07-06) |
+| Counter with no bg agent | ✅ | All buttons (+/-/Reset/Send) work; `__pi_response.set_text("count:2")` delivers (2026-07-06) |
+| Todo list via `set_text()` (no bg agent) | ✅ | Add items, scroll, "Send to Pi" sends list content (2026-07-06) |
 
 ---
 
@@ -812,11 +977,12 @@ All patterns verified end-to-end via extension tools.
 | `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
 | Standalone `ScrollBars`/`ScrollBar` as child widget (historically) | **No longer reproducible** (tested 2026-07-01 on clean build). The Splash VM now handles ScrollBars gracefully — renders as zero-size when used standalone. The fix was likely in the Makepad upstream update between git revisions. The `catch_unwind` wrapper in `app.rs` (commit b965536) provides defense-in-depth against any future panics. |
 | `View{scroll_bars: ScrollBars{...}}` — scroll_bars as View PROPERTY works | ✅ The View manages scroll internally. Use: `View{width:Fill height:300 scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true scroll_bar_y: ScrollBar{drag_scrolling:true}} ...}` |
-| Streaming responses work but token batching may occur | Deltas are sent immediately from the sub-agent, but the makepad-host polls doc changes every 500ms. Rapid deltas within 500ms are batched into one UI update. Visible as small bursts of text rather than single-token updates. |
-| **Streaming not reliably working (follow-up)** | Despite channel-based delivery (mpsc from background thread → UI), deltas from DeepSeek V4 Flash via pi SDK `session.subscribe` appear to fire all at once after `prompt()` completes, not incrementally during generation. The mpsc channel infrastructure is in place and working — the bottleneck is the pi SDK's delta delivery timing. To fix: either use a provider that streams individual deltas, or add artificial delay between sends in the extension. |
+| **Streaming now working (2026-07-06)** | **FIXED**: Per-prompt subscription streams individual deltas via `send_streaming_delta`, harness APPENDS to CRDT `streaming_text`, makepad-host syncs on `Event::Signal` only. Log widget correctly replaces the "🤖 ..." line using `rfind("\n🤖 ")` instead of `rfind('\n')` to handle AI text with internal newlines. See Section 3 for architecture. |
+| **CPU jank during streaming** | **FIXED (2026-07-06)**: `sync_streaming_text()` and `sync_pi_data_to_splash()` now only run on `Event::Signal`, not on every 60fps Draw/Mouse event. This eliminated the CRDT doc read+hydrate loop that was causing janky UI. |
 | `createAgentSession` inherits parent system prompt (historical) | **FIXED (2026-07-01)**: `getBlankSlateResourceLoader()` creates an isolated `DefaultResourceLoader` pointing at a temp directory with all context/skills/prompts/extensions disabled. The sub-agent no longer inherits the main agent's AGENTS.md, SYSTEM.md, skills, or any other context. See Section 3.1 for implementation details. |
 | Programmatic auto-scroll via `ScrollEvent` has no effect | `scroll_bars` only respond to touch/mouse gesture events, not programmatic `ScrollEvent` dispatch. Manual scrolling still works. |
 | **Makepad-host crash: `dy.is_nan()` in `turtle.rs:2342` during streaming** | **FIXED (2026-07-02)**: The `SPLASH_PREFIX` in `agent_splash.rs` was missing `width:Fill` on the outer wrapper View. This caused `View{height:Fit flow:Down <body> __ai_text{width:Fill height:0}}` — a parent with no explicit width containing children with `width: Fill`. During sub-agent streaming responses, text written to `__ai_text` triggered a re-layout that produced NaN in `turtle.total_resolved_length_to()` → `move_align_list(dy=NaN)`. Fix: added `width: Fill` to `SPLASH_PREFIX`. See Section 11 for full analysis. |
+| **AI text with internal newlines duplicates log lines** | **FIXED (2026-07-06)**: `sync_streaming_text()` and `sync_pi_data_to_splash()` now use `rfind("\n🤖 ")` instead of `rfind('\n')` to find the AI response boundary. The old code found newlines INSIDE the AI response (e.g., after bullet points), creating duplicate "🤖 ..." lines. |
 
 ### Recovery from Debug Freeze
 
@@ -973,3 +1139,378 @@ This gives the outer View a resolved width from the parent (the `splash_holder` 
 -const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
 +const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
 ```
+
+---
+
+## 12. Lessons Learned (2026-07-06 Session)
+
+This section documents approaches that were tried but did not work, to avoid repeating the same dead ends.
+
+### 12.1 Nested AgentSplash causes NaN layout crashes
+
+**Attempted:** Adding `__run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}` to SPLASH_SUFFIX so that runsplash code could be rendered inline via a nested AgentSplash, preserving the chat app body.
+
+**Result: FAILED** — consistently produces `assertion failed: !dy.is_nan()` in `turtle.rs:2342` (`move_align_list`). The crash happens during `draw_walk` (rendering), not during `set_text` (evaluation). The nested AgentSplash's `width:Fill` creates a circular layout dependency with the parent View's `height:Fit`, and when the nested content grows after `set_text`, the parent's stale layout produces NaN.
+
+**`catch_unwind` around `draw_walk` does NOT fix it:** The NaN value persists in the turtle/layout state even after the panic is caught. The next draw cycle in the parent View (KeyboardView) encounters the same NaN and crashes again.
+
+### 12.2 Partial runsplash code evaluation during streaming is unreliable
+
+**Attempted:** Extracting runsplash code from the accumulated streaming text BEFORE the closing ``` arrives, and trying to evaluate the partial code progressively.
+
+**Result: FAILED** — Partial Splash code almost never parses because the DSL requires complete syntax (balanced braces, complete property names, etc.). The only time it works is when the code inside the block happens to be syntactically complete before the closing ``` (e.g., when the AI finishes the closing `}` before writing the closing ```). Most of the time, eval fails and the body is restored to the previous state.
+
+**Practical limit:** The "Generating..." status message in the log is about as much feedback as you can show during streaming. The rendered UI only reliably appears when the complete `\`\`\`` closing marker arrives.
+
+### 12.3 Inline rendering via body replacement loses chat state
+
+**Attempted:** When runsplash code is detected in `sync_pi_data_to_splash`, calling `self.set_text(cx, &runsplash_code)` to replace the entire splash body.
+
+**Result: Works but destructive** — The chat app is replaced entirely. All `let` variables (messages array, counters) are lost because the Splash VM re-evaluates from scratch. The user can see the rendered UI but the chat context is gone.
+
+### 12.4 Version counters add complexity without clear win
+
+**Attempted:** Adding `pi_response_version` and `streaming_text_version` fields to `AgentDoc` to avoid full-doc hydration on every frame. The sync functions first read just the version counter (cheap), and only do full `hydrate` if the version changed.
+
+**Result: NOT RECOMMENDED** — The performance improvement was marginal (the `hydrate` call was already fast enough). The version counters added complexity to the `shared::AgentDoc` struct, required changes in the harness, and introduced new failure modes (version mismatches, forgotten increments). The original approach of reading and hydrating the full doc on each Signal is simpler and more reliable.
+
+### 12.5 AI system prompt must be short
+
+**Attempted:** Including the entire Splash DSL reference guide (all widgets, properties, examples) in the system prompt.
+
+**Result: Counterproductive** — Long prompts overwhelm the model and produce worse results (missing buttons, wrong syntax). A short prompt with exactly one working counter example consistently produces better code.
+
+### 12.6 `streamingBehavior: 'steer'` fixes second-prompt error
+
+**Attempted:** Sending a second `ai:ask:` message while the first was still streaming produced `"Agent is already processing"` error.
+
+**Result: WORKED** — Adding `streamingBehavior: "steer"` to the `session.prompt()` call in `background-agent.js` correctly cancels the in-progress generation and starts fresh with the new message. No crash, no error.
+
+### 12.7 `wait_for_response` hang fix
+
+**Attempted:** `wait_for_response` never fired for `ai:ask:` responses because the auto-handler only set `pi_response`, not `user_response`.
+
+**Result: WORKED** — Adding `agent.user_response = Some(final_text)` + `agent.user_response_version += 1` to the `SendStreamingEnd` handler in the harness causes the bridge loop to forward the response to the extension, which triggers `wait_for_response`.
+
+### 12.8 Error fallback should not be shown inline
+
+**Attempted:** When `eval_body` fails (e.g., partial code during streaming), rendering `SPLASH_ERROR_FALLBACK` (dark red box with "Splash app could not be rendered") inside the nested AgentSplash.
+
+**Result: BAD UX** — The error fallback covers up any partially-rendered content and looks broken. Better to silently restore the previous valid body (as `set_text` now does by saving `prev_body` and re-evaluating it on failure).
+
+### 12.9 `draw_walk` must not panic
+
+**Attempted:** Letting the nested AgentSplash's `draw_walk` panic propagate up to `catch_unwind` in the host's `handle_event`.
+
+**Result: NOT ENOUGH** — The approach of wrapping individual widget `draw_walk` calls with `catch_unwind` does NOT prevent subsequent crashes because the NaN state persists in Makepad's turtle/layout system. The parent View encounters the same NaN on the next draw cycle. The only reliable fix is to prevent NaN from entering the layout in the first place (avoid `width:Fill` / `height:Fill` combinations that create circular dependencies).
+
+### 12.10 NaN crash persists even with SPLASH_PREFIX `width:Fill` fix
+
+**Attempted:** The `dy.is_nan()` crash in `move_align_list` (turtle.rs:2342) keeps happening on every draw event even after adding `width:Fill` to SPLASH_PREFIX. The crash is 100% reproducible with any app that uses the SPLASH_SUFFIX widgets (`__ai_text`, `__pi_response`, `__pi_data`).
+
+**Root cause not found** — The crash might be from the `__ai_text := TextInput{text:" " height:0 width:Fill visible:false}` widget. A TextInput with `height:0` and `width:Fill` inside a `height:Fit flow:Down` parent View might create a layout conflict. The text " " (space) has font height > 0, conflicting with `height:0`.
+
+**Clean rebuild sometimes fixes it** — Running `cargo clean && cargo build` resolved the crash for one session, suggesting stale incremental build artifacts can cause the NaN.
+
+### 12.11 `set_text` body restoration prevents error display
+
+**Attempted:** When `eval_body` fails (partial/incomplete Splash code), the original code rendered `SPLASH_ERROR_FALLBACK` (dark red box). Changed `set_text` to save `prev_body` before eval and restore on failure.
+
+**Result: WORKS** — The previous valid body is re-evaluated and displayed on eval failure. No more red error boxes. The user only sees the last working UI, with partial/failed states silently skipped.
+
+### 12.12 `eval_body` must not render error fallback
+
+**Attempted:** `eval_body` called `render_body(cx, SPLASH_ERROR_FALLBACK)` on failure, which rendered a dark red error box over the entire splash area.
+
+**Result: Changed to just return false** — The caller (`set_text`) handles restoration. The error fallback constant is now dead code.
+
+### 12.13 Partial inline render succeeds, full render crashes with NaN
+
+**Observed behavior:** During streaming, the inline `__run_splash` AgentSplash successfully renders partial code (e.g., just the counter label and "0" display). But when the next streaming delta adds more content (buttons, layout), the re-evaluation triggers a NaN crash in `move_align_list`.
+
+**Root cause:** The nested AgentSplash starts with empty content (0 height). Partial code evaluates successfully and renders at the computed height. The parent View's layout is computed with this height. When `set_text` is called again with more complete code (taller content), the nested AgentSplash grows, but the parent View's layout is stale. This creates a circular dependency: the nested widget needs more space than allocated, producing NaN.
+
+**Failed workarounds:**
+- `catch_unwind` around `set_text` doesn't help because the NaN happens in the subsequent `draw_walk`, not in `set_text`
+- `self.redraw(cx)` after `set_text` doesn't trigger a full re-layout — the parent View reuses its cached child positions
+- Giving the nested AgentSplash `height:Fit` doesn't fix it because Fit is computed from content, but the parent already decided the height
+
+**Hypothesis for fix (unproven):** Don't render partial code during streaming at all. Only render on completion (when the closing ``` arrives). Use a simple "⚙ Generating..." status during streaming. This avoids the layout growth issue entirely.
+
+---
+
+## 13. Next Steps: AI Splash Code Generation
+
+The inline runsplash rendering works (code is extracted, `set_text()` evaluates and renders, error recovery restores on failure). The bottleneck is teaching the AI to generate **correct Splash DSL syntax**.
+
+### Objective
+Enable the "Splash Generator" app (`splash-gen`) to produce working interactive UIs from natural language. The AI generates code inside ````runsplash` blocks, extracted and rendered inline via the nested `__run_splash` AgentSplash.
+
+### Protocol
+- User types: "a counter with + and - buttons"
+- AI responds with: ````runsplash\nlet count = 0\nRoundedView{...}\n````
+- `sync_streaming_text()` extracts the block, calls `run_splash.set_text()`
+- Nested AgentSplash renders inline, error recovery on partial code
+
+### Known AI Syntax Bugs (fix via prompt engineering)
+
+| Bug | Example (WRONG) | Correct Syntax |
+|-----|-----------------|----------------|
+| Commas between properties | `width: Fill, height: Fit` | `width:Fill height:Fit` |
+| Wrong naming syntax | `id: disp` / `name: disp` | `disp := Label{...}` |
+| Wrong click syntax | `clicked: {count++}` | `on_click:||{count+=1}` |
+| Spaces after colon | `width: Fill` | `width:Fill` |
+| CSS-style properties | `bg: #x333` / `color: #x333` | `draw_bg.color:` `draw_text.color:` |
+| Number to string | `set_text(count)` | `set_text("" + count)` |
+| Triple braces in on_click | `on_click:||{{ code }}` | `on_click:||{ code }` |
+| Missing container height | No `height:Fit` | Every container needs `height:Fit` |
+| Widgets not available | `Divider`, `ProgressBar` | `Hr{height:1}`, `Slider{is_read_only:true}` |
+
+### Prompt Engineering Strategy
+
+1. **Start minimal**: One complete working example (counter). Ask AI to adapt.
+2. **Iterate on failures**: For each syntax error, add the CORRECT pattern to the prompt. Show working code, not rules.
+3. **Test systematically**: Send "counter with +/-" and check:
+   - Does it render? (`__run_splash` height > 0 in snapshot)
+   - Are widgets named correctly? (`disp := Label{...}` not `id: disp`)
+   - Do `on_click` handlers use `||{...}` syntax?
+   - Number-to-string uses `"" + count`?
+4. **Then harder cases**: todo list, toggle, text input + button
+5. **Final goal**: AI generates ANY pattern from Section 4.7 correctly
+
+### Testing Checklist
+
+1. `widget_snapshot` — check `__run_splash` height > 0 (rendered)
+2. Read `__run_splash` body text to inspect generated code
+3. Click generated buttons (orphan coordinates from snapshot)
+4. `inspect_makepad_doc` for `user_response` from generated buttons
+5. If buttons don't respond: naming syntax (`:=` vs `id:`) is likely wrong
+
+---
+
+## 14. Crash Reference & Deep Diagnosis
+
+### Crash 1: `dy.is_nan()` in `move_align_list` (turtle.rs:2342)
+
+**Symptom:**
+```
+assertion failed: !dy.is_nan() at draw/src/turtle.rs:2342:9
+```
+Stack: `draw_bg.end()` -> `end_turtle` -> `end_turtle_with_guard` -> `move_align_list(dy=NaN)`
+
+**Trigger:** Splash body with `padding:` on the root RoundedView AND buttons wrapped inside `View{flow:Right ...}`.
+
+---
+
+#### NaN Propagation Chain (line-by-line)
+
+**1. `end_turtle_with_guard` (turtle.rs:1630):**
+```rust
+let dy = turtle.total_resolved_length_to(finished_walk.deferred_before_count);
+self.move_align_list(align_list_start, align_list_end, dx, dy, false);
+```
+The `dy` passed to `move_align_list` is NaN.
+
+**2. `total_resolved_length_to` (turtle.rs:1159):**
+```rust
+fn total_resolved_length_to(&self, index: usize) -> f64 {
+    self.resolved_fills[..index].iter().sum()
+}
+```
+Sums resolved fill lengths. If any fill is NaN, the sum is NaN.
+
+**3. `resolve_fill` (turtle.rs:1199):**
+```rust
+let unresolved_length = self.unresolved_length_from(count);
+let length = unresolved_length * deferred_fill.weight / total_deferred_weight;
+```
+If `unresolved_length` is NaN, `length` becomes NaN regardless of weight.
+
+**4. `unresolved_length_from` (turtle.rs:1172):**
+```rust
+fn unresolved_length_from(&self, index: usize) -> f64 {
+    self.inner_unused_length() - self.total_resolved_length_to(index)
+}
+```
+Calls `inner_unused_length()`.
+
+**5. `inner_unused_length` (turtle.rs:1162):**
+```rust
+fn inner_unused_length(&self) -> f64 {
+    match self.layout.flow {
+        Flow::Right { wrap: false, .. } => self.unused_inner_width(),
+        Flow::Down => self.unused_inner_height(),
+        _ => panic!(),
+    }
+}
+```
+For the View{flow:Right} child (which has Flow::Right), this calls `unused_inner_width()`.
+
+**6. `unused_inner_width` (turtle.rs:732):**
+```rust
+pub fn unused_inner_width(&self) -> f64 {
+    self.inner_width() - self.inner_used_width().min(self.inner_width())
+}
+```
+If `inner_width()` is NaN (unresolved width for a shrink-to-fit container), then `NaN - anything.min(NaN)` = NaN.
+
+---
+
+#### Why `padding:` triggers it
+
+The `RoundedView{flow:Down height:Fit padding:16}` reduces the inner content width by 32px. The `View{flow:Right}` child inside it inherits this narrowed width. During the `View{flow:Right}`'s layout:
+
+1. The flow:Right turtle's `inner_width()` is set to the padded width (parent_width - 32)
+2. But the View itself is still sizing — its own height:Fit means height is NaN during width resolution
+3. Children (buttons) inside flow:Right have fixed widths (e.g., `width: 88`), not Fill
+4. Because no child uses `width:Fill`, `total_deferred_weight` is 0 in `resolve_fill`
+5. `0 / 0 = NaN` — the weight division produces NaN regardless of `unresolved_length`
+6. This NaN fill is pushed to `resolved_fills` and propagated through the sum
+
+Without `padding:16`, the outer RoundedView's inner width equals the full container width, the flow:Right View resolves its layout differently (the circular dependency doesn't trigger because width is known), and `end_turtle_with_guard` completes before the NaN can enter the fill resolution.
+
+**Why direct children (no View wrapper) fix it:** With `flow:Down` and buttons as direct orphans, there is NO nested `flow:Right` layout at all. Each button is laid out sequentially with fixed height. The parent height resolves deterministically as the sum of fixed-height children. No Fill resolution, no deferred weights, no division, no NaN.
+
+---
+
+#### `debug_assert` vs release builds
+
+The crash is a `debug_assert!(!dy.is_nan())` (turtle.rs:2342). This only fires in debug builds. In release builds, the NaN silently propagates through the rendering pipeline, potentially producing garbled output or GPU errors.
+
+**`catch_unwind` does NOT fix it:** Even if `catch_unwind` catches the panic, the NaN value persists in Makepad's layout state (the turtle's `resolved_fills` list). Every subsequent Draw event re-encounters the same NaN and crashes again.
+
+---
+
+### Crash 2: Null pointer in `first_rect_for_character_range` (macos_delegates.rs:738)
+
+**Symptom:**
+```
+null pointer dereference at macos_delegates.rs:738:37
+thread 'main' panicked with `panic_nounwind_fmt`
+```
+Stack (key frames):
+```
+ 4: first_rect_for_character_range (macos_delegates.rs:738)
+    let clearance = cw.ime_rect.size.y * 0.6;  // crash here
+...
+22: do_callback (macos_app.rs:687)
+23: do_callback (macos_window.rs:659)
+24: send_window_closed_event (macos_window.rs:844)
+25: window_will_close (macos_delegates.rs:181)
+```
+
+---
+
+#### The dangling pointer chain (line-by-line)
+
+**View initialization (macos_delegates.rs:438):**
+```rust
+extern "C" fn init_with_ptr(this: &Object, _sel: Sel, cx: *mut c_void) -> ObjcId {
+    (*this).set_ivar("macos_window_ptr", cx);  // cx = raw &MacosWindow
+```
+When the NSView is created, a raw pointer to the `MacosWindow` Rust struct is stored in the view's `macos_window_ptr` ivar. This pointer is NEVER cleared or updated.
+
+**The getter (macos_window.rs:937):**
+```rust
+pub fn get_cocoa_window(this: &Object) -> &mut MacosWindow {
+    let ptr: *mut c_void = *this.get_ivar("macos_window_ptr");
+    &mut *(ptr as *mut MacosWindow)  // dangling pointer -> UB
+}
+```
+Zero null-checking. If `macos_window_ptr` points to freed memory, this is undefined behavior.
+
+**The crash site (macos_delegates.rs:700-738):**
+```rust
+let cw = get_cocoa_window(this);   // line 700: gets dangling ref
+let view: ObjcId = this as *const _ as *mut _;
+let view_rect: NSRect = msg_send![view, frame];  // line 702: accesses view (ok, not cw)
+// ... several msg_send! calls that don't touch cw ...
+let clearance = cw.ime_rect.size.y * 0.6;  // line 738: FIRST access to cw -> crash
+```
+The crash is at line 738 because that's the FIRST time `cw` (the dangling `&MacosWindow`) is actually dereferenced. The `msg_send!` calls above use `view` (the ObjC NSView), not `cw`.
+
+---
+
+#### Why the pointer becomes dangling
+
+1. User clicks red close button on the Makepad Host window
+2. Cocoa calls `windowWillClose:` on the window delegate
+3. `send_window_closed_event(&mut self)` is called (macos_window.rs:844), where `self` is the `MacosWindow`
+4. This calls `do_callback`, which processes the `WindowClosed` event through the Makepad event loop
+5. **After** `windowWillClose:` returns (or during a nested runloop), the MacosWindow is deallocated by the Rust Drop implementation
+6. But the NSView's `macos_window_ptr` ivar still points to the now-freed memory
+7. During the window close sequence, the `__ai_text` widget (injected TextInput) loses focus
+8. The macOS IME system queries `firstRectForCharacterRange:` on the view to determine where to place the IME candidate window
+9. `get_cocoa_window(this)` reads the dangling `macos_window_ptr` and returns a reference to freed memory
+10. `cw.ime_rect.size.y` dereferences freed memory -> Rust compiler's UB null-check -> `panic_nounwind`
+
+**Key insight:** The `macos_window_ptr` ivar is set once at view creation and NEVER cleared when the MacosWindow is dropped. After drop, it's a classic use-after-free dangling pointer.
+
+---
+
+#### Why `panic_nounwind` can't be caught
+
+`panic_nounwind_fmt` is a special panic path the Rust compiler uses when it detects undefined behavior (null pointer dereference, out-of-bounds access) in contexts where unwinding is not allowed. Unlike a normal `panic!()` which can be caught with `catch_unwind`:
+
+- `panic_nounwind` calls `core::intrinsics::abort()` internally
+- `catch_unwind` has empty unwind tables for nounwind functions
+- The panic skips all cleanup and terminates the process immediately
+
+This crash is **uncatchable by design** — the compiler determined the code is in a state where recovery is unsafe.
+
+---
+
+#### Why `exit(0)` before event processing fixes it
+
+```rust
+// app.rs handle_event
+if matches!(event, Event::WindowClosed(_)) {
+    std::process::exit(0);  // exit BEFORE self.ui.handle_event()
+}
+```
+
+By calling `exit(0)` at the VERY TOP of `handle_event` for `WindowClosed` events:
+1. `self.ui.handle_event()` is NEVER called — the widget tree is never touched
+2. No TextInput loses focus — the IME system is never triggered
+3. No ObjC message dispatch to the NSView for IME queries
+4. `firstRectForCharacterRange:` is never called
+5. The process terminates before the dangling pointer can be dereferenced
+
+This is a pre-emptive kill rather than a recovery — we exit before the crash can happen.
+
+---
+
+### Triage flow for both crashes
+
+1. Tool times out or returns stale data -> host is likely dead
+2. Validate with `ps aux | grep makepad-host` or `inspect_makepad_doc` for `panic_backtrace`
+3. Harness detects host death via `child.try_wait()` in bridge loop -> sends `{"type":"host_died"}` to extension
+4. Extension calls `disposeAllSessions()` to clean up background agent sessions
+5. Extension updates status to "Makepad: host crashed"
+6. Check `panic_backtrace` in doc to determine which crash occurred
+7. Restart by launching a new app (spawns fresh harness + host)
+
+---
+
+## 15. Streaming Inline Rendering
+
+Generated Splash DSL code is rendered **inline** inside the generator app via the injected `__run_splash` AgentSplash (a nested AgentSplash with `is_root:false`).
+
+**Flow:**
+1. Sub-agent streams deltas -> auto-handler sends `send_streaming_delta` -> harness appends to CRDT `streaming_text`
+2. CRDT syncs to host -> `Event::Signal` fires
+3. `sync_streaming_text()` runs (agent_splash.rs, only on Signal):
+   - Writes accumulated text to `__ai_text` label
+   - Extracts Splash DSL code from the text (handles \`\`\`runsplash, \`\`\`splash, plain \`\`\`, or raw DSL with no backticks)
+   - Calls `__run_splash.set_text(cx, &code)` which evaluates and renders the code inline
+4. `set_text()` has error recovery: if `eval_body()` fails (partial/incomplete code during streaming), it restores the previous valid body and silently ignores the failure
+5. On streaming completion, `sync_pi_data_to_splash()` writes the final text to `__pi_data` and also re-evaluates through `__run_splash` for the final rendered result
+
+**Key constraint:** `sync_streaming_text()` and `sync_pi_data_to_splash()` only run on `Event::Signal` (not Draw/Mouse/Timer), to avoid 60fps CRDT doc reads. This means streaming updates appear at Signal frequency, not every frame.
+
+**Files:**
+- `agent_splash.rs` -- `sync_streaming_text()`, `sync_pi_data_to_splash()`, `SPLASH_SUFFIX` injection
+- `app.rs` -- `WindowClosed` guard, `catch_unwind` in `handle_event`
+- `harness/src/main.rs` -- `child.try_wait()` host death monitor, `panic_backtrace` forwarding
+- `.pi/extensions/makepad/dist/doc-bridge.js` -- `host_died` WebSocket handler -> `disposeAllSessions()`
+- `.pi/extensions/makepad/dist/index.js` -- status updates on welcome/host_died messages

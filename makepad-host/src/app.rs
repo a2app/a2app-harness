@@ -484,6 +484,25 @@ impl AppMain for MakepadHostApp {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        // ── Early exit on WindowClosed ─────────────────────────────
+        // Null-pointer crash in first_rect_for_character_range when the
+        // system queries IME during window close. Exit BEFORE any text
+        // input processing to prevent the macOS delegate from accessing
+        // a deallocated NSView via get_cocoa_window().
+        if matches!(event, Event::WindowClosed(_)) {
+            if let Some(doc_handle) = crate::SHARED_DOC.get() {
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.should_exit = true;
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+            }
+            std::process::exit(0);
+        }
+
         // Wrap the entire handler in catch_unwind to prevent any panic from
         // propagating through the #[no_unwind] macOS NSTimer callback
         // (received_timer), which would abort with panic_cannot_unwind.
@@ -515,6 +534,22 @@ impl AppMain for MakepadHostApp {
         
         if let Err(e) = result {
             eprintln!("[app] handle_event panicked: {:?}", e);
+            // Capture the panic backtrace from the global and write to CRDT doc
+            let backtrace_text = crate::LAST_PANIC_BACKTRACE.get().and_then(|g| {
+                g.lock().ok().and_then(|mut guard| guard.take())
+            }).unwrap_or_else(|| {
+                format!("PANIC: {:?}\n(no backtrace captured)", e)
+            });
+            if let Some(doc_handle) = crate::SHARED_DOC.get() {
+                doc_handle.with_document(|doc| {
+                    use autosurgeon::{hydrate, reconcile};
+                    let mut agent: shared::AgentDoc = hydrate(doc).unwrap_or_default();
+                    agent.panic_backtrace = Some(backtrace_text);
+                    let mut tx = doc.transaction();
+                    let _ = reconcile(&mut tx, &agent);
+                    tx.commit();
+                });
+            }
             // Log the panic but don't re-panick — the NSTimer callback is
             // #[no_unwind] and re-panicking would abort the process.
         }

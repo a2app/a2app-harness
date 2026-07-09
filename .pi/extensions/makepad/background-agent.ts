@@ -62,6 +62,12 @@ interface StoredSession {
   provider: string;
   modelId: string;
   createdAt: number;
+  /// Which app to stream deltas to (null = no streaming, e.g. tool-created session)
+  streamAppId: string | null;
+  /// Unsubscribe function for the session-level streaming subscription (null = no sub)
+  subUnsub: (() => void) | null;
+  /// Accumulated text for the current in-flight prompt (reset each prompt)
+  accumulated: string;
 }
 
 const sessions = new Map<string, StoredSession>();
@@ -72,6 +78,43 @@ const appSessionMap = new Map<string, string>();
 
 function getDefaultModel(): { provider: string; modelId: string } {
   return { provider: "deepseek", modelId: "deepseek-v4-flash" };
+}
+
+// ── Persistent Streaming Subscription ───────────────────────────────────
+//
+// Sets up a SINGLE subscription per session that lives for the entire
+// lifetime of the session. Every text_delta from ANY prompt on this
+// session is streamed to the harness via send_streaming_delta.
+//
+// The `accumulated` field on the session is reset by the caller before
+// each prompt (e.g., in the ai:ask: handler), so each prompt's deltas
+// are correctly accumulated for the send_streaming_end completion event.
+//
+function setupSessionStreaming(sessionId: string, appId: string): void {
+  const stored = sessions.get(sessionId);
+  if (!stored) return;
+
+  // Remove any existing subscription to avoid duplicates
+  if (stored.subUnsub) {
+    stored.subUnsub();
+    stored.subUnsub = null;
+  }
+
+  stored.streamAppId = appId;
+  stored.accumulated = "";
+
+  const unsub = stored.session.subscribe((event: any) => {
+    if (
+      event.type === "message_update" &&
+      event.assistantMessageEvent?.type === "text_delta"
+    ) {
+      const current = sessions.get(sessionId);
+      if (!current) return;
+      current.accumulated += event.assistantMessageEvent.delta;
+    }
+  });
+
+  stored.subUnsub = unsub;
 }
 
 // ── Tool Registration ────────────────────────────────────────────────────
@@ -145,18 +188,16 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
           tools: [],
         });
 
-        // Collect output via subscription
-        const unsub = session.subscribe((event: any) => {
-          if (
-            event.type === "message_update" &&
-            event.assistantMessageEvent?.type === "text_delta"
-          ) {
-            // Just keeping the subscription alive
-          }
-        });
-
         const sessionId = `bg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        sessions.set(sessionId, { session, provider, modelId, createdAt: Date.now() });
+        sessions.set(sessionId, {
+          session,
+          provider,
+          modelId,
+          createdAt: Date.now(),
+          streamAppId: null,    // no app_id — streaming set up later if associated
+          subUnsub: null,        // no streaming subscription yet
+          accumulated: "",
+        });
 
         return {
           content: [
@@ -224,7 +265,7 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
         });
 
         await Promise.race([
-          stored.session.prompt(params.message, { expandPromptTemplates: false }),
+          stored.session.prompt(params.message, { expandPromptTemplates: false, streamingBehavior: "steer" }),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error(`Timed out after ${maxWait / 1000}s`)), maxWait),
           ),
@@ -404,21 +445,41 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
         });
 
         const sessionId = "bg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+
+        // Seed the system prompt FIRST (before setting up streaming), so the
+        // seeding response doesn't leak into the UI. Use a temporary non-streaming
+        // subscription just to keep the SDK happy.
+        if (systemPrompt) {
+          let _seedResp = "";
+          const _seedUnsub = session.subscribe((event: any) => {
+            if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+              _seedResp += event.assistantMessageEvent.delta;
+            }
+          });
+          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false, streamingBehavior: "steer" });
+          _seedUnsub();
+        }
+
+        // Now set up the persistent streaming subscription for all future prompts.
         sessions.set(sessionId, {
           session,
           provider: "deepseek",
           modelId,
           createdAt: Date.now(),
+          streamAppId: null,  // will be set by setupSessionStreaming
+          subUnsub: null,
+          accumulated: "",
         });
+
+        // Set up persistent streaming subscription
+        setupSessionStreaming(sessionId, params.app_id);
 
         // Associate app_id with session_id for the auto-handler
         appSessionMap.set(params.app_id, sessionId);
 
-        // Seed the system prompt as the first message and WAIT for it.
-        // Using fire-and-forget causes race conditions with the first ai:ask.
-        if (systemPrompt) {
-          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false });
-        }
+        // Sync currentApp state so list_makepad_apps and check_debug_app work
+        const { setCurrentAppState } = await import("./tools.js");
+        setCurrentAppState({ app_id: params.app_id, status: "Launched", splash_body: params.splash_body });
 
         return {
           content: [{
@@ -457,6 +518,10 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
       }
 
       try {
+        // Clean up the persistent streaming subscription first
+        if (stored.subUnsub) {
+          stored.subUnsub();
+        }
         stored.session.dispose();
       } catch {
         // Ignore
@@ -517,24 +582,31 @@ async function initSession(appId: string, initialMessage?: string): Promise<stri
     });
 
     const sessionId = "bg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+
+    // Set up session entry and persistent streaming subscription
     sessions.set(sessionId, {
       session,
       provider: "deepseek",
       modelId: "deepseek-v4-flash",
       createdAt: Date.now(),
+      streamAppId: null,
+      subUnsub: null,
+      accumulated: "",
     });
+    setupSessionStreaming(sessionId, appId);
 
     // If there's an initial message, process it immediately
     if (initialMessage) {
-      let response = "";
-      const unsub = session.subscribe((event: any) => {
-        if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-          response += event.assistantMessageEvent.delta;
-        }
-      });
-      await session.prompt(initialMessage, { expandPromptTemplates: false });
-      unsub();
-      sendToHarness({ type: "send_pi_response", app_id: appId, data: sessionId + "|" + (response || "") });
+      // Reset accumulated for this prompt
+      const stored = sessions.get(sessionId);
+      if (stored) stored.accumulated = "";
+
+      await session.prompt(initialMessage, { expandPromptTemplates: false, streamingBehavior: "steer" });
+
+      // Read accumulated text from the subscription
+      const finalText = stored ? stored.accumulated : "";
+      sendToHarness({ type: "send_streaming_end", app_id: appId, final_text: finalText || "[No response]" });
+      sendToHarness({ type: "send_pi_response", app_id: appId, data: sessionId + "|" + (finalText || "") });
     } else {
       sendToHarness({ type: "send_pi_response", app_id: appId, data: sessionId });
     }
@@ -593,17 +665,9 @@ function handleAutoMessage(data: string, appId: string): void {
         });
 
         const sessionId = "bg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-        sessions.set(sessionId, {
-          session,
-          provider: "deepseek",
-          modelId: "deepseek-v4-flash",
-          createdAt: Date.now(),
-        });
-        appSessionMap.set(appId, sessionId);
 
-        // Send the app-provided system prompt as the first message to set context.
-        // The agent session doesn't expose a systemPrompt option via createAgentSession,
-        // so we seed the conversation with a context-setting message.
+        // Seed the system prompt FIRST (before setting up streaming), so
+        // the seeding response doesn't leak into the splash UI.
         if (systemPrompt) {
           let _initResp = "";
           const _unsub = session.subscribe((event: any) => {
@@ -611,9 +675,22 @@ function handleAutoMessage(data: string, appId: string): void {
               _initResp += event.assistantMessageEvent.delta;
             }
           });
-          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false });
+          await session.prompt("[SYSTEM CONTEXT] " + systemPrompt, { expandPromptTemplates: false, streamingBehavior: "steer" });
           _unsub();
         }
+
+        // Set up the session entry and persistent streaming subscription
+        sessions.set(sessionId, {
+          session,
+          provider: "deepseek",
+          modelId: "deepseek-v4-flash",
+          createdAt: Date.now(),
+          streamAppId: null,
+          subUnsub: null,
+          accumulated: "",
+        });
+        setupSessionStreaming(sessionId, appId);
+        appSessionMap.set(appId, sessionId);
 
         // Confirm to the splash app that the session was initialized
         sendToHarness({ type: "send_pi_response", app_id: appId, data: "[Session initialized with app-provided system prompt]" });
@@ -645,18 +722,45 @@ function handleAutoMessage(data: string, appId: string): void {
         const stored = sessions.get(sid);
         if (!stored) return;
 
+        // ── Use per-prompt subscription for streaming (proven pattern) ──
+        // Batch deltas with a 50ms timer to avoid flooding the CRDT with
+        // individual writes on every text_delta event from the AI model.
         let response = "";
+        let batchAccumulated = "";
+        let batchTimer: ReturnType<typeof setTimeout> | null = null;
+        const flushBatch = () => {
+          if (batchAccumulated) {
+            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: batchAccumulated });
+            batchAccumulated = "";
+          }
+          batchTimer = null;
+        };
         const unsub = stored.session.subscribe((event: any) => {
-          if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-            response += event.assistantMessageEvent.delta;
-            sendToHarness({ type: "send_streaming_delta", app_id: appId, delta: response });
+          if (
+            event.type === "message_update" &&
+            event.assistantMessageEvent?.type === "text_delta"
+          ) {
+            const delta = event.assistantMessageEvent.delta;
+            response += delta;
+            batchAccumulated += delta;
+            if (!batchTimer) {
+              batchTimer = setTimeout(flushBatch, 50);
+            }
           }
         });
 
-        await stored.session.prompt(message, { expandPromptTemplates: false });
+        await stored.session.prompt(message, { expandPromptTemplates: false, streamingBehavior: "steer" });
+
+        // Flush any remaining batch and unsubscribe
+        if (batchTimer) clearTimeout(batchTimer);
+        if (batchAccumulated) flushBatch();
         unsub();
 
-        sendToHarness({ type: "send_streaming_end", app_id: appId, final_text: response || "[No response]" });
+        sendToHarness({
+          type: "send_streaming_end",
+          app_id: appId,
+          final_text: response || "[No response]",
+        });
       } catch (err) {
         console.error("[bg-agent] Error processing message:", err);
       }
@@ -701,6 +805,9 @@ export function registerAppSessionAssociation(appId: string, sessionId: string):
 export function disposeAllSessions(): void {
   for (const [, stored] of sessions) {
     try {
+      if (stored.subUnsub) {
+        stored.subUnsub();
+      }
       stored.session.dispose();
     } catch {
       // ignore
