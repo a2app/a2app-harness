@@ -569,6 +569,45 @@ widget injected into every splash body's `SPLASH_SUFFIX`.
 
 This section covers general Makepad Splash DSL patterns that apply to ANY app body.
 
+> **⚠️ CRITICAL: The `dy.is_nan()` crash at `turtle.rs:2342`**
+>
+> This crash happens when using **`padding:Inset{...}`** on a `RoundedView` or `View` that
+> contains **nested `View{flow:Right}`** children (especially with fixed-width buttons).
+>
+> **Root cause:** `padding` reduces the inner content width. Inside, a `flow:Right` View
+> creates a nested layout system where `unused_inner_width()` produces `NaN` because no
+> child uses `width:Fill` → `total_deferred_weight` is 0 → `0/0 = NaN` fill → propagates
+> through `move_align_list` → crashes.
+>
+> **Fix: NEVER use `RoundedView{padding:...}` as the root container.** Use a plain
+> `View` (or no wrapper at all) and apply padding only via inner `View` children.
+> Or better yet, **omit `padding` entirely** and use `spacing` between children with
+> direct orphans (no `View{flow:Right}` wrapper for buttons).
+>
+> ```splash
+> // ✅ SAFE — direct orphans, no padding, no flow:Right wrapper
+> RoundedView{width:Fill height:Fit flow:Down spacing:12 show_bg:true ...
+>   display := Label{...}
+>   ButtonFlat{text:"-" on_click:||{...}}  // direct children, no wrapping
+>   ButtonFlat{text:"Send" on_click:||{...}}
+> }
+>
+> // ❌ CRASH — padding + flow:Right wrapper = dy.is_nan()
+> RoundedView{width:Fill height:Fit padding:16 flow:Down ...
+>   View{flow:Right spacing:12  // <-- nested layout with reduced inner width = NaN
+>     ButtonFlat{text:"-" ...}
+>     ButtonFlat{text:"+" ...}
+>   }
+> }
+> ```
+>
+> **If you NEED horizontal button rows:**
+> 1. Use `flow:Right` directly on the root (if no other layout needed), OR
+> 2. Omit `padding` on the outer container, OR
+> 3. Use `spacing` between orphan buttons in `flow:Down` (each on its own line)
+>
+> See §14.1 for the full NaN propagation trace.
+
 ### 4.1 Key Rules
 
 - **`let`/`fn` declarations must be at the top**, before any widget. The body starts with declarations, then the root widget.

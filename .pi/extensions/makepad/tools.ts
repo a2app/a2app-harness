@@ -14,6 +14,12 @@ let harnessStarted = false;
 let harnessReady: Promise<void> | null = null;
 let currentApp: AppState | null = null;
 
+// Export setter for background-agent.ts to sync state
+// currentApp must be set by launch_app_with_agent too
+export function setCurrentAppState(state: AppState | null): void {
+  currentApp = state;
+}
+
 // Track the last render error per app_id
 const lastErrors = new Map<string, string>();
 

@@ -477,6 +477,10 @@ export function registerBackgroundAgentTools(pi: ExtensionAPI): void {
         // Associate app_id with session_id for the auto-handler
         appSessionMap.set(params.app_id, sessionId);
 
+        // Sync currentApp state so list_makepad_apps and check_debug_app work
+        const { setCurrentAppState } = await import("./tools.js");
+        setCurrentAppState({ app_id: params.app_id, status: "Launched", splash_body: params.splash_body });
+
         return {
           content: [{
             type: "text",
