@@ -58,7 +58,9 @@ TypeScript extension. Key files:
 
 Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.js`, and `tools.ts`/`dist/tools.js` must be kept in sync — pi loads from `dist/`.
 
-### JSON WS Protocol (pi ↔ harness, port 2341)
+## 2. Communication Flows
+
+### 2.1 JSON WS Protocol (pi ↔ harness, port 2341)
 
 #### Pi → Harness
 ```json
@@ -82,15 +84,15 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 {"type": "doc_state", "app_id": "todo-1", "user_response": "...", "error_message": "...", "status": "...", "pi_response": "..."}
 ```
 
-### Communication Flows
+### 2.2 Launch App
 
-#### Launch App
 1. pi sends `{"type":"launch","app_id":"...","splash_body":"..."}` over JSON WS
 2. Harness writes `pending_app` to CRDT doc (Pending → Launched)
 3. CRDT syncs to makepad-host over samod WS
 4. Makepad-host renders splash in AgentSplash widget on next Draw event
 
-#### User Response (splash → pi)
+### 2.3 User Response (splash → pi)
+
 1. Splash app calls `ui.__pi_response.set_text("data")` in any `on_click` handler
 2. AgentSplash detects the label text changed → writes `user_response` to CRDT doc
 3. AgentSplash also increments `user_response_version` before writing
@@ -98,7 +100,8 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 5. Harness forwards `{"type":"user_response","app_id":"...","response":"..."}` to pi
 6. Pi extension buffers the event (per-type Map) and dispatches to `wait_for_response`
 
-#### Pi Response (pi → splash)
+### 2.4 Pi Response (pi → splash)
+
 1. pi (or extension auto-handler) sends `{"type":"send_pi_response","app_id":"...","data":"..."}` over JSON WS
 2. Harness writes `pi_response` to CRDT doc + sets `extension_requests = true`
 3. CRDT syncs to makepad-host over samod WS
@@ -106,11 +109,12 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 5. AgentSplash reads `pi_response`, writes it to `__ai_text` widget (TextInput) and `__pi_data` label
 6. Splash app reads response via `ui.__ai_text.text()` or `ui.__pi_data.text()`
 
-#### Streaming Response (ai:ask → live deltas → splash)
+### 2.5 Streaming Response (ai:ask → live deltas → splash)
+
 1. Splash calls `ui.__pi_response.set_text("ai:ask:message")` → AgentSplash writes `user_response` + increment `user_response_version`
 2. Harness bridge loop detects version change → forwards `{"type":"user_response",...}` to pi over JSON WS
 3. Extension auto-handler matches `ai:ask:` prefix → finds session via `appSessionMap.get(appId)`
-4. Auto-handler creates a **per-prompt subscription** (same proven pattern as `send_background_message`) that:
+4. Auto-handler creates a **per-prompt subscription** that:
    - Captures each `text_delta` event from the pi SDK
    - Sends it immediately as `{"type":"send_streaming_delta","app_id":"...","delta":"<raw new chars>"}` over JSON WS
 5. Harness receives `send_streaming_delta` → **APPENDS** the delta to `streaming_text` CRDT field:
@@ -127,12 +131,15 @@ Both `validate-splash.ts`/`dist/validate-splash.js`, `harness.ts`/`dist/harness.
 9. Harness handles `send_streaming_end`: sets `pi_response = Some(final_text)`, clears `streaming_text = None`, sets `extension_requests = true`
 10. CRDT sync → Signal → `sync_pi_data_to_splash()` reads `pi_response`, writes final text to `__ai_text`, `__pi_data`, and `log` (replacing the "🤖 ..." line), then **clears** `pi_response` from the doc
 
-#### Shutdown
+### 2.6 Shutdown
+
 1. pi sends `{"type":"exit"}` or pi exits
 2. Harness sets `should_exit = true` in the doc
 3. Harness kills makepad-host child process and exits
 
-### Shared Document (`AgentDoc` in `shared/src/lib.rs`)
+## 3. Shared Document
+
+`AgentDoc` in `shared/src/lib.rs`:
 
 ```rust
 pub struct AgentDoc {
@@ -159,9 +166,7 @@ pub struct AgentDoc {
 
 CRDT is in-memory only — no disk persistence. Restarting always starts clean.
 
----
-
-## 2. Debug System (`check_debug_app`)
+## 4. Debug System
 
 Debug commands flow: pi → harness → CRDT doc → makepad-host → response back.
 
@@ -258,7 +263,7 @@ fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
 ```
 
 Key differences from the host's handle_event:
-- **`sync_streaming_text` and `sync_pi_data_to_splash` only run on `Event::Signal`** — not on Draw, Mouse, or Timer events. This prevents reading+hyrating the CRDT doc at 60fps (which caused CPU spikes during streaming).
+- **`sync_streaming_text` and `sync_pi_data_to_splash` only run on `Event::Signal`** — not on Draw, Mouse, or Timer events. This prevents reading+hydrating the CRDT doc at 60fps (which caused CPU spikes during streaming).
 - The `__pi_response` check runs on ALL events (not just Signal) so that splash → pi messages are not missed.
 - The STREAMING_RX mpsc channel (a secondary direct-delivery path) is drained on every event.
 
@@ -276,12 +281,6 @@ Splash content widgets have `parent = -1` in the widget tree graph. This means:
 
 **Orphan widget coordinates in `widget_dump` and `widget_snapshot` are WINDOW-RELATIVE** — they are relative to the window's content area top-left (0,0 at window's content origin, NOT including the window's screen position).
 
-This was confirmed by testing (2026-06-24):
-- Window at screen position (245, 144)
-- AgentSplash at snapshot absolute (271, 276) → window-relative: (271-245=26, 276-144=132)
-- Orphan outer View at window-relative (26, 132) — MATCHES AgentSplash's window-relative position
-- Orphan "-" button at window-relative (447, 135) → clicked at center (457, 146) → COUNTER DECREMENTED ✅
-
 **To click: use orphan coordinates directly — they are already in window-relative space.**
 
 ```
@@ -289,11 +288,10 @@ click_x = orphan_widget.x + (orphan_widget.width / 2)
 click_y = orphan_widget.y + (orphan_widget.height / 2)
 ```
 
-Do NOT add window position. Do NOT add parent offsets. The orphan coordinates in the dump/snapshot are absolute window-relative positions.
+Do NOT add window position. Do NOT add parent offsets.
 
 **Example from the compact_dump format (W3):**
 ```
-# Parent ID is shown but coordinates are WINDOW-RELATIVE, not parent-relative
 9 -1 - View 26 132 928 105           # orphan View, window-relative (26,132)
 10 9 display Label 50 162 22 32      # display at (50,162) in window space
 11 9 - Button 442 224 41 22           # Click button at (442,224), center (462,235)
@@ -303,11 +301,6 @@ Click at window-relative (462, 235) to hit the button at (442, 224, 41, 22).
 ### Clipped Rect Issue (Critical for Nested Widgets)
 
 Containers with `padding` or `show_bg: true` create draw clips that affect their children's `area.clipped_rect()`. The hit-test for mouse events uses `area.clipped_rect()`, NOT `area.rect()`. If a child widget overflows the parent's padded content area, its `clipped_rect` is reduced to the overlap, potentially making it UNHITTABLE.
-
-**Tested (2026-06-24):**
-- **Direct orphans (parent=-1) with no container wrapping**: Buttons hittable ✅
-- **Nested inside `View{height:Fit}` without padding**: Buttons hittable ✅
-- **Nested inside `RoundedView{padding:16}` where buttons overflowed padded area**: Buttons NOT hittable ❌
 
 **Workaround:** Keep interactive buttons as direct orphans (not wrapped in containers with padding), or ensure they fit within the parent's padded content area.
 
@@ -322,21 +315,14 @@ Containers with `padding` or `show_bg: true` create draw clips that affect their
 
 **CRITICAL: Always take a fresh snapshot before each click** — orphan coordinates shift after layout changes (e.g., adding list items moves buttons down).
 
-**Use `inspect_makepad_doc` for response** — `wait_for_response` may time out if the response arrived before the listener was set up (the listener is event-driven and events may be missed during tool transitions). `inspect_makepad_doc` is synchronous and always reflects the current doc state.
+**Use `inspect_makepad_doc` for response** — `wait_for_response` may time out if the response arrived before the listener was set up. `inspect_makepad_doc` is synchronous and always reflects the current doc state.
 
 ### Known Interaction Issues
 
-**Coordinates shift after layout changes**
-When content grows (e.g., items added to a list via `set_text()`), the splash container height changes and all subsequent widgets shift downward. The orphan coordinates from the initial snapshot become stale. **Always take a fresh snapshot before each click** if the UI has changed since the last snapshot.
-
-**`type_text` fills the first TextInput within splash children**
-The `type_text` command calls `walk_widgets_set_text(splash, ...)` which walks the AgentSplash widget's child hierarchy via `try_children()` (which delegates to the inner View's children list — the outer View from SPLASH_PREFIX). This means it walks the splash body's widget tree, NOT the main UI tree, so it will **not** accidentally fill the makepad-host `source` editor. It fills the first TextInput found in depth-first order (stops at first match).
-
-**Tested (2026-06-24):** Body with `inp := TextInput{height:34}` as first child → `type_text` filled `inp` with `value: "hello world"` ✅
-
-**Also tested: clicking at coordinates that don't hit any widget (e.g., (5,5)) is a harmless no-op — no crash, no response sent.** ✅
-
-**Also tested: empty string `send_pi_response` is a harmless no-op.** ✅
+- **Coordinates shift after layout changes** — when content grows, orphan coordinates from a previous snapshot become stale. Always take a fresh snapshot before each click if the UI has changed.
+- **`type_text` fills the first TextInput within splash children** — walks depth-first, stops at first match. Will not accidentally fill the makepad-host `source` editor.
+- **Clicking at coordinates that don't hit any widget** — harmless no-op, no crash, no response sent.
+- **Empty string `send_pi_response`** — harmless no-op.
 
 ### Rendering Error Handling
 
@@ -346,9 +332,7 @@ When splash body fails to render:
 3. Harness forwards `{"type":"error","app_id":"...","message":"..."}` to pi
 4. The launch tool has a 1.5s debounce window after receiving `status=Launched` to collect any error messages. Errors persist in a `lastErrors` map per app_id.
 
----
-
-## 3. Background Sub-Agent Sessions
+## 5. Background Sub-Agent Sessions
 
 Splash apps can communicate with background AI sub-agent sessions created via the pi SDK.
 The sub-agent is an independent `AgentSession` that processes prompts and returns responses.
@@ -421,12 +405,11 @@ If no session exists when `ai:ask:` arrives, one is auto-created with a default 
 
 ### Auto-Display via `__ai_text` (with Streaming)
 
-The AgentSplash injects a `__ai_text := TextInput{text:" " height:0 width:Fill visible:false}` widget that
+The AgentSplash injects a `__ai_text := TextInput{height:34 width:Fill}` widget that
 auto-displays the sub-agent's response — no manual reading needed.
 
 **Streaming architecture (per-prompt subscription):** When the auto-handler processes
-an `ai:ask:` message, it creates a **per-prompt subscription** (identical pattern to
-`send_background_message`):
+an `ai:ask:` message, it creates a **per-prompt subscription**:
 
 ```typescript
 let response = "";
@@ -447,18 +430,12 @@ Key characteristics:
 - **Individual deltas** are sent (raw new chars, NOT full accumulated text)
 - The harness **APPENDS** each delta to the CRDT `streaming_text` field
 - On completion, `send_streaming_end` sets `pi_response` (final text) and clears `streaming_text`
-- `sync_streaming_text()` is called **only on `Event::Signal`** (not on every Draw/Mouse event)
-  to avoid reading+hyrating the CRDT doc at 60fps
-- The `log` widget uses `rfind("\n🤖 ")` (not `rfind('\n')`) to correctly find the
-  AI response boundary when the response contains internal newlines
+- `sync_streaming_text()` is called **only on `Event::Signal`** to avoid reading+hydrating the CRDT doc at 60fps
+- The `log` widget uses `rfind("\n🤖 ")` (not `rfind('\n')`) to correctly find the AI response boundary when the response contains internal newlines
 
 **Also has a session-level subscription** (`setupSessionStreaming`) that silently
 accumulates deltas into `stored.accumulated` (does NOT send to harness). This is
 a fallback for `send_background_message` tool usage and future use.
-
-**Result:** the `__ai_text` widget shows text appearing token-by-token as the model
-generates, rather than waiting for the full response. The splash app can also read
-the final response via `ui.__pi_data.text()` (only updated on completion).
 
 ### Injected Widgets
 
@@ -517,7 +494,7 @@ ButtonFlat{text:"Send" on_click:||{
 The response auto-appears in the `__ai_text` TextInput at the bottom of the layout.
 No display widget needed in the splash body.
 
-### 3.4 Inline Runsplash Rendering (Current Working Implementation)
+### Inline Runsplash Rendering
 
 Runsplash code can be rendered **inline** inside the chat app via a nested AgentSplash
 widget injected into every splash body's `SPLASH_SUFFIX`.
@@ -525,7 +502,7 @@ widget injected into every splash body's `SPLASH_SUFFIX`.
 **How it works:**
 1. `SPLASH_SUFFIX` includes `__run_splash := AgentSplash{width:Fill height:Fit is_root:false}`
 2. The nested AgentSplash has `is_root:false`, so it does NOT sync from the CRDT doc
-3. During streaming, `sync_streaming_text()` extracts `\`\`\`runsplash` blocks from
+3. During streaming, `sync_streaming_text()` extracts `` ```runsplash `` blocks from
    the accumulated text and calls `run_splash.set_text(cx, &runsplash_code)`
 4. The nested AgentSplash evaluates the runsplash code and renders it **inline**
    below the chat app (preserving the chat state)
@@ -535,308 +512,162 @@ widget injected into every splash body's `SPLASH_SUFFIX`.
 7. On completion, `sync_pi_data_to_splash()` also runs the runsplash code through
    the nested AgentSplash, replacing any partial rendering with the final result
 
-**Known Problems:**
-1. **AI generates incorrect naming syntax** — The AI often uses `id: disp` instead of
-   `disp := Label{...}` to name widgets. This causes buttons to render but click
-   handlers referencing `ui.disp` to silently fail. **Workaround:** Improve the system
-   prompt with explicit examples of the `:=` naming syntax.
-2. **Second prompt error** — Sending a second `ai:ask:` while the first is still
-   streaming. Fixed by adding `streamingBehavior: "steer"` to `session.prompt()`.
-3. **Nested children invisible in debug tools** — `widget_snapshot` and `widget_dump`
-   only show the nested AgentSplash widget itself, not its rendered children (buttons,
-   labels). The children are in the VM's widget tree, separate from the main tree.
-4. **Buttons overflow Fit height by a few pixels** — The nested counter UI needs slightly
-   more height than the parent allocates, clipping button bottoms.
-5. **AI generates invalid DSL syntax** — The AI frequently uses commas between
-   properties (`width: Fill, height: Fit`), triple curly braces, or CSS-style
-   properties. The system prompt must rigorously teach the exact `name:value` format.
+**Flow:**
+1. Sub-agent streams deltas → auto-handler sends `send_streaming_delta` → harness appends to CRDT `streaming_text`
+2. CRDT syncs to host → `Event::Signal` fires
+3. `sync_streaming_text()` runs (agent_splash.rs, only on Signal):
+   - Writes accumulated text to `__ai_text` label
+   - Extracts Splash DSL code from the text (handles `` ```runsplash ``, `` ```splash ``, plain `` ``` ``, or raw DSL with no backticks)
+   - Calls `__run_splash.set_text(cx, &code)` which evaluates and renders the code inline
+4. On streaming completion, `sync_pi_data_to_splash()` writes the final text to `__pi_data` and also re-evaluates through `__run_splash` for the final rendered result
 
-**Recommended approach for the next session:**
-1. Create a system prompt that teaches Splash DSL syntax using ONLY valid examples
-   (no explanation, just correct code)
-2. Test with a simple prompt like "counter" and check the generated code
-3. Iterate: fix the prompt for each syntax error the AI makes
-4. Common pitfalls to address:
-   - `name := Widget{}` not `id: name` for naming
-   - Property format: `width:Fill` (no spaces after colon, no commas)
-   - `on_click:||{ code }` with double pipes
-   - `let`/`fn` at the top, before widgets
-   - String concat with `+`, number to string with `"" + n`
+**Known limitations:**
+- Nested AgentSplash children are invisible in `widget_snapshot` and `widget_dump` — only the AgentSplash widget itself shows, not its rendered children
+- Buttons may overflow Fit height by a few pixels
+- AI frequently generates invalid DSL syntax (commas between properties, `id:` instead of `:=`, etc.)
+- Sending a second `ai:ask:` while the first is still streaming is handled by `streamingBehavior: "steer"`
+- Do not render partial code during streaming (only on completion) to avoid NaN layout crashes from circular `width:Fill` / `height:Fit` dependencies
 
----
+**Key constraint:** `sync_streaming_text()` and `sync_pi_data_to_splash()` only run on `Event::Signal` (not Draw/Mouse/Timer), to avoid 60fps CRDT doc reads.
 
-## 4. Splash DSL Guide (General Reference)
+**Files:**
+- `agent_splash.rs` — `sync_streaming_text()`, `sync_pi_data_to_splash()`, `SPLASH_SUFFIX` injection
+- `app.rs` — `exit(0)` on `WindowClosed` to prevent IME dangling pointer crash, `catch_unwind` in `handle_event`
+- `harness/src/main.rs` — `child.try_wait()` host death monitor, `panic_backtrace` forwarding
+- `.pi/extensions/makepad/dist/doc-bridge.js` — `host_died` WebSocket handler → `disposeAllSessions()`
 
-This section covers general Makepad Splash DSL patterns that apply to ANY app body.
+## 6. Splash DSL Guide
 
-> **⚠️ CRITICAL: The `dy.is_nan()` crash at `turtle.rs:2342`**
->
-> This crash happens when using **`padding:Inset{...}`** on a `RoundedView` or `View` that
-> contains **nested `View{flow:Right}`** children (especially with fixed-width buttons).
->
-> **Root cause:** `padding` reduces the inner content width. Inside, a `flow:Right` View
-> creates a nested layout system where `unused_inner_width()` produces `NaN` because no
-> child uses `width:Fill` → `total_deferred_weight` is 0 → `0/0 = NaN` fill → propagates
-> through `move_align_list` → crashes.
->
-> **Fix: NEVER use `RoundedView{padding:...}` as the root container.** Use a plain
-> `View` (or no wrapper at all) and apply padding only via inner `View` children.
-> Or better yet, **omit `padding` entirely** and use `spacing` between children with
-> direct orphans (no `View{flow:Right}` wrapper for buttons).
->
-> ```splash
-> // ✅ SAFE — direct orphans, no padding, no flow:Right wrapper
-> RoundedView{width:Fill height:Fit flow:Down spacing:12 show_bg:true ...
->   display := Label{...}
->   ButtonFlat{text:"-" on_click:||{...}}  // direct children, no wrapping
->   ButtonFlat{text:"Send" on_click:||{...}}
-> }
->
-> // ❌ CRASH — padding + flow:Right wrapper = dy.is_nan()
-> RoundedView{width:Fill height:Fit padding:16 flow:Down ...
->   View{flow:Right spacing:12  // <-- nested layout with reduced inner width = NaN
->     ButtonFlat{text:"-" ...}
->     ButtonFlat{text:"+" ...}
->   }
-> }
-> ```
->
-> **If you NEED horizontal button rows:**
-> 1. Use `flow:Right` directly on the root (if no other layout needed), OR
-> 2. Omit `padding` on the outer container, OR
-> 3. Use `spacing` between orphan buttons in `flow:Down` (each on its own line)
->
-> See §14.1 for the full NaN propagation trace.
+### 6.1 Critical Layout Rules
 
-### 4.1 Key Rules
+> **AVOID `padding:Inset{...}` on a `RoundedView` or `View` that contains nested `View{flow:Right}` children.** This causes the inner buttons to become **unhittable** (their `clipped_rect` is reduced by the padded area; the hit-test uses `clipped_rect`, not `area.rect()`).
+>
+> **Fix:** Use `spacing` between orphan buttons in `flow:Down` (no `View{flow:Right}` wrapper for buttons). Or omit `padding` on the outer container.
 
-- **`let`/`fn` declarations must be at the top**, before any widget. The body starts with declarations, then the root widget.
-- **Every container MUST have `height: Fit`** — most common failure mode. Inside a fixed-height parent, `height: Fill` is fine.
-- **Root container MUST use `width: Fill`** — never a fixed pixel width. The app renders inside a parent container that provides the width.
-- `ui` object is built-in; do NOT declare it with `:=`
+```splash
+// ✅ SAFE — direct orphans, no padding, no flow:Right wrapper
+RoundedView{width:Fill height:Fit flow:Down spacing:12 show_bg:true ...
+  display := Label{...}
+  ButtonFlat{text:"-"}  // direct orphans are always hittable
+  ButtonFlat{text:"+"}
+}
+
+// ❌ PROBLEMATIC — padding + flow:Right = buttons are UNHITTABLE (confirmed still broken)
+RoundedView{width:Fill height:Fit padding:16 flow:Down ...
+  View{flow:Right spacing:12
+    ButtonFlat{text:"-"}
+    ButtonFlat{text:"+"}
+  }
+}
+```
+
+### 6.2 Key Rules
+
+- **`let`/`fn` declarations must be at the top**, before any widget.
+- **Every container MUST have `height: Fit`** — most common failure mode.
+- **Root container MUST use `width: Fill`** — never a fixed pixel width.
+- `ui` object is built-in; do NOT declare it with `:=`.
 - **`for` loops render widgets at build time only** — array changes do NOT re-render. Use `set_text()` for dynamic content.
-- **Functions with `for` loops return empty strings** when called from `on_click` — inline string building instead
-- **`as int` type casting produces NaN** — use string display + `set_text()` only
-- **Colons inside string arguments work correctly** — `"Time: 2:30"` is fine
-- Every `TextInput` must have a fixed numeric height (e.g. `34`)
-- No `on_render` in embedded apps
+- **`as int` type casting produces NaN** — use string display + `set_text()` only.
+- Every `TextInput` must have a fixed numeric height (e.g. `34`).
+- No `on_render` in embedded apps.
+- **`widget_tree_mark_dirty` in `render_body` is MANDATORY** — without it, `eval_body` stores the new widget tree but the host never draws it (app stays at loading state). This is already correctly set in the codebase.
 
-### 4.2 Widget Availability
+### 6.3 Widget Availability
 
 **Available:** View, RoundedView, Label, TextInput, LinkLabel, Button, ButtonFlat, ButtonFlatter, Slider, CheckBox, CheckBoxFlat, RadioButton, RadioButtonFlat, ToggleFlat, DropDown, TabBar, Tab, PopupMenu, ScrollBar, ScrollBars, LoadingSpinner, Hr, Vr, Icon
 
 **NOT available (silently fail):** Stack, Divider, ProgressBar, IconButton, ToggleButton, Image, ListView, Grid, ColorPicker, ScrollPair
 
-| Wanted | Not Available | Use Instead |
-|--------|--------------|-------------|
-| Divider line | `Divider` | `Hr{height:1 width:Fill}` |
-| Progress bar | `ProgressBar` | `Slider{value:0.65 is_read_only:true}` |
-| Tabbed UI | `TabBar`/`Tab` | `ButtonFlat` rows (TabBar renders zero-size) |
+| Wanted | Use Instead |
+|--------|-------------|
+| Divider line | `Hr{height:1 width:Fill}` |
+| Progress bar | `Slider{value:0.65 is_read_only:true}` |
+| Tabbed UI | `ButtonFlat` rows (TabBar renders zero-size) |
 
-### 4.3 Styling Gotchas
+### 6.4 Styling Gotchas
 
-**`draw_bg.border_radius` takes a float, not an Inset:**
-```splash
-// ✅
-draw_bg.border_radius: 16.0
+- **`draw_bg.border_radius` takes a float**, not an Inset: `draw_bg.border_radius: 16.0`
+- **`#x` prefix for hex colors containing 'e'**: Use `#x2ecc71` (not `#2ecc71`) when the hex contains the letter `e` adjacent to digits, to avoid parser ambiguity with scientific notation.
+- **Default text color is white** — for light backgrounds, always set `draw_text.color` on every text element.
+- **`new_batch: true` for text visibility** — required on any container with `show_bg: true` that contains text children:
+  ```splash
+  RoundedView{width:Fill height:Fit new_batch:true show_bg:true draw_bg.color:#x334
+    Label{text:"Visible" draw_text.color:#fff}
+  }
+  ```
 
-// ❌ parse error — silently breaks layout
-draw_bg.border_radius: Inset{top:0 bottom:16 left:0 right:0}
-```
+### 6.5 Variable Scope
 
-**`#x` prefix for hex colors containing 'e':** When a hex color contains the letter `e` adjacent to digits (like `#1e1e2e`), use `#x` to avoid parser ambiguity. Without `#x`, Makepad's parser may misinterpret digits following 'e' as an exponent:
-```splash
-#x2ecc71     // ✅ contains 'e' next to digits, use #x
-#x1e1e2e     // ✅ contains 'e' next to digits, use #x
-#ff4444      // ✅ no 'e' issue, plain # works
-#00ff00      // ✅ no 'e' issue
-```
+**`let` variables DO persist** across click events (counter, toggle states work correctly).
 
-**Default text color is white:** All text widgets (`Label`, `Button`, etc.) default to `#fff`. For light/white backgrounds, you MUST explicitly set `draw_text.color` to a dark color on every text element:
-```splash
-RoundedView{draw_bg.color:#f5f5f5 height:Fit
-  Label{text:"Visible!" draw_text.color:#x222}
-}
-```
+However, **widget `checked` state** on `RadioButton`, `ToggleFlat`, `CheckBox` does NOT persist because internal post-processing discards the `on_click` scope context. Use `ButtonFlat` with manual toggle for persistent boolean state:
 
-**Label styling shorthand:** Both syntaxes work:
-```splash
-Label{text:"Hello" color:#x2ecc71 font_size:16}              // bare props work
-Label{text:"Hello" draw_text.color:#x2ecc71 draw_text.text_style.font_size:16}  // draw_text also works
-```
-
-**`new_batch: true` for text visibility:** Required on any container with `show_bg: true` that contains text children. Without it, text renders behind the background (invisible):
-```splash
-// ✅ Correct
-RoundedView{width:Fill height:Fit new_batch:true show_bg:true draw_bg.color:#x334
-  Label{text:"Visible" draw_text.color:#fff}
-}
-// ❌ Text may be invisible (draws behind bg)
-RoundedView{width:Fill height:Fit show_bg:true draw_bg.color:#x334
-  Label{text:"Invisible!" draw_text.color:#fff}
-}
-```
-
-### 4.4 Widget Reliability Reference
-
-| Widget | Capabilities | Best For |
-|--------|-------------|----------|
-| **`ButtonFlat`** | Click → variable write, `set_text()`, `text()` | All interactive controls |
-| **`Button`** | Click → variable write, `set_text()`, `text()` | Standard buttons |
-| **`Label`** | `set_text()` updates visible text, `text()` reads back | Display values, status, dynamic list display |
-| **`TextInput`** | `type_text` fills first input, `text()` reads value, `set_text()` writes | Text entry |
-| **`Hr`** | Full-width line divider | Visual separation |
-| **`RoundedView`** | Container with rounded corners | App root, groups |
-
-### 4.5 Splash VM Variable Scope
-
-**`let` variables DO persist** across click events in the same app session:
-- Counter: `let count = 0; count = count + 1` correctly produces `1, 2, 3, 4` across consecutive clicks
-- Toggle: `let toggled = false; toggled = !toggled` persists `true` state across separate button clicks
-
-However, **widget `checked` state** on `RadioButton`, `ToggleFlat`, `CheckBox` does NOT persist because internal post-processing discards the `on_click` scope context.
-
-| Widget | Visual State | Variable Persistence |
-|--------|-------------|---------------------|
-| **`RadioButton`** | `checked: true` in widget tree | ❌ Lost — internal post-processing discards `on_click` scope |
-| **`ToggleFlat`** | `checked` visual renders | ❌ Same limitation |
-| **`CheckBox`** / **`CheckBoxFlat`** | `checked: true` in widget tree | ❌ Same limitation |
-
-**Use `ButtonFlat` with manual toggle for persistent boolean state:**
 ```splash
 let toggled = false
 ButtonFlat{text:"Toggle" on_click:||{toggled = !toggled; ui.display.set_text("" + toggled)}}
-ButtonFlat{text:"Show" on_click:||{ui.display.set_text("Current: " + toggled)}}
 ```
 
+### 6.6 Patterns
 
-
-### 4.7 Patterns
-
-#### 4.7.1 Struct Arrays & Array Operations
+#### 6.6.1 Struct Arrays & Array Operations
 
 The Splash VM supports arrays of structs with `.push()`, `.remove()`, `.len()`, and `.retain()`. Read fields via `array[index].field`, update with `array[index] += {field: val}`.
 
-**⚠️ `for i in items` iterates over VALUES, not indices.** This is a critical gotcha — `for i in items` behaves like a for-each loop, so `i` is the element value (string), not an integer index. Using `items[i]` will silently mis-index (treating a string as an index, which falls through to the first element):
+**⚠️ `for i in items` iterates over VALUES, not indices.** Use `while` loop with explicit index:
 
 ```splash
-// ❌ WRONG — i is the string value, not an index
-for i in items { out = out + items[i] }  // always returns items[0]
-
-// ✅ CORRECT — use while loop with explicit index
 let idx = 0
 while idx < items.len() {
     out = out + items[idx]
     idx = idx + 1
 }
-
-// ✅ ALSO CORRECT — direct indexing when you know the position
-items[0]  // works
-items[1]  // works
 ```
 
-**Note:** `while` loops in the Splash VM are functional but can cause debug system timeouts with rapid successive clicks. After using `while` in an `on_click`, allow 10+ seconds for the debug system to recover.
-
-```splash
-let items = [
-    {text: "Task 1" tag: "work" done: false}
-    {text: "Task 2" tag: "personal" done: false}
-]
-let max_items = 5
-
-fn add_item(text){
-    let clean = ("" + text).trim()
-    if clean == "" { return }
-    if items.len() >= max_items { return }
-    items.push({text: clean tag: "" done: false})
-    sync_all()
-}
-
-fn toggle_item(index){
-    if index >= items.len() { return }
-    items[index] += {done: !items[index].done}
-    sync_all()
-}
-
-fn remove_item(index){
-    if index >= items.len() { return }
-    items.remove(index)
-    sync_all()
-}
-
-fn clear_flagged(){
-    items.retain(|it| !it.done)
-    sync_all()
-}
-```
-
-#### 4.7.2 Component / Template Pattern
-
-Define reusable templates with `let` and instantiate with property overrides:
+#### 6.6.2 Component / Template Pattern
 
 ```splash
 let ItemRow = RoundedView{
-    width: Fill height: Fit
-    padding: Inset{top: 8 bottom: 8 left: 12 right: 12}
+    width: F ill height: Fit
     flow: Right spacing: 10
-    align: Align{y: 0.5}
-    new_batch: true
-    draw_bg.color: #x2a2a3a
-    draw_bg.border_radius: 8.0
-    label := Label{text: "item" width: Fill draw_text.color: #xddd}
+    label := Label{text: "item" width: Fill}
     action := ButtonFlatter{text: "Do" width: 56 height: 28}
-    remove := ButtonFlatter{text: "X" width: 56 height: 28}
 }
-
 row_0 := ItemRow{
     label.text: "First item"
     action.on_click: || do_something(0)
-    remove.on_click: || remove_item(0)
 }
 ```
 
 Override syntax: `<child-name>.<property>: <value>` — every segment in the path must use `:=`.
 
-#### 4.7.3 Pre-allocated Fixed Slots
+#### 6.6.3 Pre-allocated Fixed Slots
 
 `for` loops render at build-time only — array changes don't add/remove widgets. Pre-allocate a fixed number of rows and update via sync functions:
 
 ```splash
 let items = [{text: "Item 1"} {text: "Item 2"}]
-
 fn sync_row_0(){
     if 0 < items.len() {
         ui.row_0.label.set_text(items[0].text)
-    } else {
-        ui.row_0.label.set_text("Empty slot")
     }
-}
-fn sync_rows(){
-    sync_row_0()
-    sync_row_1()
-    sync_status()
 }
 ```
 
-Pre-allocate 5 rows for a 5-item max list. Call `sync_rows()` after every mutation.
-
-#### 4.7.4 Numeric State Pattern
+#### 6.6.4 Numeric State Pattern
 
 ```splash
 let count = 0
-RoundedView{width:Fill height:Fit flow:Down spacing:10 padding:16 new_batch:true
+RoundedView{width:Fill height:Fit flow:Down spacing:10 new_batch:true
   display := Label{text:"0" draw_text.color:#x44cc88 draw_text.text_style.font_size:32}
-  View{flow:Right spacing:12 align:Align{x:0.5 y:0.5}
-    ButtonFlat{text:"-" on_click:||{count -= 1; ui.display.set_text(count + "")}}
-    ButtonFlat{text:"Reset" on_click:||{count = 0; ui.display.set_text("0")}}
-    ButtonFlat{text:"+" on_click:||{count += 1; ui.display.set_text(count + "")}}
-  }
+  ButtonFlat{text:"-" on_click:||{count -= 1; ui.display.set_text(count + "")}}
+  ButtonFlat{text:"+" on_click:||{count += 1; ui.display.set_text(count + "")}}
 }
 ```
 
 Use `count + ""` to convert numbers to strings.
 
-#### 4.7.5 Dynamic List Display
+#### 6.6.5 Dynamic List Display
 
 ```splash
 let task_count = 0
@@ -855,7 +686,7 @@ ButtonFlat{text:"Add" on_click:||{
 }}
 ```
 
-#### 4.7.6 TextInput with on_return
+#### 6.6.6 TextInput with on_return
 
 ```splash
 input := TextInput{
@@ -866,42 +697,16 @@ input := TextInput{
 Button{text: "Add" width: 64 height: 34 on_click: || add_item(ui.input.text())}
 ```
 
-#### 4.7.7 Sequential Digit Input
+### 6.7 Naming Children
 
-Perform arithmetic by accumulating digits:
-```splash
-let a = 0
-ButtonFlat{text:"7" on_click:||{a = a*10+7; ui.display.set_text("" + a)}}
-```
+| Syntax | Effect |
+|--------|--------|
+| `label := Label{text:"default"}` | ✅ Addressable via `ui.label`, overridable |
+| `label: Label{text:"default"}` | ❌ Static — NOT addressable |
 
-### 4.8 Naming Children: `:=` vs `:`
+Every segment in an override path must use `:=`
 
-Use `:=` for addressable children, `:` for static children:
-```splash
-label := Label{text:"default"}    // ✅ addressable via ui.label, overridable
-label: Label{text:"default"}     // ❌ static — NOT addressable
-```
-
-Every path segment in an override must use `:=`:
-```splash
-// ✅ Correct
-let Item = View{flow:Right
-  texts := View{flow:Down
-    label := Label{text:"default"}
-  }
-}
-Item{texts.label.text:"new text"}  // works!
-
-// ❌ Wrong — anonymous parent blocks override
-let Item = View{flow:Right
-  View{flow:Down
-    label := Label{text:"default"}  // UNREACHABLE
-  }
-}
-Item{label.text:"new text"}  // silent failure
-```
-
-### 4.9 Styling Reference
+### 6.8 Styling Reference
 
 | Property | Example | Effect |
 |----------|---------|--------|
@@ -915,44 +720,22 @@ Item{label.text:"new text"}  // silent failure
 | `new_batch` | `true` | Required for text visibility on `show_bg:true` containers |
 | `empty_text` | `"Type here..."` | Placeholder for TextInput |
 
-### 4.10 Not in Build
+### 6.9 View Scrolling
 
-| Widget | Behavior |
-|--------|----------|
-| **`TabBar`** / **`Tab`** | width=0, height=0 — no visible output |
+Use `scroll_bars` as a View property:
 
----
+```splash
+View{width:Fill height:300
+  scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true
+    scroll_bar_y: ScrollBar{drag_scrolling:true}
+  }
+  ...
+}
+```
 
-## 5. Verified Patterns (Tested 2026-06-24)
+`ScrollEvent` dispatch has no effect — scroll bars only respond to touch/mouse gestures.
 
-All patterns verified end-to-end via extension tools.
-
-| Pattern | Test Status | Test Data |
-|---------|-------------|-----------|
-| Direct orphan button → `__pi_response.set_text()` | ✅ | Button at (26,135,928,200), click at (490,235) → doc: `"clicked:1"` |
-| Nested button inside container without padding | ✅ | Buttons at (447,135,17,22), click at (457,146) → counter decremented to -1 |
-| Counter variable persistence | ✅ | Click - → 0→-1, click + → -1→0, Send → doc: `"count:0"` |
-| Toggle (same-value via version counter) | ✅ | "true" → "true" → "false" → "false" all delivered |
-| `type_text` → click Submit | ✅ | "hello world" typed, submitted → doc: `"got:hello world"` |
-| `send_pi_response` → splash reads data | ✅ | "Data from pi agent!" appears in __pi_data and __ai_text |
-| Dynamic list via `set_text()` | ✅ | 2 items added → doc: `"1. Buy groceries\\n2. Write tests"` |
-| Array push + indexing (while loop) | ✅ | 3 pushes → items[0..2] → doc: `"Alpha, Beta, Gamma"` |
-| Coordinate shift after layout change | ✅ | Buttons shifted +19px after 2nd list item added |
-| Container padding clipping | ❌ | RoundedView{padding:16} → buttons overflow padded area → unhittable |
-| Sub-agent `ai:ask:` auto-handler (pre-created session) | ✅ | Type text → click Send → `__ai_text` shows AI response (2026-06-24) |
-| Sub-agent via `launch_app_with_agent` (system_prompt) | ✅ | "What is 2+2?" → AI: "**2 + 2 = 4**" in `__ai_text` (2026-06-29) |
-| `send_pi_response` → splash reads `__pi_data` | ✅ | "Greetings from pi!" → label shows "Got: Greetings from pi!" |
-| Splash → Pi communication (`__pi_response.set_text`) | ✅ | Click "Send to Pi" → doc: `"hello from splash"` |
-| Two-way comms (pi→splash + splash→pi) | ✅ | Full round-trip verified in single session |
-| Per-prompt streaming (individual deltas) | ✅ | `send_streaming_delta` sends raw new chars; harness APPENDS to CRDT (2026-07-06) |
-| Log widget no duplicate lines | ✅ | `rfind("\n🤖 ")` correctly handles AI text with internal newlines (2026-07-06) |
-| Signal-only CRDT sync (no CPU jank) | ✅ | Doc read+hyrdate only on `Event::Signal`, not 60fps Draw events (2026-07-06) |
-| Counter with no bg agent | ✅ | All buttons (+/-/Reset/Send) work; `__pi_response.set_text("count:2")` delivers (2026-07-06) |
-| Todo list via `set_text()` (no bg agent) | ✅ | Add items, scroll, "Send to Pi" sends list content (2026-07-06) |
-
----
-
-## 6. Known Current Limitations
+## 7. Known Limitations & Still-Broken Issues
 
 | Limitation | Workaround |
 |-----------|------------|
@@ -963,37 +746,100 @@ All patterns verified end-to-end via extension tools.
 | Stale content after rapid close+launch | Wait 1-2 seconds between close and launch |
 | Debug commands freeze after ~50 ops | Kill both processes, rebuild, restart |
 | Coordinates shift after layout changes | Always take a fresh `widget_snapshot` before each click |
-| `type_text` fills first TextInput in splash body | Check `value` field on orphan TextInputs in snapshot |
 | Container padding clips children's hit areas | Keep buttons as direct orphans (no container wrapping) |
-| Orphan coordinates are window-relative | Use directly from dump/snapshot — no window offset needed |
-| `RadioButton`, `ToggleFlat`, `CheckBox` variables don't persist | Use `ButtonFlat` with manual toggle |
 | Background sub-agent slow (5-20s API call) | Wait for response; check harness logs |
 | `__ai_text` is a TextInput — fills before user's in `type_text` | Put user's TextInput FIRST in splash body (default is correct) |
 | Sub-agent session dispose warning | Call `stop_background_session` when done |
-| `ai:init:` needs extension restart to pick up new code | Restart pi after recompiling `background-agent.ts` → `dist/background-agent.js` |
-| Auto-handler runs with cached extension code | Extension compiled dist is loaded at pi startup; recompiling dist only takes effect on next pi session |
-| `createAgentSession` has no `systemPrompt` parameter | **FIXED**: Sub-agent sessions now use a blank-slate `ResourceLoader` with `noContextFiles`, `noSkills`, `noExtensions`, and `systemPromptOverride: () => ""`. The splash app's system prompt (via `ai:init:<prompt>`) is seeded as `[SYSTEM CONTEXT] <prompt>` on an otherwise empty session. See Section 3.1. |
 | `for i in items` iterates over values (not indices) in Splash VM | Use `while idx < items.len()` with `items[idx]` for correct indexing |
-| `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click`; avoid rapid successive clicks after while loops |
-| Standalone `ScrollBars`/`ScrollBar` as child widget (historically) | **No longer reproducible** (tested 2026-07-01 on clean build). The Splash VM now handles ScrollBars gracefully — renders as zero-size when used standalone. The fix was likely in the Makepad upstream update between git revisions. The `catch_unwind` wrapper in `app.rs` (commit b965536) provides defense-in-depth against any future panics. |
-| `View{scroll_bars: ScrollBars{...}}` — scroll_bars as View PROPERTY works | ✅ The View manages scroll internally. Use: `View{width:Fill height:300 scroll_bars: ScrollBars{show_scroll_x:false show_scroll_y:true scroll_bar_y: ScrollBar{drag_scrolling:true}} ...}` |
-| **Streaming now working (2026-07-06)** | **FIXED**: Per-prompt subscription streams individual deltas via `send_streaming_delta`, harness APPENDS to CRDT `streaming_text`, makepad-host syncs on `Event::Signal` only. Log widget correctly replaces the "🤖 ..." line using `rfind("\n🤖 ")` instead of `rfind('\n')` to handle AI text with internal newlines. See Section 3 for architecture. |
-| **CPU jank during streaming** | **FIXED (2026-07-06)**: `sync_streaming_text()` and `sync_pi_data_to_splash()` now only run on `Event::Signal`, not on every 60fps Draw/Mouse event. This eliminated the CRDT doc read+hydrate loop that was causing janky UI. |
-| `createAgentSession` inherits parent system prompt (historical) | **FIXED (2026-07-01)**: `getBlankSlateResourceLoader()` creates an isolated `DefaultResourceLoader` pointing at a temp directory with all context/skills/prompts/extensions disabled. The sub-agent no longer inherits the main agent's AGENTS.md, SYSTEM.md, skills, or any other context. See Section 3.1 for implementation details. |
-| Programmatic auto-scroll via `ScrollEvent` has no effect | `scroll_bars` only respond to touch/mouse gesture events, not programmatic `ScrollEvent` dispatch. Manual scrolling still works. |
-| **Makepad-host crash: `dy.is_nan()` in `turtle.rs:2342` during streaming** | **FIXED (2026-07-02)**: The `SPLASH_PREFIX` in `agent_splash.rs` was missing `width:Fill` on the outer wrapper View. This caused `View{height:Fit flow:Down <body> __ai_text{width:Fill height:0}}` — a parent with no explicit width containing children with `width: Fill`. During sub-agent streaming responses, text written to `__ai_text` triggered a re-layout that produced NaN in `turtle.total_resolved_length_to()` → `move_align_list(dy=NaN)`. Fix: added `width: Fill` to `SPLASH_PREFIX`. See Section 11 for full analysis. |
-| **AI text with internal newlines duplicates log lines** | **FIXED (2026-07-06)**: `sync_streaming_text()` and `sync_pi_data_to_splash()` now use `rfind("\n🤖 ")` instead of `rfind('\n')` to find the AI response boundary. The old code found newlines INSIDE the AI response (e.g., after bullet points), creating duplicate "🤖 ..." lines. |
+| `while` loops in Splash can cause debug system timeouts | Allow 10s+ cooldown after using `while` in `on_click` |
 
-### Recovery from Debug Freeze
+### ACTIVE BUG: `dy.is_nan()` crash in `move_align_list` (turtle.rs:2342)
 
-If debug commands return `"No result provided"` or time out after heavy use:
-1. `pkill -f makepad-host; pkill -f harness`
-2. `cargo build -p harness -p makepad-host`
-3. Launch a new app
+**Status: NEWLY REPRODUCED (2026-07-14)** — crashes on initial render during `DrawQuad::end()`, then **re-crashes on every subsequent Draw event** (persistent crash loop). Caught by `catch_unwind` but the app is effectively dead — `close_makepad_app` can't recover it because the host panics on every event cycle. **Recovery requires `pkill -f makepad-host`.**
 
----
+**Trigger conditions (all must be present):**
+- A `View{flow:Right}` containing **3+ siblings** (buttons, labels, etc.)
+- A **separator widget** between two flow:Right groups (Hr, Label, View{height:1 width:Fill} — any widget with a fixed height that separates them)
+- At least one more `View{flow:Right}` (any size) after the separator
+- **Padding is NOT required** — crash reproduces with no padding, no `show_bg:true`
 
-## 7. Build, Test, Logs
+The crash is triggered by the layout arithmetic combining a multi-line flow:Right group, a fixed-height separator child, and another flow:Right group. The `move_align_list` alignment calculation produces a NaN delta-y.
+
+**Redacted backtrace (useful frames only):**
+```
+assertion failed: !dy.is_nan()
+  at Cx2d::move_align_list  (turtle.rs:2342)
+  → Cx2d::end_turtle_with_guard  (turtle.rs:1635)
+  → Cx2d::end_turtle  (turtle.rs:1464)
+  → DrawQuad::end  (draw_quad.rs:122)
+  → View::draw_walk  (view.rs:965)
+  → AgentSplash::draw_walk  (agent_splash.rs:389)
+  → catch_unwind  (app.rs:509)   ← host survives but re-crashes on next Draw
+```
+
+**Confirmed safe (does NOT crash):**
+- `View{flow:Right}` with only 2 siblings (then separator, then another) ✓
+- Two `View{flow:Right}` groups adjacent with no separator between them ✓
+- Separator before any flow:Right groups (at the top) ✓
+- A single `View{flow:Right}` group followed by a separator (no second group) ✓
+- Direct orphan buttons in `flow:Down` (no `flow:Right` wrapper) ✓
+
+**What does NOT work (do not try):**
+- Removing padding — crash is NOT about padding, padding is irrelevant
+- Replacing Hr with a Label separator — same crash (it's ANY separator, not specifically Hr)
+- Replacing Hr with a View{height:1} — same crash
+- Adding `width:Fill` — already present, crash still happens
+- Manipulating injected widgets (Label/TextInput/__ai_text) — the crash is in splash body layout, not injected widgets
+
+**What DOES work (avoid the trigger):**
+- Use at most 2 siblings in any `View{flow:Right}` when a separator follows
+- Place the separator at the start (before all flow:Right groups), not between them
+- Remove the separator between flow:Right groups (use `spacing` on the parent instead)
+- Use direct orphan buttons in `flow:Down` with `spacing` instead of `View{flow:Right}` wrappers
+
+### ACTIVE BUG: Buttons inside `padding` + `View{flow:Right}` are UNHITTABLE
+
+**Status: CONFIRMED STILL BROKEN** — tested with end-to-end click simulation, clicks do NOT register. Not a crash, the buttons simply don't respond.
+
+**Root cause:** Containers with `padding` create a draw clip. Makepad's hit-test uses `area.clipped_rect()`, not `area.rect()`. Nested buttons inside `View{flow:Right}` inside a padded container get their `clipped_rect` reduced to the padded content area, so clicks near the padded edge miss entirely.
+
+**What does NOT work (do not try):**
+- `cursor: Hand` on inner View — irrelevant for hit-testing
+- `size` props on inner View — doesn't change clipped_rect hit-test behavior
+- Changing padding on inner View — the outer container's clip limits everything inside
+- Using `margin` instead of `padding` — hit-test still uses clipped_rect
+
+**What DOES work:**
+- Direct orphan buttons in `flow:Down` with `spacing` — always hittable
+- Omitting `padding` on the outer container — no clip created
+- Keeping buttons outside any `padding`-ed container's content area
+
+### Host Process Death Recovery
+
+If tools time out or return stale data:
+1. Validate with `ps aux | grep makepad-host` or `inspect_makepad_doc` for `panic_backtrace`
+2. Harness detects host death via `child.try_wait()` in bridge loop → sends `{"type":"host_died"}` to extension
+3. Extension calls `disposeAllSessions()` to clean up background agent sessions
+4. Restart by launching a new app (spawns fresh harness + host)
+
+**Recovery from debug freeze:**
+```bash
+pkill -f makepad-host; pkill -f harness
+cargo build -p harness -p makepad-host
+```
+Then launch a new app.
+
+### What Has Been Fixed (no longer a concern)
+
+These were problems historically. Do NOT attempt to fix them again:
+
+| Fixed Issue | Fix | Verified |
+|-------------|-----|----------|
+| Streaming-time `dy.is_nan()` crash (text writes to `__ai_text` at 60fps with TextInput{height:0}) | 1. `SPLASH_PREFIX` has `width:Fill` 2. `__ai_text` uses `Label{height:Fit}` not `TextInput{height:0}` 3. `widget_tree_mark_dirty` in `render_body` 4. Signal-only sync (no 60fps doc reads) | Verified during sub-agent streaming + unsafe layout (padding+flow:Right) |
+| macOS IME null pointer crash on window close | `exit(0)` at top of `handle_event` for `WindowClosed` (before any widget processing) | Code-inspected at 3 exit paths |
+| Rust harness `catch_unwind` can't catch IME null pointer | Fixed by `exit(0)` before any widget processing on WindowClosed | Confirmed — IME query runs after widget focus changes, so exiting early prevents it |
+
+## 8. Build, Test, Logs
 
 ### Build
 
@@ -1015,502 +861,3 @@ cd .pi/extensions/makepad && npm test
 ### Logs
 
 Both processes output to stderr via `eprintln!`. Prefixes: `[harness]`, `[makepad-host]`, `[splash]`. makepad-host is spawned with `Stdio::inherit()`, so its logs go to the pi terminal.
-
----
-
-## 8. Test Walkthrough Protocol
-
-When walking through apps step by step:
-1. For each step, explain what you're about to do and what the user should see
-2. **Wait for confirmation** before executing
-3. Keep steps small — one interaction per confirmation
-4. Always show coordinates before clicking
-5. Only move to next step when user confirms current step is complete
-
-## 9. End of Task
-
-At the end of a task, suggest a commit message to the user based on the current diff.
-
-## 10. Test Results Archive (2026-06-24)
-
-All core patterns were tested end-to-end. The following findings correct earlier documentation:
-
-### Coordinate System Correction
-
-**OLD claim:** Orphan widget coordinates are parent-relative.
-**REALITY:** Orphan widget coordinates in `widget_dump` and `widget_snapshot` are **window-relative** (relative to window content origin). Use them directly for click coordinates.
-
-**Proof:** AgentSplash at window-relative (26, 132). Orphan outer View at dump (26, 132) — exact match. Orphan "-" button at dump (447, 135) — click at center (457, 146) hit the button ✅
-
-### Container Clipping Correction
-
-**OLD claim:** Nested buttons work identically to direct orphans.
-**REALITY:** Containers with `padding:16` and `show_bg:true` create draw clips. Buttons overflowing the padded area have reduced `clipped_rect` → hit-test fails.
-
-### wait_for_response Timing
-
-**OLD claim:** Primary way to receive responses.
-**REALITY:** May time out during tool transitions. Use `inspect_makepad_doc` for reliable synchronous checking.
-
-### type_text Walk Order
-
-**OLD claim:** Walks orphan splash widgets.
-**REALITY:** Walks AgentSplash's `try_children()` → inner View's children list. Fills first TextInput depth-first.
-
-### Verified Patterns Summary
-
-| Pattern | Status |
-|---------|--------|
-| Direct orphan button → `__pi_response.set_text()` | ✅ Click at (490, 235) → doc: `"clicked:1"` |
-| Nested button (no-padding container) → counter | ✅ Click at (457, 146) → count: 0 → -1 |
-| Toggle (same-value via version counter) | ✅ All four same/different values delivered |
-| type_text → button → response | ✅ "hello world" → doc: `"got:hello world"` |
-| send_pi_response → splash reads | ✅ Data appears in __pi_data and __ai_text |
-| Dynamic list set_text() | ✅ 2 items added, Done button returned both |
-| Coordinate shift after layout | ✅ Buttons shifted +19px after 2nd list item |
-| Container padding clipping | ❌ RoundedView{padding:16} → unhittable buttons |
-| Sub-agent auto-handler (`ai:ask:` with pre-created session) | ✅ Type text → click Send → `__ai_text` displays AI response |
-| `send_pi_response` → `__ai_text` auto-display | ✅ "Test message from pi to splash app" appeared in `__ai_text` and `__pi_data` within seconds |
-
-## 11. Crash Analysis: `dy.is_nan()` in `move_align_list` (2026-07-02)
-
-### Symptom
-
-```
-thread 'main' panicked at makepad/draw/src/turtle.rs:2342:9:
-assertion failed: !dy.is_nan().0M
-```
-
-Stack trace: `received_timer` → `call_draw_event` → `handle_event` → `draw_walk` → `View::draw_walk` → `AgentSplash::draw_walk` → `View::draw_walk` → `draw_bg.end()` → `end_turtle` → `end_turtle_with_guard` → `move_align_list(..., dy=NaN, ...)`
-
-### Trigger
-
-Launching a splash app via `launch_app_with_agent`, then clicking a button that sends an `ai:ask:` message. When the sub-agent streams its response back and text is written to the injected `__ai_text` widget, the Makepad layout engine recalculates positions and hits the NaN assertion.
-
-### Root Cause
-
-The `SPLASH_PREFIX` in `makepad-host/src/agent_splash.rs` wrapped every splash body in an outer View **without `width: Fill`**:
-
-```rust
-// BEFORE (broken):
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-```
-
-This produced the following widget hierarchy:
-```
-View{height:Fit flow:Down          ← NO width! width computed from children
-  <user's RoundedView{width:Fill ...}>
-  __ai_text := TextInput{width:Fill height:0 visible:false}
-  __pi_response := Label{...}
-  __pi_data := Label{...}
-}
-```
-
-When `sync_pi_data_to_splash()` or `sync_streaming_text()` called `set_text()` on `__ai_text`, Makepad's layout engine attempted to resolve `width: Fill` on a child whose parent had no explicit width. This circular dependency (`Fill` depends on parent width, parent width depends on child) produced `NaN` in `turtle.total_resolved_length_to()`, which flowed through `end_turtle_with_guard` → `move_align_list(dy=NaN)` → assertion failure.
-
-**Why it was intermittent:** The crash only occurred when text was actively written to `__ai_text` during streaming deltas while a Draw event was in flight. The timing of the streaming relative to the draw cycle determined whether the NaN would manifest.
-
-**Secondary finding:** `visible:false` on `__ai_text` (a TextInput) is not respected — every snapshot shows it as `visible: true` with full width. This means the injected TextInput always participates in layout.
-
-### Fix
-
-Added `width: Fill` to the outer wrapper View so children with `width: Fill` resolve correctly:
-
-```rust
-// AFTER (fixed):
-const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
-```
-
-This gives the outer View a resolved width from the parent (the `splash_holder` in the window), so all `width: Fill` children compute their widths from a known value — no circular dependency.
-
-### Verification
-
-1. Launched `file-summarizer` app with `launch_app_with_agent` and a large system prompt
-2. Typed a filename into the TextInput
-3. Clicked "Summarize" button → `__pi_response` set to `ai:ask:summarize shared/src/lib.rs`
-4. Sub-agent began streaming response → text written to `__ai_text` via CRDT
-5. **No crash** — app survived the full streaming flow
-
-### Code Change
-
-**File:** `makepad-host/src/agent_splash.rs`, line 44
-
-```diff
--const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{height:Fit flow:Down ";
-+const SPLASH_PREFIX: &str = "use mod.prelude.widgets.*View{width:Fill height:Fit flow:Down ";
-```
-
----
-
-## 12. Lessons Learned (2026-07-06 Session)
-
-This section documents approaches that were tried but did not work, to avoid repeating the same dead ends.
-
-### 12.1 Nested AgentSplash causes NaN layout crashes
-
-**Attempted:** Adding `__run_splash := mod.widgets.AgentSplash{width:Fill height:Fit is_root:false}` to SPLASH_SUFFIX so that runsplash code could be rendered inline via a nested AgentSplash, preserving the chat app body.
-
-**Result: FAILED** — consistently produces `assertion failed: !dy.is_nan()` in `turtle.rs:2342` (`move_align_list`). The crash happens during `draw_walk` (rendering), not during `set_text` (evaluation). The nested AgentSplash's `width:Fill` creates a circular layout dependency with the parent View's `height:Fit`, and when the nested content grows after `set_text`, the parent's stale layout produces NaN.
-
-**`catch_unwind` around `draw_walk` does NOT fix it:** The NaN value persists in the turtle/layout state even after the panic is caught. The next draw cycle in the parent View (KeyboardView) encounters the same NaN and crashes again.
-
-### 12.2 Partial runsplash code evaluation during streaming is unreliable
-
-**Attempted:** Extracting runsplash code from the accumulated streaming text BEFORE the closing ``` arrives, and trying to evaluate the partial code progressively.
-
-**Result: FAILED** — Partial Splash code almost never parses because the DSL requires complete syntax (balanced braces, complete property names, etc.). The only time it works is when the code inside the block happens to be syntactically complete before the closing ``` (e.g., when the AI finishes the closing `}` before writing the closing ```). Most of the time, eval fails and the body is restored to the previous state.
-
-**Practical limit:** The "Generating..." status message in the log is about as much feedback as you can show during streaming. The rendered UI only reliably appears when the complete `\`\`\`` closing marker arrives.
-
-### 12.3 Inline rendering via body replacement loses chat state
-
-**Attempted:** When runsplash code is detected in `sync_pi_data_to_splash`, calling `self.set_text(cx, &runsplash_code)` to replace the entire splash body.
-
-**Result: Works but destructive** — The chat app is replaced entirely. All `let` variables (messages array, counters) are lost because the Splash VM re-evaluates from scratch. The user can see the rendered UI but the chat context is gone.
-
-### 12.4 Version counters add complexity without clear win
-
-**Attempted:** Adding `pi_response_version` and `streaming_text_version` fields to `AgentDoc` to avoid full-doc hydration on every frame. The sync functions first read just the version counter (cheap), and only do full `hydrate` if the version changed.
-
-**Result: NOT RECOMMENDED** — The performance improvement was marginal (the `hydrate` call was already fast enough). The version counters added complexity to the `shared::AgentDoc` struct, required changes in the harness, and introduced new failure modes (version mismatches, forgotten increments). The original approach of reading and hydrating the full doc on each Signal is simpler and more reliable.
-
-### 12.5 AI system prompt must be short
-
-**Attempted:** Including the entire Splash DSL reference guide (all widgets, properties, examples) in the system prompt.
-
-**Result: Counterproductive** — Long prompts overwhelm the model and produce worse results (missing buttons, wrong syntax). A short prompt with exactly one working counter example consistently produces better code.
-
-### 12.6 `streamingBehavior: 'steer'` fixes second-prompt error
-
-**Attempted:** Sending a second `ai:ask:` message while the first was still streaming produced `"Agent is already processing"` error.
-
-**Result: WORKED** — Adding `streamingBehavior: "steer"` to the `session.prompt()` call in `background-agent.js` correctly cancels the in-progress generation and starts fresh with the new message. No crash, no error.
-
-### 12.7 `wait_for_response` hang fix
-
-**Attempted:** `wait_for_response` never fired for `ai:ask:` responses because the auto-handler only set `pi_response`, not `user_response`.
-
-**Result: WORKED** — Adding `agent.user_response = Some(final_text)` + `agent.user_response_version += 1` to the `SendStreamingEnd` handler in the harness causes the bridge loop to forward the response to the extension, which triggers `wait_for_response`.
-
-### 12.8 Error fallback should not be shown inline
-
-**Attempted:** When `eval_body` fails (e.g., partial code during streaming), rendering `SPLASH_ERROR_FALLBACK` (dark red box with "Splash app could not be rendered") inside the nested AgentSplash.
-
-**Result: BAD UX** — The error fallback covers up any partially-rendered content and looks broken. Better to silently restore the previous valid body (as `set_text` now does by saving `prev_body` and re-evaluating it on failure).
-
-### 12.9 `draw_walk` must not panic
-
-**Attempted:** Letting the nested AgentSplash's `draw_walk` panic propagate up to `catch_unwind` in the host's `handle_event`.
-
-**Result: NOT ENOUGH** — The approach of wrapping individual widget `draw_walk` calls with `catch_unwind` does NOT prevent subsequent crashes because the NaN state persists in Makepad's turtle/layout system. The parent View encounters the same NaN on the next draw cycle. The only reliable fix is to prevent NaN from entering the layout in the first place (avoid `width:Fill` / `height:Fill` combinations that create circular dependencies).
-
-### 12.10 NaN crash persists even with SPLASH_PREFIX `width:Fill` fix
-
-**Attempted:** The `dy.is_nan()` crash in `move_align_list` (turtle.rs:2342) keeps happening on every draw event even after adding `width:Fill` to SPLASH_PREFIX. The crash is 100% reproducible with any app that uses the SPLASH_SUFFIX widgets (`__ai_text`, `__pi_response`, `__pi_data`).
-
-**Root cause not found** — The crash might be from the `__ai_text := TextInput{text:" " height:0 width:Fill visible:false}` widget. A TextInput with `height:0` and `width:Fill` inside a `height:Fit flow:Down` parent View might create a layout conflict. The text " " (space) has font height > 0, conflicting with `height:0`.
-
-**Clean rebuild sometimes fixes it** — Running `cargo clean && cargo build` resolved the crash for one session, suggesting stale incremental build artifacts can cause the NaN.
-
-### 12.11 `set_text` body restoration prevents error display
-
-**Attempted:** When `eval_body` fails (partial/incomplete Splash code), the original code rendered `SPLASH_ERROR_FALLBACK` (dark red box). Changed `set_text` to save `prev_body` before eval and restore on failure.
-
-**Result: WORKS** — The previous valid body is re-evaluated and displayed on eval failure. No more red error boxes. The user only sees the last working UI, with partial/failed states silently skipped.
-
-### 12.12 `eval_body` must not render error fallback
-
-**Attempted:** `eval_body` called `render_body(cx, SPLASH_ERROR_FALLBACK)` on failure, which rendered a dark red error box over the entire splash area.
-
-**Result: Changed to just return false** — The caller (`set_text`) handles restoration. The error fallback constant is now dead code.
-
-### 12.13 Partial inline render succeeds, full render crashes with NaN
-
-**Observed behavior:** During streaming, the inline `__run_splash` AgentSplash successfully renders partial code (e.g., just the counter label and "0" display). But when the next streaming delta adds more content (buttons, layout), the re-evaluation triggers a NaN crash in `move_align_list`.
-
-**Root cause:** The nested AgentSplash starts with empty content (0 height). Partial code evaluates successfully and renders at the computed height. The parent View's layout is computed with this height. When `set_text` is called again with more complete code (taller content), the nested AgentSplash grows, but the parent View's layout is stale. This creates a circular dependency: the nested widget needs more space than allocated, producing NaN.
-
-**Failed workarounds:**
-- `catch_unwind` around `set_text` doesn't help because the NaN happens in the subsequent `draw_walk`, not in `set_text`
-- `self.redraw(cx)` after `set_text` doesn't trigger a full re-layout — the parent View reuses its cached child positions
-- Giving the nested AgentSplash `height:Fit` doesn't fix it because Fit is computed from content, but the parent already decided the height
-
-**Hypothesis for fix (unproven):** Don't render partial code during streaming at all. Only render on completion (when the closing ``` arrives). Use a simple "⚙ Generating..." status during streaming. This avoids the layout growth issue entirely.
-
----
-
-## 13. Next Steps: AI Splash Code Generation
-
-The inline runsplash rendering works (code is extracted, `set_text()` evaluates and renders, error recovery restores on failure). The bottleneck is teaching the AI to generate **correct Splash DSL syntax**.
-
-### Objective
-Enable the "Splash Generator" app (`splash-gen`) to produce working interactive UIs from natural language. The AI generates code inside ````runsplash` blocks, extracted and rendered inline via the nested `__run_splash` AgentSplash.
-
-### Protocol
-- User types: "a counter with + and - buttons"
-- AI responds with: ````runsplash\nlet count = 0\nRoundedView{...}\n````
-- `sync_streaming_text()` extracts the block, calls `run_splash.set_text()`
-- Nested AgentSplash renders inline, error recovery on partial code
-
-### Known AI Syntax Bugs (fix via prompt engineering)
-
-| Bug | Example (WRONG) | Correct Syntax |
-|-----|-----------------|----------------|
-| Commas between properties | `width: Fill, height: Fit` | `width:Fill height:Fit` |
-| Wrong naming syntax | `id: disp` / `name: disp` | `disp := Label{...}` |
-| Wrong click syntax | `clicked: {count++}` | `on_click:||{count+=1}` |
-| Spaces after colon | `width: Fill` | `width:Fill` |
-| CSS-style properties | `bg: #x333` / `color: #x333` | `draw_bg.color:` `draw_text.color:` |
-| Number to string | `set_text(count)` | `set_text("" + count)` |
-| Triple braces in on_click | `on_click:||{{ code }}` | `on_click:||{ code }` |
-| Missing container height | No `height:Fit` | Every container needs `height:Fit` |
-| Widgets not available | `Divider`, `ProgressBar` | `Hr{height:1}`, `Slider{is_read_only:true}` |
-
-### Prompt Engineering Strategy
-
-1. **Start minimal**: One complete working example (counter). Ask AI to adapt.
-2. **Iterate on failures**: For each syntax error, add the CORRECT pattern to the prompt. Show working code, not rules.
-3. **Test systematically**: Send "counter with +/-" and check:
-   - Does it render? (`__run_splash` height > 0 in snapshot)
-   - Are widgets named correctly? (`disp := Label{...}` not `id: disp`)
-   - Do `on_click` handlers use `||{...}` syntax?
-   - Number-to-string uses `"" + count`?
-4. **Then harder cases**: todo list, toggle, text input + button
-5. **Final goal**: AI generates ANY pattern from Section 4.7 correctly
-
-### Testing Checklist
-
-1. `widget_snapshot` — check `__run_splash` height > 0 (rendered)
-2. Read `__run_splash` body text to inspect generated code
-3. Click generated buttons (orphan coordinates from snapshot)
-4. `inspect_makepad_doc` for `user_response` from generated buttons
-5. If buttons don't respond: naming syntax (`:=` vs `id:`) is likely wrong
-
----
-
-## 14. Crash Reference & Deep Diagnosis
-
-### Crash 1: `dy.is_nan()` in `move_align_list` (turtle.rs:2342)
-
-**Symptom:**
-```
-assertion failed: !dy.is_nan() at draw/src/turtle.rs:2342:9
-```
-Stack: `draw_bg.end()` -> `end_turtle` -> `end_turtle_with_guard` -> `move_align_list(dy=NaN)`
-
-**Trigger:** Splash body with `padding:` on the root RoundedView AND buttons wrapped inside `View{flow:Right ...}`.
-
----
-
-#### NaN Propagation Chain (line-by-line)
-
-**1. `end_turtle_with_guard` (turtle.rs:1630):**
-```rust
-let dy = turtle.total_resolved_length_to(finished_walk.deferred_before_count);
-self.move_align_list(align_list_start, align_list_end, dx, dy, false);
-```
-The `dy` passed to `move_align_list` is NaN.
-
-**2. `total_resolved_length_to` (turtle.rs:1159):**
-```rust
-fn total_resolved_length_to(&self, index: usize) -> f64 {
-    self.resolved_fills[..index].iter().sum()
-}
-```
-Sums resolved fill lengths. If any fill is NaN, the sum is NaN.
-
-**3. `resolve_fill` (turtle.rs:1199):**
-```rust
-let unresolved_length = self.unresolved_length_from(count);
-let length = unresolved_length * deferred_fill.weight / total_deferred_weight;
-```
-If `unresolved_length` is NaN, `length` becomes NaN regardless of weight.
-
-**4. `unresolved_length_from` (turtle.rs:1172):**
-```rust
-fn unresolved_length_from(&self, index: usize) -> f64 {
-    self.inner_unused_length() - self.total_resolved_length_to(index)
-}
-```
-Calls `inner_unused_length()`.
-
-**5. `inner_unused_length` (turtle.rs:1162):**
-```rust
-fn inner_unused_length(&self) -> f64 {
-    match self.layout.flow {
-        Flow::Right { wrap: false, .. } => self.unused_inner_width(),
-        Flow::Down => self.unused_inner_height(),
-        _ => panic!(),
-    }
-}
-```
-For the View{flow:Right} child (which has Flow::Right), this calls `unused_inner_width()`.
-
-**6. `unused_inner_width` (turtle.rs:732):**
-```rust
-pub fn unused_inner_width(&self) -> f64 {
-    self.inner_width() - self.inner_used_width().min(self.inner_width())
-}
-```
-If `inner_width()` is NaN (unresolved width for a shrink-to-fit container), then `NaN - anything.min(NaN)` = NaN.
-
----
-
-#### Why `padding:` triggers it
-
-The `RoundedView{flow:Down height:Fit padding:16}` reduces the inner content width by 32px. The `View{flow:Right}` child inside it inherits this narrowed width. During the `View{flow:Right}`'s layout:
-
-1. The flow:Right turtle's `inner_width()` is set to the padded width (parent_width - 32)
-2. But the View itself is still sizing — its own height:Fit means height is NaN during width resolution
-3. Children (buttons) inside flow:Right have fixed widths (e.g., `width: 88`), not Fill
-4. Because no child uses `width:Fill`, `total_deferred_weight` is 0 in `resolve_fill`
-5. `0 / 0 = NaN` — the weight division produces NaN regardless of `unresolved_length`
-6. This NaN fill is pushed to `resolved_fills` and propagated through the sum
-
-Without `padding:16`, the outer RoundedView's inner width equals the full container width, the flow:Right View resolves its layout differently (the circular dependency doesn't trigger because width is known), and `end_turtle_with_guard` completes before the NaN can enter the fill resolution.
-
-**Why direct children (no View wrapper) fix it:** With `flow:Down` and buttons as direct orphans, there is NO nested `flow:Right` layout at all. Each button is laid out sequentially with fixed height. The parent height resolves deterministically as the sum of fixed-height children. No Fill resolution, no deferred weights, no division, no NaN.
-
----
-
-#### `debug_assert` vs release builds
-
-The crash is a `debug_assert!(!dy.is_nan())` (turtle.rs:2342). This only fires in debug builds. In release builds, the NaN silently propagates through the rendering pipeline, potentially producing garbled output or GPU errors.
-
-**`catch_unwind` does NOT fix it:** Even if `catch_unwind` catches the panic, the NaN value persists in Makepad's layout state (the turtle's `resolved_fills` list). Every subsequent Draw event re-encounters the same NaN and crashes again.
-
----
-
-### Crash 2: Null pointer in `first_rect_for_character_range` (macos_delegates.rs:738)
-
-**Symptom:**
-```
-null pointer dereference at macos_delegates.rs:738:37
-thread 'main' panicked with `panic_nounwind_fmt`
-```
-Stack (key frames):
-```
- 4: first_rect_for_character_range (macos_delegates.rs:738)
-    let clearance = cw.ime_rect.size.y * 0.6;  // crash here
-...
-22: do_callback (macos_app.rs:687)
-23: do_callback (macos_window.rs:659)
-24: send_window_closed_event (macos_window.rs:844)
-25: window_will_close (macos_delegates.rs:181)
-```
-
----
-
-#### The dangling pointer chain (line-by-line)
-
-**View initialization (macos_delegates.rs:438):**
-```rust
-extern "C" fn init_with_ptr(this: &Object, _sel: Sel, cx: *mut c_void) -> ObjcId {
-    (*this).set_ivar("macos_window_ptr", cx);  // cx = raw &MacosWindow
-```
-When the NSView is created, a raw pointer to the `MacosWindow` Rust struct is stored in the view's `macos_window_ptr` ivar. This pointer is NEVER cleared or updated.
-
-**The getter (macos_window.rs:937):**
-```rust
-pub fn get_cocoa_window(this: &Object) -> &mut MacosWindow {
-    let ptr: *mut c_void = *this.get_ivar("macos_window_ptr");
-    &mut *(ptr as *mut MacosWindow)  // dangling pointer -> UB
-}
-```
-Zero null-checking. If `macos_window_ptr` points to freed memory, this is undefined behavior.
-
-**The crash site (macos_delegates.rs:700-738):**
-```rust
-let cw = get_cocoa_window(this);   // line 700: gets dangling ref
-let view: ObjcId = this as *const _ as *mut _;
-let view_rect: NSRect = msg_send![view, frame];  // line 702: accesses view (ok, not cw)
-// ... several msg_send! calls that don't touch cw ...
-let clearance = cw.ime_rect.size.y * 0.6;  // line 738: FIRST access to cw -> crash
-```
-The crash is at line 738 because that's the FIRST time `cw` (the dangling `&MacosWindow`) is actually dereferenced. The `msg_send!` calls above use `view` (the ObjC NSView), not `cw`.
-
----
-
-#### Why the pointer becomes dangling
-
-1. User clicks red close button on the Makepad Host window
-2. Cocoa calls `windowWillClose:` on the window delegate
-3. `send_window_closed_event(&mut self)` is called (macos_window.rs:844), where `self` is the `MacosWindow`
-4. This calls `do_callback`, which processes the `WindowClosed` event through the Makepad event loop
-5. **After** `windowWillClose:` returns (or during a nested runloop), the MacosWindow is deallocated by the Rust Drop implementation
-6. But the NSView's `macos_window_ptr` ivar still points to the now-freed memory
-7. During the window close sequence, the `__ai_text` widget (injected TextInput) loses focus
-8. The macOS IME system queries `firstRectForCharacterRange:` on the view to determine where to place the IME candidate window
-9. `get_cocoa_window(this)` reads the dangling `macos_window_ptr` and returns a reference to freed memory
-10. `cw.ime_rect.size.y` dereferences freed memory -> Rust compiler's UB null-check -> `panic_nounwind`
-
-**Key insight:** The `macos_window_ptr` ivar is set once at view creation and NEVER cleared when the MacosWindow is dropped. After drop, it's a classic use-after-free dangling pointer.
-
----
-
-#### Why `panic_nounwind` can't be caught
-
-`panic_nounwind_fmt` is a special panic path the Rust compiler uses when it detects undefined behavior (null pointer dereference, out-of-bounds access) in contexts where unwinding is not allowed. Unlike a normal `panic!()` which can be caught with `catch_unwind`:
-
-- `panic_nounwind` calls `core::intrinsics::abort()` internally
-- `catch_unwind` has empty unwind tables for nounwind functions
-- The panic skips all cleanup and terminates the process immediately
-
-This crash is **uncatchable by design** — the compiler determined the code is in a state where recovery is unsafe.
-
----
-
-#### Why `exit(0)` before event processing fixes it
-
-```rust
-// app.rs handle_event
-if matches!(event, Event::WindowClosed(_)) {
-    std::process::exit(0);  // exit BEFORE self.ui.handle_event()
-}
-```
-
-By calling `exit(0)` at the VERY TOP of `handle_event` for `WindowClosed` events:
-1. `self.ui.handle_event()` is NEVER called — the widget tree is never touched
-2. No TextInput loses focus — the IME system is never triggered
-3. No ObjC message dispatch to the NSView for IME queries
-4. `firstRectForCharacterRange:` is never called
-5. The process terminates before the dangling pointer can be dereferenced
-
-This is a pre-emptive kill rather than a recovery — we exit before the crash can happen.
-
----
-
-### Triage flow for both crashes
-
-1. Tool times out or returns stale data -> host is likely dead
-2. Validate with `ps aux | grep makepad-host` or `inspect_makepad_doc` for `panic_backtrace`
-3. Harness detects host death via `child.try_wait()` in bridge loop -> sends `{"type":"host_died"}` to extension
-4. Extension calls `disposeAllSessions()` to clean up background agent sessions
-5. Extension updates status to "Makepad: host crashed"
-6. Check `panic_backtrace` in doc to determine which crash occurred
-7. Restart by launching a new app (spawns fresh harness + host)
-
----
-
-## 15. Streaming Inline Rendering
-
-Generated Splash DSL code is rendered **inline** inside the generator app via the injected `__run_splash` AgentSplash (a nested AgentSplash with `is_root:false`).
-
-**Flow:**
-1. Sub-agent streams deltas -> auto-handler sends `send_streaming_delta` -> harness appends to CRDT `streaming_text`
-2. CRDT syncs to host -> `Event::Signal` fires
-3. `sync_streaming_text()` runs (agent_splash.rs, only on Signal):
-   - Writes accumulated text to `__ai_text` label
-   - Extracts Splash DSL code from the text (handles \`\`\`runsplash, \`\`\`splash, plain \`\`\`, or raw DSL with no backticks)
-   - Calls `__run_splash.set_text(cx, &code)` which evaluates and renders the code inline
-4. `set_text()` has error recovery: if `eval_body()` fails (partial/incomplete code during streaming), it restores the previous valid body and silently ignores the failure
-5. On streaming completion, `sync_pi_data_to_splash()` writes the final text to `__pi_data` and also re-evaluates through `__run_splash` for the final rendered result
-
-**Key constraint:** `sync_streaming_text()` and `sync_pi_data_to_splash()` only run on `Event::Signal` (not Draw/Mouse/Timer), to avoid 60fps CRDT doc reads. This means streaming updates appear at Signal frequency, not every frame.
-
-**Files:**
-- `agent_splash.rs` -- `sync_streaming_text()`, `sync_pi_data_to_splash()`, `SPLASH_SUFFIX` injection
-- `app.rs` -- `WindowClosed` guard, `catch_unwind` in `handle_event`
-- `harness/src/main.rs` -- `child.try_wait()` host death monitor, `panic_backtrace` forwarding
-- `.pi/extensions/makepad/dist/doc-bridge.js` -- `host_died` WebSocket handler -> `disposeAllSessions()`
-- `.pi/extensions/makepad/dist/index.js` -- status updates on welcome/host_died messages
