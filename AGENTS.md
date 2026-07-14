@@ -204,6 +204,15 @@ Debug commands flow: pi → harness → CRDT doc → makepad-host → response b
 
 ```rust
 fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+    // ── WindowClosed early exit ─────────────────────────────────
+    // macOS IME null-pointer crash: first_rect_for_character_range
+    // fires on the NSView AFTER it's been deallocated by Window close
+    // processing. Exit BEFORE any widget processing to avoid the segfault.
+    if matches!(event, Event::WindowClosed(_)) {
+        doc.should_exit = true;  // signal harness: intentional exit
+        std::process::exit(0);   // die before Widget touches the close
+    }
+
     // Pre-dispatch: synthetic input before UI processes events
     if matches!(event, Event::Signal | Event::Draw(_)) {
         self.dispatch_pending_type_text(cx);
@@ -836,8 +845,38 @@ These were problems historically. Do NOT attempt to fix them again:
 | Fixed Issue | Fix | Verified |
 |-------------|-----|----------|
 | Streaming-time `dy.is_nan()` crash (text writes to `__ai_text` at 60fps with TextInput{height:0}) | 1. `SPLASH_PREFIX` has `width:Fill` 2. `__ai_text` uses `Label{height:Fit}` not `TextInput{height:0}` 3. `widget_tree_mark_dirty` in `render_body` 4. Signal-only sync (no 60fps doc reads) | Verified during sub-agent streaming + unsafe layout (padding+flow:Right) |
-| macOS IME null pointer crash on window close | `exit(0)` at top of `handle_event` for `WindowClosed` (before any widget processing) | Code-inspected at 3 exit paths |
+| macOS IME null pointer crash on window close | `exit(0)` at top of `handle_event` for `WindowClosed` (before any widget processing) | Reproduced and confirmed by removing the fix — window close with active TextInput causes deterministic segfault |
 | Rust harness `catch_unwind` can't catch IME null pointer | Fixed by `exit(0)` before any widget processing on WindowClosed | Confirmed — IME query runs after widget focus changes, so exiting early prevents it |
+
+### IME Crash Root Cause (macOS)
+
+**Crash chain (without the fix):**
+
+```
+1. User clicks red ✕ on window title bar
+2. macOS calls window_should_close → cw.send_window_close_requested_event()
+3. macOS calls window_will_close → cw.send_window_closed_event()
+4. Makepad event loop picks up Event::WindowClosed
+5. handle_event → ui.handle_event() → Root → Window processes WindowClosed
+6. Window widget tells macOS to close → NSView gets deallocated
+7. macOS IME cleanup fires first_rect_for_character_range on the NSView
+8. get_cocoa_window(this) reads this.get_ivar("macos_window_ptr")
+   → `this` is a DANGLING POINTER (NSView already freed in step 6)
+   → SEGFAULT
+```
+
+**Why `catch_unwind` can't help:** This is a segfault (dangling pointer dereference), not a Rust panic. `catch_unwind` only catches Rust panics. The crash is outside Rust's control — it's in Objective-C message dispatch (`msg_send![view, frame]`) on a freed object.
+
+**How the fix works:** The fix places the entire `WindowClosed` check **before** `catch_unwind` and **before** `ui.handle_event()`. When `WindowClosed` arrives:
+
+1. Write `should_exit = true` to CRDT doc (so the harness knows the exit was intentional, not a crash)
+2. Call `std::process::exit(0)` — terminates the process immediately
+
+Because `exit(0)` runs before `ui.handle_event()`, the Window widget **never processes the close**. The NSView is never deallocated during event processing. The IME delegate never gets a chance to query the dangling pointer. The process just dies cleanly.
+
+**The CRDT `should_exit` write is best-effort** — it races with `exit(0)`, but since the CRDT is in the harness process (in-memory), the write goes through before the host dies. This prevents the harness from firing `host_died` → `disposeAllSessions()` unnecessarily.
+
+**Is this a general Makepad bug?** Yes — the crash pathway is the same in any Makepad app on macOS. A stock `cargo makepad new` app with a focused TextInput would hit the same crash on window close. The fix is specific to our `handle_event` because we have a custom event loop with doc sync and debug dispatch. Most Makepad apps don't have this code, but they still have the same underlying macOS IME + NSView deallocation race.
 
 ## 8. Build, Test, Logs
 
