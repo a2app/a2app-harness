@@ -20,6 +20,56 @@ One concrete way to implement A2App maps the four features onto three components
 
 ---
 
+## Getting Started
+
+### 1. Install Pi
+
+A2App is built on [pi](https://github.com/earendil-works/pi-coding-agent), a coding agent harness that runs LLM inference and exposes agent tool-use capabilities. Install it via npm:
+
+```bash
+npm install -g @earendil-works/pi-coding-agent
+```
+
+Verify the installation:
+
+```bash
+pi --version
+```
+
+### 2. The Makepad Extension
+
+This repository includes a pi extension at `.pi/extensions/makepad/` that teaches pi about the `a2app_harness` tools — launching Makepad Splash mini-apps, inspecting their widget trees, clicking buttons, sending prompts to sub-agents, and receiving streaming responses. It is loaded automatically when pi runs inside this project directory.
+
+The extension registers custom tools (`launch_makepad_app`, `check_debug_app`, `launch_app_with_agent`, etc.) and an auto-handler for splash-to-agent communication. The workflow goes like this:
+
+1. **You describe an app** in the pi chat — e.g. "build a counter app with +/- buttons and send the count back to me when I click Send".
+2. **Pi generates Splash DSL** — a simple layout language (View, Label, Button, TextInput) and calls `launch_makepad_app` to render it inside the Makepad host window.
+3. **Pi inspects the UI** — it takes a `widget_snapshot` to discover widget positions (orphaned widgets have window-relative coordinates), then simulates clicks and text input to verify the app works.
+4. **Interactive apps communicate back** — splash buttons call `ui.__pi_response.set_text(...)` to send data to pi. Pi reads responses via `inspect_makepad_doc` or the async `wait_for_response` tool.
+5. **AI-powered apps** — using `launch_app_with_agent`, pi creates a blank-slate sub-agent session. The splash app sends prompts via `ai:ask:` messages, and the sub-agent's response streams token-by-token into an auto-displayed widget.
+
+### 3. Build
+
+```bash
+cargo build -p harness -p makepad-host
+```
+
+### 4. Try It Out — AI Chat App
+
+Start pi in this project directory:
+
+```bash
+pi
+```
+
+Then say something like:
+
+> Launch an AI chat app (using a sub agent).
+
+Pi will generate the Splash DSL, launch it inside the Makepad host window with a blank-slate sub-agent session, and the response will stream token-by-token into the app.
+
+---
+
 ## Component Notes
 
 **A — Coding Agent** handles inference (feature 1), workspace access (feature 2), and the main agent chat UI (feature 4). It runs the LLM loop, provides the user-facing chat interface, reads and writes the filesystem, and communicates outward via a WebSocket connection to the Rust process.
